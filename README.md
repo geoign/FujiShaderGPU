@@ -1,4 +1,4 @@
-# FujiShaderGPU🌋
+# FujiShaderGPU 富士シェーダーGPU🌋
 - Lightning fast terrain shader for a big Cloud Optimized GeoTIFF
 - Cloud Optimized GeoTIFFの為の電光石火DEM地形可視化シェーダー
 
