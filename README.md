@@ -2,7 +2,7 @@
 - Lightning fast terrain shader for a big Cloud Optimized GeoTIFF
 - Cloud Optimized GeoTIFFの為の電光石火DEM地形可視化シェーダー
 
-GPUを使って処理することで数分～10分以内に計算が終わります。
+GPUを使って処理することでCPUの数百倍の速度で計算できます。
 
 ## Install インストール
 - Requires CUDA environment (nVidia GPU)
@@ -20,7 +20,10 @@ FujiShaderGPU infile.tif outfile.tif
 ⭐![Try at Google Colab.](https://colab.research.google.com/drive/1IbIGtaoKM9e1OsdxdnzNN7KeO1W_gRwZ?usp=sharing)⭐ ←Google Colabで試すことができます。Google Driveから読み込み書き出します。 
 
 ## Limitations 注意事項
-FujiShaderGPU is designed for the Cartesian DEMs. It can process LatLon DEMs too but the result is not accurate. 
+- FujiShaderGPU is designed for the Cartesian DEMs.
+- It can process LatLon DEMs too but the result is not accurate.
+- 富士シェーダーは直交座標系のDEMの処理を想定しています。
+- 緯度経度座標系のDEMも処理できますが、結果は正確ではありません。
 
 ## Benchmark ベンチマーク
 ### nVidia A100 GPU (Google Colab)
