@@ -1,4 +1,4 @@
-# FujiShaderGPU
+# FujiShaderGPU🌋
 - Lightning fast terrain shader for a big Cloud Optimized GeoTIFF
 - Cloud Optimized GeoTIFFの為の電光石火DEM地形可視化シェーダー
 
@@ -17,7 +17,7 @@ GPUを使って処理することで数分～10分以内に計算が終わりま
 FujiShaderGPU infile.tif outfile.tif
 ```
 
-![Try at Google Colab.](https://colab.research.google.com/drive/1IbIGtaoKM9e1OsdxdnzNN7KeO1W_gRwZ?usp=sharing) ←Google Colabで試すことができます。Google Driveから読み込み書き出します。 
+⭐![Try at Google Colab.](https://colab.research.google.com/drive/1IbIGtaoKM9e1OsdxdnzNN7KeO1W_gRwZ?usp=sharing)⭐ ←Google Colabで試すことができます。Google Driveから読み込み書き出します。 
 
 ## Limitations 注意事項
 FujiShaderGPU is designed for the Cartesian DEMs. It can process LatLon DEMs too but the result is not accurate. 
