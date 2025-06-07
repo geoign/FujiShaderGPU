@@ -28,7 +28,7 @@ FujiShaderGPU infile.tif outfile.tif
 ## Benchmark ベンチマーク
 ### nVidia A100 GPU (Google Colab)
 - 70,000 x 70,000 pixels: 7 min. (Processing) + 7 min. (COG packaging)
-- 20,000 x 240,000 pixels: 60 min. (Processing) + ? min. (COG packaging)
+- 220,000 x 240,000 pixels: 60 min. (Processing) + ? min. (COG packaging)
 
 ### nVidia RTX4070 Laptop
 - 60,000 x 30,000 pixels: 5 min. (Processing) + 10 min. (COG packaging)
