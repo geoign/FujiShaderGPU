@@ -11,7 +11,7 @@ GPUを使って処理することで数分～10分以内に計算が終わりま
 
 ## Usage 使い方
 - Only pseudo- Ridge Valley Index (RVI) is available at the moment.
-- 現在のバージョンでは、尾根谷度の計算のみサポートしています。
+- 現在のバージョンでは、疑似的な尾根谷度の計算のみサポートしています。
 
 ```bash
 FujiShaderGPU infile.tif outfile.tif
