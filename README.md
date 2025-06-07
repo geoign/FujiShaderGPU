@@ -14,7 +14,7 @@ GPUを使って処理することでCPUの数百倍の速度で計算できま�
 - 現在のバージョンでは、疑似的な尾根谷度の計算のみサポートしています。
 
 ```bash
-FujiShaderGPU infile.tif outfile.tif
+fujishadergpu infile.tif outfile.tif
 ```
 
 ⭐![Try at Google Colab.](https://colab.research.google.com/drive/1IbIGtaoKM9e1OsdxdnzNN7KeO1W_gRwZ?usp=sharing)⭐ ←Google Colabで試すことができます。Google Driveから読み込み書き出します。 
