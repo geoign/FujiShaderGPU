@@ -359,6 +359,10 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
     dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
+    # CRSが設定されていない場合の警告
+    if not hasattr(data, 'rio') or data.rio.crs is None:
+        logger.warning("No CRS found in data. Output may not have proper georeferencing.")
+    
     if use_cog_driver:
         try:
             logger.info(f"Using COG driver (GDAL {major}.{minor}) with dtype={dtype_str}")
@@ -404,6 +408,10 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                         attrs=data.attrs,
                         name=data.name
                     )
+                    
+                    # CRS情報を引き継ぐ
+                    if hasattr(data, 'rio') and data.rio.crs is not None:
+                        computed_da.rio.write_crs(data.rio.crs, inplace=True)
                     
                     # COG書き込み（別の進捗バー）
                     logger.info("Writing to COG...")
@@ -488,8 +496,9 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                             attrs=data.attrs
                         )
                         
-                        # 座標参照系を設定
-                        chunk_da.rio.write_crs(data.rio.crs, inplace=True)
+                        # 座標参照系を設定（存在する場合のみ）
+                        if hasattr(data, 'rio') and data.rio.crs is not None:
+                            chunk_da.rio.write_crs(data.rio.crs, inplace=True)
                         
                         # チャンクをGeoTIFFとして保存
                         chunk_da.rio.to_raster(
@@ -549,6 +558,10 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
             attrs=data.attrs,
             name=data.name
         )
+        
+        # CRS情報を引き継ぐ
+        if hasattr(data, 'rio') and data.rio.crs is not None:
+            computed_da.rio.write_crs(data.rio.crs, inplace=True)
         
         logger.info("Writing temporary TIFF...")
         computed_da.rio.to_raster(
@@ -821,6 +834,7 @@ def run_pipeline(
         )
         
         # 6‑5) xarray ラップ（改善：座標構築の簡略化）
+        # 6‑5) xarray ラップ（改善：座標構築の簡略化）
         if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
             dims = ("scale", *dem.dims)
             coords = {"scale": params['sigmas'], **dem.coords}
@@ -878,6 +892,10 @@ def run_pipeline(
             attrs=attrs,
             name=algorithm.upper(),
         )
+        
+        # CRS情報を元のDEMから引き継ぐ
+        if hasattr(dem, 'rio') and dem.rio.crs is not None:
+            result_da.rio.write_crs(dem.rio.crs, inplace=True)
         
         # 6‑6) 出力 (直接 COG)
         write_cog_da_chunked(result_da, Path(dst_cog), show_progress=show_progress)
