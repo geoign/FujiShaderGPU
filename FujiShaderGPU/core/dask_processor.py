@@ -466,54 +466,74 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                 # data.dataがDask配列の場合
                 delayed_chunks = data.data.to_delayed()
                 
+                # チャンク情報の検証
+                if not hasattr(data, 'chunks') or data.chunks is None:
+                    logger.warning("No chunk information found, falling back to regular processing")
+                    _write_cog_da_original(data, dst, show_progress)
+                    return
+                
                 # チャンクの形状を保持しながら処理
                 chunk_idx = 0
                 for i in range(delayed_chunks.shape[0]):
                     for j in range(delayed_chunks.shape[1]):
                         chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
                         
-                        # チャンクを計算
-                        chunk_data = delayed_chunks[i, j].compute()
-                        
-                        # チャンクの座標を計算
-                        y_slice = slice(
-                            i * data.chunks[0][0],
-                            min((i + 1) * data.chunks[0][0], data.shape[0])
-                        )
-                        x_slice = slice(
-                            j * data.chunks[1][0],
-                            min((j + 1) * data.chunks[1][0], data.shape[1])
-                        )
-                        
-                        # チャンクをDataArrayとして作成
-                        chunk_da = xr.DataArray(
-                            chunk_data,
-                            dims=data.dims,
-                            coords={
-                                data.dims[0]: data.coords[data.dims[0]][y_slice],
-                                data.dims[1]: data.coords[data.dims[1]][x_slice]
-                            },
-                            attrs=data.attrs
-                        )
-                        
-                        # 座標参照系を設定（存在する場合のみ）
-                        if hasattr(data, 'rio') and data.rio.crs is not None:
-                            chunk_da.rio.write_crs(data.rio.crs, inplace=True)
-                        
-                        # チャンクをGeoTIFFとして保存
-                        chunk_da.rio.to_raster(
-                            chunk_file,
-                            driver="GTiff",
-                            compress="ZSTD",
-                            tiled=True,
-                            blockxsize=512,
-                            blockysize=512
-                        )
-                        chunk_files.append(chunk_file)
-                        
-                        # メモリ解放
-                        del chunk_data, chunk_da
-                        chunk_idx += 1
+                        try:
+                            # チャンクを計算
+                            chunk_data = delayed_chunks[i, j].compute()
+                            
+                            # チャンクの実際のサイズを取得
+                            chunk_height, chunk_width = chunk_data.shape
+                            
+                            # チャンクの開始位置を計算
+                            y_start = sum(data.chunks[0][:i])
+                            x_start = sum(data.chunks[1][:j])
+                            
+                            # チャンクの終了位置を計算
+                            y_end = y_start + chunk_height
+                            x_end = x_start + chunk_width
+                            
+                            # 座標のスライスを作成
+                            y_slice = slice(y_start, y_end)
+                            x_slice = slice(x_start, x_end)
+                            
+                            # デバッグ情報
+                            logger.debug(f"Chunk {i},{j}: data shape={chunk_data.shape}, "
+                                       f"y_slice={y_start}:{y_end}, x_slice={x_start}:{x_end}")
+                            
+                            # チャンクをDataArrayとして作成
+                            chunk_da = xr.DataArray(
+                                chunk_data,
+                                dims=data.dims,
+                                coords={
+                                    data.dims[0]: data.coords[data.dims[0]][y_slice],
+                                    data.dims[1]: data.coords[data.dims[1]][x_slice]
+                                },
+                                attrs=data.attrs
+                            )
+                            
+                            # 座標参照系を設定（存在する場合のみ）
+                            if hasattr(data, 'rio') and data.rio.crs is not None:
+                                chunk_da.rio.write_crs(data.rio.crs, inplace=True)
+                            
+                            # チャンクをGeoTIFFとして保存
+                            chunk_da.rio.to_raster(
+                                chunk_file,
+                                driver="GTiff",
+                                compress="ZSTD",
+                                tiled=True,
+                                blockxsize=512,
+                                blockysize=512
+                            )
+                            chunk_files.append(chunk_file)
+                            
+                            # メモリ解放
+                            del chunk_data, chunk_da
+                            chunk_idx += 1
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to process chunk {i},{j}: {e}")
+                            raise
             else:
                 # Dask配列でない場合は通常の処理にフォールバック
                 logger.info("Data is not chunked with Dask, falling back to regular processing")
@@ -521,6 +541,9 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                 return
                 
             # VRTで統合してCOGに変換
+            if not chunk_files:
+                raise ValueError("No chunks were successfully processed")
+                
             vrt_file = Path(tmpdir) / "merged.vrt"
             gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
             
@@ -531,6 +554,8 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                 format="COG" if use_cog_driver else "GTiff",
                 creationOptions=list(f"{k}={v}" for k, v in cog_options.items())
             )
+            
+            logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
     else:
         # 既存の処理
         _write_cog_da_original(data, dst, show_progress)
@@ -827,13 +852,8 @@ def run_pipeline(
             )
         
         # 6‑4) GPU→CPU 戻し（改善：明示的なdtype）
-        result_cpu = result_gpu.map_blocks(
-            cp.asnumpy, 
-            dtype="float32",
-            meta=cp.empty((0, 0), dtype=cp.float32).get()
-        )
+    
         
-        # 6‑5) xarray ラップ（改善：座標構築の簡略化）
         # 6‑5) xarray ラップ（改善：座標構築の簡略化）
         if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
             dims = ("scale", *dem.dims)
