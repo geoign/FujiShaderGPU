@@ -130,7 +130,9 @@ def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str,
     result = None
     
     for i, sigma in enumerate(iterator):
-        depth = int(4 * sigma)
+        # depth = int(4 * sigma)  # この行を削除
+        # 大きなsigmaに対してdepthを制限
+        depth = min(int(4 * sigma), 200)  # 最大depth=200に制限
         
         # 各sigmaを個別に計算（メモリ効率向上）
         hp = da.map_overlap(

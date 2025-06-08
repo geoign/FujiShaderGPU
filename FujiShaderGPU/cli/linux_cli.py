@@ -76,8 +76,9 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         parser.add_argument(
             "--memory-fraction",
             type=float,
-            default=0.8,
-            help="GPU メモリ使用率 (default: 0.8)"
+            # default=0.8,  # この行を削除
+            default=0.5,  # より保守的なデフォルト値に変更
+            help="GPU メモリ使用率 (default: 0.5)"  # ヘルプテキストも更新
         )
         
         # マルチスケール処理

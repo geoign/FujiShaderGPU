@@ -42,7 +42,8 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
     base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 10)
     # 512の倍数に丸める（COGブロックサイズとの整合性）
-    return max(2048, min(8192, (base_chunk // 512) * 512))
+    # return max(2048, min(8192, (base_chunk // 512) * 512))  # この行を削除
+    return max(4096, min(8192, (base_chunk // 512) * 512))  # 最小値を4096に増加
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:  # 0.8 → 0.6に削減
     """Colab A100 (40 GB VRAM) 用の最適化されたクラスタを構築"""
@@ -55,7 +56,8 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         else:
             gpu_memory_gb = 40  # デフォルトA100想定
             
-        rmm_size = int(gpu_memory_gb * memory_fraction * 0.7)  # さらに保守的に
+        # rmm_size = int(gpu_memory_gb * memory_fraction * 0.7)  # さらに保守的に  # この行を削除
+        rmm_size = int(gpu_memory_gb * memory_fraction * 0.5)  # さらに保守的に（0.7→0.5）
         
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
@@ -173,7 +175,8 @@ def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> Li
     
     # 基本スケール（地形の複雑さに応じて調整）
     if terrain_complexity < 0.1:  # 平坦な地形
-        base_scales = [100, 200, 400]
+        # base_scales = [100, 200, 400]  # この行を削除
+        base_scales = [50, 100, 150]  # より小さい値に制限
     elif terrain_complexity < 0.3:  # 緩やかな地形
         base_scales = [50, 100, 200]
     else:  # 複雑な地形
@@ -185,7 +188,8 @@ def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> Li
             if 10 < scale < 500:  # 現実的な範囲のスケールのみ
                 # Gaussianフィルタのsigmaは、検出されたスケールの約1/4
                 sigma_candidate = round(scale / 4, 0)  # 整数に丸める
-                if 5 <= sigma_candidate <= 500:
+                # if 5 <= sigma_candidate <= 500:  # この行を削除
+                if 5 <= sigma_candidate <= 150:  # 最大値を150に制限
                     sigmas_set.add(sigma_candidate)
     
     # 3. 曲率に基づく微細スケール
@@ -195,7 +199,8 @@ def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> Li
     
     # 基本スケールを追加
     for scale in base_scales:
-        if 5 <= scale <= 500:
+        # if 5 <= scale <= 500:  # この行を削除
+        if 5 <= scale <= 150:  # 最大値を150に制限
             sigmas_set.add(scale)
     
     # setをリストに変換してソート
@@ -413,7 +418,8 @@ def run_pipeline(
         # 地理座標系の大きなデータの場合はチャンクサイズを大幅に調整
         if dem.shape[0] > 30000 or dem.shape[1] > 30000:
             logger.info("Very large geographic dataset detected, using minimal chunk size")
-            chunk = 512  # より小さなチャンクサイズ
+            # chunk = 512  # より小さなチャンクサイズ  # この行を削除
+            chunk = 2048  # より大きなチャンクサイズに変更
             # データを再チャンク
             dem = dem.chunk({"y": chunk, "x": chunk})
             logger.info(f"Rechunked to {chunk}x{chunk}")
