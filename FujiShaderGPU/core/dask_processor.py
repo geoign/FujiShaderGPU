@@ -570,12 +570,33 @@ def run_pipeline(
                 params['radii'] = radii
                 params['weights'] = weights
                 
-            elif sigmas is not None:
+            elif sigmas is not None or (sigmas is None and auto_sigma):
                 # 従来のsigmaモード（互換性）
                 params['mode'] = 'sigma'
-                params['sigmas'] = sigmas
-                params['agg'] = agg
-                logger.warning("Using legacy sigma mode. Consider switching to radius mode for better performance.")
+                
+                if sigmas is not None:
+                    params['sigmas'] = sigmas
+                    params['agg'] = agg
+                    logger.warning("Using legacy sigma mode. Consider switching to radius mode for better performance.")
+                else:
+                    # auto_sigmaがTrueの場合
+                    logger.info("Analyzing terrain for automatic sigma determination...")
+                    
+                    # 地形解析
+                    terrain_stats = analyze_terrain_scales(gpu_arr)
+                    
+                    # 最適なsigmaを決定
+                    sigmas = determine_optimal_sigmas(terrain_stats, pixel_size)
+                    
+                    logger.info(f"Terrain analysis results:")
+                    logger.info(f"  - Elevation range: {terrain_stats['elevation_range']:.1f} m")
+                    logger.info(f"  - Mean slope: {terrain_stats['mean_slope']:.3f}")
+                    logger.info(f"  - Detected scales: {terrain_stats.get('dominant_scales', [])}")
+                    logger.info(f"  - Auto-determined sigmas: {sigmas}")
+                    
+                    # パラメータに設定
+                    params['sigmas'] = sigmas
+                    params['agg'] = agg
                 
             elif radii is not None:
                 # 手動指定の半径モード
@@ -586,35 +607,8 @@ def run_pipeline(
             else:
                 raise ValueError("Either provide radii/sigmas or enable auto_radii/auto_sigma")
 
-        # 6‑2.5) 自動sigma決定（必要な場合、RVIアルゴリズムのみ）
-        if algorithm == "rvi" and sigmas is None and auto_sigma:
-            logger.info("Analyzing terrain for automatic sigma determination...")
-            
-            # 地形解析
-            terrain_stats = analyze_terrain_scales(gpu_arr)
-            
-            # 最適なsigmaを決定
-            sigmas = determine_optimal_sigmas(terrain_stats, pixel_size)
-            
-            logger.info(f"Terrain analysis results:")
-            logger.info(f"  - Elevation range: {terrain_stats['elevation_range']:.1f} m")
-            logger.info(f"  - Mean slope: {terrain_stats['mean_slope']:.3f}")
-            logger.info(f"  - Detected scales: {terrain_stats.get('dominant_scales', [])}")
-            logger.info(f"  - Auto-determined sigmas: {sigmas}")
-            
-            # パラメータに設定
-            params['sigmas'] = sigmas
-
-        elif algorithm == "rvi" and sigmas is None:
-            # auto_sigmaがFalseでsigmasも指定されていない場合
-            raise ValueError("Either provide sigmas or enable auto_sigma")
-
-        # RVIの場合は手動指定のsigmasを設定
-        if algorithm == "rvi" and sigmas is not None:
-            params['sigmas'] = sigmas
-
         # 多くのアルゴリズムでピクセルサイズが必要（RVI以外の場合）
-        if algorithm != "rvi" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
+        elif algorithm != "rvi" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
             try:
                 x_res = abs(float(dem.rio.resolution()[0]))
                 y_res = abs(float(dem.rio.resolution()[1]))
