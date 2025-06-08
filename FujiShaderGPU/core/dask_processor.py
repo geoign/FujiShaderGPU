@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os, subprocess, warnings, logging, rasterio, psutil, GPUtil
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Union
 
 import cupy as cp
 import numpy as np

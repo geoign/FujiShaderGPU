@@ -2,7 +2,7 @@
 FujiShaderGPU/algorithms/dask_algorithms.py
 """
 from __future__ import annotations
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
 
 import cupy as cp

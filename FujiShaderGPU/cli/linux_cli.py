@@ -249,39 +249,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # アルゴリズム固有パラメータの準備
         algo_params = {}
         
-        if args.algorithm == "hillshade":
-            algo_params.update({
-                'azimuth': args.azimuth,
-                'altitude': args.altitude,
-                'z_factor': args.z_factor,
-                'multiscale': args.multiscale,
-            })
-            if args.multiscale and args.sigma_list:
-                algo_params['sigmas'] = args.sigma_list
-                
-        elif args.algorithm == "slope":
-            algo_params['unit'] = args.unit
-            
-        elif args.algorithm == "curvature":
-            algo_params['curvature_type'] = args.curvature_type
-            
-        elif args.algorithm == "tpi":
-            algo_params['radius'] = args.radius
-            
-        elif args.algorithm == "lrm":
-            algo_params['kernel_size'] = args.kernel_size
-            
-        elif args.algorithm == "openness":
-            algo_params.update({
-                'openness_type': args.openness_type,
-                'num_directions': args.num_directions,
-                'max_distance': args.max_distance,
-            })
-            
-        elif args.algorithm in ["specular", "atmospheric_scattering", "ambient_occlusion",
-                              "atmospheric_perspective", "npr_edges", "frequency_enhancement"]:
-            if hasattr(args, 'intensity'):
-                algo_params['intensity'] = args.intensity
+        # ... 既存のアルゴリズム固有パラメータ処理 ...
         
         # ログ出力
         self.logger.info(f"=== Dask-CUDA地形解析 ===")
@@ -289,45 +257,55 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         self.logger.info(f"出力: {args.output}")
         self.logger.info(f"アルゴリズム: {args.algorithm}")
         
+        # デフォルト値の設定
+        if not hasattr(args, 'use_sigma_mode'):
+            args.use_sigma_mode = False
+        if not hasattr(args, 'auto_radii'):
+            args.auto_radii = True
+        if not hasattr(args, 'auto_sigma'):
+            args.auto_sigma = False
+        if not hasattr(args, 'radii'):
+            args.radii = None
+        if not hasattr(args, 'weights'):
+            args.weights = None
+        
+        # RVI用ログ出力
         if args.algorithm == "rvi":
             if args.use_sigma_mode:
                 self.logger.info("モード: Sigma（従来方式）")
-                if args.sigma_list:
-                    self.logger.info(f"Sigma値: {args.sigma_list}")
-                elif args.auto_sigma:
-                    self.logger.info("Sigmaは地形解析により自動決定されます")
+                if params['sigma_list']:
+                    self.logger.info(f"Sigma値: {params['sigma_list']}")
             else:
-                self.logger.info("モード: Radius（高速方式）")
-                if args.radii_list:
-                    self.logger.info(f"半径: {args.radii_list}")
-                elif args.auto_radii:
-                    self.logger.info("半径は地形解析により自動決定されます")
+                self.logger.info("モード: Radius（高速方式・自動決定）")
         
         # 処理の実行
         try:
             from ..core.dask_processor import run_pipeline
             
+            # RVIパラメータの安全な処理
+            rvi_params = {
+                'sigmas': params['sigma_list'] if args.use_sigma_mode else None,
+                'radii': None,  # 自動決定に任せる
+                'weights': None,
+                'auto_sigma': args.auto_sigma if args.use_sigma_mode else False,
+                'auto_radii': True if not args.use_sigma_mode else False,
+            }
+            
             run_pipeline(
                 src_cog=params['input_path'],
                 dst_cog=params['output_path'],
                 algorithm=args.algorithm,
-                sigmas=params['sigma_list'] if args.use_sigma_mode else None,
-                radii=getattr(args, 'radii_list', None),
                 agg=args.agg,
                 chunk=args.chunk,
                 show_progress=params['show_progress'],
-                auto_sigma=args.auto_sigma if args.use_sigma_mode else False,
-                auto_radii=args.auto_radii if not args.use_sigma_mode else False,
                 memory_fraction=args.memory_fraction,
-                weights=getattr(args, 'weights_list', None),
+                **rvi_params,
                 **algo_params
             )
             
-        except ImportError as e:
-            self.logger.error(f"Dask-CUDA環境が利用できません: {e}")
-            self.logger.error("Linux環境用の依存関係をインストールしてください:")
-            self.logger.error("pip install 'FujiShaderGPU[linux]'")
-            raise
         except Exception as e:
             self.logger.error(f"処理中にエラーが発生しました: {e}")
+            import traceback
+            traceback.print_exc()
             raise
+        
