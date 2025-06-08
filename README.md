@@ -6,7 +6,7 @@ GPUを使って処理することでCPUの数百倍の速度で計算できま�
 
 ## Install インストール
 - Requires CUDA environment (nVidia GPU)
-- CUDA実行環境が必要です。(nVidia社のGPU)
+- CUDA実行環境が必要です。(nVidia社のGPU + WindowsであればCUDA tookit)
 
 ```pip install git+https://github.com/geoign/FujiShaderGPU.git```
 
