@@ -353,15 +353,30 @@ def write_cog_da(data: xr.DataArray, dst: Path, show_progress: bool = True):
             with rasterio.Env(GDAL_CACHEMAX=512):
                 if show_progress:
                     # Daskの計算進捗を表示
-                    with tqdm(total=100, desc="Writing COG") as pbar:
-                        def callback(future):
-                            pbar.update(10)
-                        
-                        future = data.rio.to_raster(
-                            dst,
-                            driver="COG",
-                            **cog_options,
-                        )
+                    from dask.diagnostics import ProgressBar
+                    
+                    # 計算と書き込みを分離
+                    logger.info("Computing result...")
+                    with ProgressBar():
+                        # まず計算を実行（これがメインの処理時間）
+                        computed_data = data.compute()
+                    
+                    # 計算済みデータをxarrayに戻す
+                    computed_da = xr.DataArray(
+                        computed_data,
+                        dims=data.dims,
+                        coords=data.coords,
+                        attrs=data.attrs,
+                        name=data.name
+                    )
+                    
+                    # COG書き込み（これは比較的高速）
+                    logger.info("Writing to COG...")
+                    computed_da.rio.to_raster(
+                        dst,
+                        driver="COG",
+                        **cog_options,
+                    )
                 else:
                     data.rio.to_raster(
                         dst,
@@ -387,7 +402,24 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
         tiff_options = {k: v for k, v in cog_options.items() 
                        if k not in ['OVERVIEWS', 'OVERVIEW_RESAMPLING']}
         
-        data.rio.to_raster(
+        # 進捗表示付きで計算してから書き込み
+        from dask.diagnostics import ProgressBar
+        
+        logger.info("Computing result...")
+        with ProgressBar():
+            computed_data = data.compute()
+        
+        # 計算済みデータをxarrayに戻す
+        computed_da = xr.DataArray(
+            computed_data,
+            dims=data.dims,
+            coords=data.coords,
+            attrs=data.attrs,
+            name=data.name
+        )
+        
+        logger.info("Writing temporary TIFF...")
+        computed_da.rio.to_raster(
             tmp,
             tiled=True,
             blockxsize=512,
