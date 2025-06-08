@@ -3,7 +3,7 @@ FujiShaderGPU/core/tile_processor.py
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ..core.gpu_memory import gpu_memory_pool
-from ..core.system_config import get_gpu_config
+from ..config.system_config import get_gpu_config
 from ..io.raster_info import detect_pixel_size_from_cog
 from ..utils.types import TileResult
 from ..utils.scale_analysis import analyze_terrain_scales
@@ -19,6 +19,16 @@ import cupyx.scipy.ndimage as cpx_ndimage
 from rasterio.windows import Window
 from rasterio.transform import Affine
 from typing import Optional, Tuple, List
+from importlib import import_module
+
+def _load_algorithm(name: str):
+    mod = import_module(f"..algorithms.{name}", package=__package__)
+    # クラスの場合と関数の場合の両対応
+    if hasattr(mod, "process"):          # クラス実装
+        return mod
+    elif hasattr(mod, f"_{name}"):       # 関数実装
+        return getattr(mod, f"_{name}")
+    raise ValueError(f"Algorithm {name} not found")
 
 def process_single_tile(
     input_cog_path: str,

@@ -1,7 +1,7 @@
 """
 FujiShaderGPU/main.py
 """
-from .core.system_config import check_gdal_environment
+from .config.system_config import check_gdal_environment
 from .core.tile_processor import process_dem_tiles
 import os, argparse
 
@@ -10,7 +10,20 @@ def main():
         description="DEM→RVI超高速処理（CuPy+マルチスケール+QGIS最適化COG出力）"
     )
     parser.add_argument("input_cog", help="入力DEM（COG形式）")
-    parser.add_argument("output_cog", help="出力RVI COG")
+    parser.add_argument("output_cog", help="出力COG")
+
+    # アルゴリズム選択
+    parser.add_argument(
+        "--algorithm",
+        default="rvi_gaussian",
+        choices=[
+            "rvi_gaussian", "hillshade", "atmospheric_scattering",
+            "composite_terrain", "curvature",
+            "frequency_enhancement", "visual_saliency"
+        ],
+        help="使用するアルゴリズム名"
+    )
+    
     parser.add_argument("--tmp_dir", default="tiles_tmp", help="一時ディレクトリ")
     parser.add_argument("--tile_size", type=int, help="タイルサイズ（自動検出）")
     parser.add_argument("--padding", type=int, help="パディング（自動計算）")

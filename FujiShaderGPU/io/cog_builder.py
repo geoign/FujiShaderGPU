@@ -2,7 +2,7 @@
 FujiShaderGPU/io/cog_builder.py
 """
 
-from ..io.gdal_config import _configure_gdal_ultra_performance
+from ..config.gdal_config import _configure_gdal_ultra_performance
 import os, glob, shutil
 from typing import List
 from osgeo import gdal
