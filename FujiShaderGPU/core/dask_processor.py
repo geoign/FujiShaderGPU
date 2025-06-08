@@ -453,31 +453,63 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
             # チャンクごとに処理
             chunk_files = []
             
-            # より小さなチャンクで処理
-            for i, chunk in enumerate(data.to_delayed().flatten()):
-                chunk_file = Path(tmpdir) / f"chunk_{i}.tif"
-                chunk_data = chunk.compute()
+            # Dask配列のチャンクを取得
+            if hasattr(data.data, 'to_delayed'):
+                # data.dataがDask配列の場合
+                delayed_chunks = data.data.to_delayed()
                 
-                # チャンクをGeoTIFFとして保存
-                chunk_da = xr.DataArray(
-                    chunk_data,
-                    dims=data.dims,
-                    coords={k: v[...] for k, v in data.coords.items()},
-                    attrs=data.attrs
-                )
-                
-                chunk_da.rio.to_raster(
-                    chunk_file,
-                    driver="GTiff",
-                    compress="ZSTD",
-                    tiled=True,
-                    blockxsize=512,
-                    blockysize=512
-                )
-                chunk_files.append(chunk_file)
-                
-                # メモリ解放
-                del chunk_data, chunk_da
+                # チャンクの形状を保持しながら処理
+                chunk_idx = 0
+                for i in range(delayed_chunks.shape[0]):
+                    for j in range(delayed_chunks.shape[1]):
+                        chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
+                        
+                        # チャンクを計算
+                        chunk_data = delayed_chunks[i, j].compute()
+                        
+                        # チャンクの座標を計算
+                        y_slice = slice(
+                            i * data.chunks[0][0],
+                            min((i + 1) * data.chunks[0][0], data.shape[0])
+                        )
+                        x_slice = slice(
+                            j * data.chunks[1][0],
+                            min((j + 1) * data.chunks[1][0], data.shape[1])
+                        )
+                        
+                        # チャンクをDataArrayとして作成
+                        chunk_da = xr.DataArray(
+                            chunk_data,
+                            dims=data.dims,
+                            coords={
+                                data.dims[0]: data.coords[data.dims[0]][y_slice],
+                                data.dims[1]: data.coords[data.dims[1]][x_slice]
+                            },
+                            attrs=data.attrs
+                        )
+                        
+                        # 座標参照系を設定
+                        chunk_da.rio.write_crs(data.rio.crs, inplace=True)
+                        
+                        # チャンクをGeoTIFFとして保存
+                        chunk_da.rio.to_raster(
+                            chunk_file,
+                            driver="GTiff",
+                            compress="ZSTD",
+                            tiled=True,
+                            blockxsize=512,
+                            blockysize=512
+                        )
+                        chunk_files.append(chunk_file)
+                        
+                        # メモリ解放
+                        del chunk_data, chunk_da
+                        chunk_idx += 1
+            else:
+                # Dask配列でない場合は通常の処理にフォールバック
+                logger.info("Data is not chunked with Dask, falling back to regular processing")
+                _write_cog_da_original(data, dst, show_progress)
+                return
                 
             # VRTで統合してCOGに変換
             vrt_file = Path(tmpdir) / "merged.vrt"
@@ -492,7 +524,7 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
             )
     else:
         # 既存の処理
-        _write_cog_da_original(data, dst, show_progress, use_cog_driver, cog_options)
+        _write_cog_da_original(data, dst, show_progress)
 
 def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
     """フォールバック：一時ファイル経由でCOG作成"""
