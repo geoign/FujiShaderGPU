@@ -221,7 +221,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         return parsed_args
     
     def _validate_platform_args(self, args: argparse.Namespace):
-        """Linux固有の引数検証"""
         # auto-radiiフラグの処理
         if hasattr(args, 'auto_radii') and hasattr(args, 'no_auto_radii'):
             args.auto_radii = args.auto_radii and not args.no_auto_radii
@@ -232,13 +231,19 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         
         # RVIでradii/sigmaが未指定かつ自動決定も無効の場合エラー
         if args.algorithm == "rvi":
+            # use_sigma_modeのデフォルト値を設定
+            if not hasattr(args, 'use_sigma_mode'):
+                args.use_sigma_mode = False
+                
             if args.use_sigma_mode:
                 # 従来モード
-                if not args.sigma_list and not args.auto_sigma:
+                # sigma_listはbase.pyのparse_argsで設定されるので、そちらを使用
+                if not getattr(args, 'sigma_list', None) and not getattr(args, 'auto_sigma', False):
                     self.parser.error("sigmaモードではsigmaを指定するか、--auto-sigmaを有効にしてください")
             else:
                 # 新モード（デフォルト）
-                if not args.radii_list and not args.auto_radii:
+                # radiiが指定されているかチェック（radii_listはまだ存在しない）
+                if not getattr(args, 'radii', None) and not getattr(args, 'auto_radii', True):
                     self.parser.error("radiiを指定するか、--auto-radiiを有効にしてください")
 
     def execute(self, args: argparse.Namespace):
@@ -261,12 +266,12 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             args.auto_sigma = False
         if not hasattr(args, 'radii'):
             args.radii = None
-        if not hasattr(args, 'radii_list'):  # 追加
-            args.radii_list = None
+        if not hasattr(args, 'radii_list'):
+            args.radii_list = getattr(args, 'radii_list', None)
         if not hasattr(args, 'weights'):
             args.weights = None
-        if not hasattr(args, 'weights_list'):  # 追加
-            args.weights_list = None
+        if not hasattr(args, 'weights_list'):
+            args.weights_list = getattr(args, 'weights_list', None)
 
         # アルゴリズム固有パラメータの準備
         algo_params = {}
@@ -287,22 +292,37 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             from ..core.dask_processor import run_pipeline
             
             # RVIパラメータの安全な処理
-            rvi_params = {
-                'sigmas': params['sigma_list'] if args.use_sigma_mode else None,
-                'radii': None,  # 自動決定に任せる
-                'weights': None,
-                'auto_sigma': args.auto_sigma if args.use_sigma_mode else False,
-                'auto_radii': True if not args.use_sigma_mode else False,
-            }
+            if args.algorithm == "rvi":
+                if args.use_sigma_mode:
+                    # Sigmaモード
+                    rvi_params = {
+                        'sigmas': params['sigma_list'],
+                        'radii': None,
+                        'weights': None,
+                        'auto_sigma': getattr(args, 'auto_sigma', False),
+                        'auto_radii': False,
+                    }
+                else:
+                    # Radiusモード（デフォルト）
+                    rvi_params = {
+                        'sigmas': None,
+                        'radii': args.radii_list,  # 手動指定がある場合のみ
+                        'weights': args.weights_list,
+                        'auto_sigma': False,
+                        'auto_radii': args.radii_list is None,  # radiiが指定されていない場合は自動決定
+                    }
+            else:
+                # RVI以外のアルゴリズム
+                rvi_params = {}
             
             run_pipeline(
                 src_cog=params['input_path'],
                 dst_cog=params['output_path'],
                 algorithm=args.algorithm,
-                agg=args.agg,
-                chunk=args.chunk,
+                agg=getattr(args, 'agg', 'mean'),
+                chunk=getattr(args, 'chunk', None),
                 show_progress=params['show_progress'],
-                memory_fraction=args.memory_fraction,
+                memory_fraction=getattr(args, 'memory_fraction', 0.5),
                 **rvi_params,
                 **algo_params
             )
