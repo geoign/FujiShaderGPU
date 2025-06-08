@@ -77,6 +77,97 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
 # 3. 地形解析によるsigma自動決定
 ###############################################################################
 
+def analyze_terrain_for_radii(dem_arr: da.Array, pixel_size: float = 1.0, 
+                             sample_ratio: float = 0.01) -> dict:
+    """地形の特性を解析して最適な半径を推定"""
+    # サンプリングして計算を高速化
+    h, w = dem_arr.shape
+    sample_size = int(min(h, w) * sample_ratio)
+    sample_size = max(512, min(2048, sample_size))  # 512-2048の範囲に制限
+    
+    # 中央部分をサンプリング
+    cy, cx = h // 2, w // 2
+    y1 = max(0, cy - sample_size // 2)
+    y2 = min(h, cy + sample_size // 2)
+    x1 = max(0, cx - sample_size // 2)
+    x2 = min(w, cx + sample_size // 2)
+    
+    sample = dem_arr[y1:y2, x1:x2].compute()
+    
+    # NaN除去
+    valid_mask = ~cp.isnan(sample)
+    if not valid_mask.any():
+        raise ValueError("No valid elevation data found")
+    
+    # 基本統計量
+    elevations = sample[valid_mask]
+    elev_range = float(cp.ptp(elevations))
+    std_dev = float(cp.std(elevations))
+    
+    # 勾配計算
+    dy, dx = cp.gradient(sample)
+    slope = cp.sqrt(dy**2 + dx**2)
+    valid_slope = slope[valid_mask]
+    mean_slope = float(cp.mean(valid_slope))
+    
+    return {
+        'elevation_range': elev_range,
+        'std_dev': std_dev,
+        'mean_slope': mean_slope,
+        'pixel_size': pixel_size
+    }
+
+
+def determine_optimal_radii(terrain_stats: dict) -> tuple[List[int], List[float]]:
+    """地形統計に基づいて最適な半径を決定"""
+    pixel_size = terrain_stats.get('pixel_size', 1.0)
+    mean_slope = terrain_stats['mean_slope']
+    std_dev = terrain_stats['std_dev']
+    
+    # 地形の複雑さ
+    complexity = mean_slope * std_dev
+    
+    # 基本的な実世界距離（メートル）
+    if complexity < 0.1:
+        # 平坦な地形：大きめのスケール
+        base_distances = [10, 40, 160, 640]
+    elif complexity < 0.3:
+        # 緩やかな地形：中程度のスケール
+        base_distances = [5, 20, 80, 320]
+    else:
+        # 複雑な地形：細かいスケール
+        base_distances = [2.5, 10, 40, 160]
+    
+    # ピクセル単位の半径に変換
+    radii = []
+    for dist in base_distances:
+        radius = int(dist / pixel_size)
+        # 現実的な範囲に制限（2-256ピクセル）
+        radius = max(2, min(radius, 256))
+        radii.append(radius)
+    
+    # 重複削除とソート
+    radii = sorted(list(set(radii)))
+    
+    # 最大4つまでに制限
+    if len(radii) > 4:
+        import numpy as np
+        # 対数的に分布
+        indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
+        radii = [radii[i] for i in indices]
+    
+    # 重みの決定（小さいスケールを重視）
+    weights = []
+    for i, r in enumerate(radii):
+        weight = 1.0 / (i + 1)  # 1, 1/2, 1/3, 1/4
+        weights.append(weight)
+    
+    # 正規化
+    total = sum(weights)
+    weights = [w / total for w in weights]
+    
+    return radii, weights
+
 def analyze_terrain_scales(dem_arr: da.Array, sample_ratio: float = 0.01) -> dict:
     """地形の特性を解析してスケールパラメータを推定"""
     # サンプリングして計算を高速化
@@ -366,11 +457,13 @@ def run_pipeline(
     src_cog: str,
     dst_cog: str,
     algorithm: str = "rvi",
-    sigmas: Optional[List[float]] = None,
+    sigmas: Optional[List[float]] = None,  # 従来の互換性のため残す
+    radii: Optional[List[int]] = None,     # 新しいパラメータ
     agg: str = "mean",
     chunk: Optional[int] = None,
     show_progress: bool = True,
-    auto_sigma: bool = True,
+    auto_sigma: bool = False,  # 従来の互換性
+    auto_radii: bool = True,   # 新しいパラメータ
     **algo_params
 ):
     """改善されたメインパイプライン"""
@@ -441,6 +534,45 @@ def run_pipeline(
             'show_progress': show_progress,
             'agg': agg
         }
+        
+        # 6‑2.5) 自動決定（RVIアルゴリズムの場合）
+        if algorithm == "rvi":
+            # 新しい効率的なモードをデフォルトに
+            if radii is None and sigmas is None and auto_radii:
+                logger.info("Analyzing terrain for automatic radii determination...")
+                
+                # 地形解析
+                terrain_stats = analyze_terrain_for_radii(gpu_arr, pixel_size)
+                
+                # 最適な半径を決定
+                radii, weights = determine_optimal_radii(terrain_stats)
+                
+                logger.info(f"Terrain analysis results:")
+                logger.info(f"  - Elevation range: {terrain_stats['elevation_range']:.1f} m")
+                logger.info(f"  - Mean slope: {terrain_stats['mean_slope']:.3f}")
+                logger.info(f"  - Auto-determined radii: {radii} pixels")
+                logger.info(f"  - Weights: {[f'{w:.2f}' for w in weights]}")
+                
+                # パラメータに設定
+                params['mode'] = 'radius'
+                params['radii'] = radii
+                params['weights'] = weights
+                
+            elif sigmas is not None:
+                # 従来のsigmaモード（互換性）
+                params['mode'] = 'sigma'
+                params['sigmas'] = sigmas
+                params['agg'] = agg
+                logger.warning("Using legacy sigma mode. Consider switching to radius mode for better performance.")
+                
+            elif radii is not None:
+                # 手動指定の半径モード
+                params['mode'] = 'radius'
+                params['radii'] = radii
+                params['weights'] = algo_params.get('weights', None)
+            
+            else:
+                raise ValueError("Either provide radii/sigmas or enable auto_radii/auto_sigma")
         
         # 6‑2.5) 自動sigma決定（必要な場合、RVIアルゴリズムのみ）
         if algorithm == "rvi" and sigmas is None and auto_sigma:

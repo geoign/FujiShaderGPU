@@ -2,7 +2,7 @@
 FujiShaderGPU/algorithms/dask_algorithms.py
 """
 from __future__ import annotations
-from typing import List
+from typing import List, Optional
 from abc import ABC, abstractmethod
 
 import cupy as cp
@@ -58,22 +58,114 @@ def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
         
     return result
 
+def compute_rvi_efficient_block(block: cp.ndarray, *, 
+                               radii: List[int] = [4, 16, 64], 
+                               weights: Optional[List[float]] = None,
+                               pixel_size: float = 1.0) -> cp.ndarray:
+    """効率的なRVI計算（固定半径ベース）"""
+    # NaNマスクを保存
+    nan_mask = cp.isnan(block)
+    
+    if weights is None:
+        weights = [1.0 / len(radii)] * len(radii)
+    
+    # 結果の初期化
+    rvi_combined = cp.zeros_like(block, dtype=cp.float32)
+    
+    for radius, weight in zip(radii, weights):
+        if radius <= 1:
+            # 小さな半径の場合はGaussianフィルタ
+            if nan_mask.any():
+                filled = cp.where(nan_mask, 0, block)
+                valid = (~nan_mask).astype(cp.float32)
+                smoothed_values = gaussian_filter(filled * valid, sigma=1.0, mode='nearest')
+                smoothed_weights = gaussian_filter(valid, sigma=1.0, mode='nearest')
+                mean_elev = cp.where(smoothed_weights > 0, smoothed_values / smoothed_weights, 0)
+            else:
+                mean_elev = gaussian_filter(block, sigma=1.0, mode='nearest')
+        else:
+            # 大きな半径の場合は効率的なuniform_filter
+            if nan_mask.any():
+                filled = cp.where(nan_mask, 0, block)
+                valid = (~nan_mask).astype(cp.float32)
+                
+                # 円形カーネルの近似として正方形カーネルを使用（高速）
+                kernel_size = 2 * radius + 1
+                sum_values = uniform_filter(filled * valid, size=kernel_size, mode='nearest')
+                sum_weights = uniform_filter(valid, size=kernel_size, mode='nearest')
+                mean_elev = cp.where(sum_weights > 0, sum_values / sum_weights, 0)
+            else:
+                kernel_size = 2 * radius + 1
+                mean_elev = uniform_filter(block, size=kernel_size, mode='nearest')
+        
+        # RVI = 元の標高 - 平均標高
+        rvi_scale = block - mean_elev
+        rvi_combined += weight * rvi_scale
+        
+        # メモリクリーンアップ
+        del mean_elev, rvi_scale
+    
+    # NaN処理
+    if nan_mask.any():
+        rvi_combined[nan_mask] = cp.nan
+    
+    return rvi_combined
+
+
+def multiscale_rvi_efficient(gpu_arr: da.Array, *, 
+                            radii: List[int], 
+                            weights: Optional[List[float]] = None,
+                            show_progress: bool = True) -> da.Array:
+    """効率的なマルチスケールRVI（Dask版）"""
+    
+    if not radii:
+        raise ValueError("At least one radius value is required")
+    
+    # 最大半径に基づいてdepthを設定（Gaussianよりも大幅に小さい）
+    max_radius = max(radii)
+    depth = max_radius + 1  # 半径+1で十分
+    
+    # 単一のmap_overlapで全スケールを計算（効率的）
+    result = gpu_arr.map_overlap(
+        compute_rvi_efficient_block,
+        depth=depth,
+        boundary="reflect",
+        dtype=cp.float32,
+        meta=cp.empty((0, 0), dtype=cp.float32),
+        radii=radii,
+        weights=weights
+    )
+    
+    return result
+
+
 class RVIAlgorithm(DaskAlgorithm):
-    """Ridge-Valley Indexアルゴリズム"""
+    """Ridge-Valley Indexアルゴリズム（効率的実装）"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        sigmas = params.get('sigmas', [50])
-        agg = params.get('agg', 'mean')
+        # パラメータ取得
+        mode = params.get('mode', 'radius')  # 'radius' or 'sigma'
         show_progress = params.get('show_progress', True)
         
-        # sigmasがNoneまたは空の場合はデフォルト値を使用
-        if not sigmas:
-            sigmas = [50]
+        if mode == 'sigma':
+            # 従来のsigmaベース（互換性のため残す）
+            sigmas = params.get('sigmas', [50])
+            agg = params.get('agg', 'mean')
+            rvi = multiscale_rvi(gpu_arr, sigmas=sigmas, agg=agg, show_progress=show_progress)
+        else:
+            # 新しい効率的な半径ベース
+            radii = params.get('radii', None)
+            weights = params.get('weights', None)
+            
+            # 自動決定
+            if radii is None:
+                pixel_size = params.get('pixel_size', 1.0)
+                radii = self._determine_optimal_radii(pixel_size)
+            
+            rvi = multiscale_rvi_efficient(gpu_arr, radii=radii, weights=weights, 
+                                         show_progress=show_progress)
         
-        # マルチスケールRVIを計算
-        rvi = multiscale_rvi(gpu_arr, sigmas=sigmas, agg=agg, show_progress=show_progress)
-        
-        # 正規化とガンマ補正（-1から+1の範囲に）
+        # 正規化とガンマ補正
         def normalize_rvi(block):
             # NaNマスクを保存
             nan_mask = cp.isnan(block)
@@ -106,11 +198,38 @@ class RVIAlgorithm(DaskAlgorithm):
         
         return normalized_rvi
     
+    def _determine_optimal_radii(self, pixel_size: float) -> List[int]:
+        """ピクセルサイズに基づいて最適な半径を決定"""
+        # 実世界の距離（メートル）をピクセルに変換
+        target_distances = [5, 20, 80, 320]  # メートル単位
+        radii = []
+        
+        for dist in target_distances:
+            radius = int(dist / pixel_size)
+            # 現実的な範囲に制限
+            radius = max(2, min(radius, 256))
+            radii.append(radius)
+        
+        # 重複を削除してソート
+        radii = sorted(list(set(radii)))
+        
+        # 最大4つまでに制限
+        if len(radii) > 4:
+            # 対数的に分布するように選択
+            import numpy as np
+            indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
+            radii = [radii[i] for i in indices]
+        
+        return radii
+    
     def get_default_params(self) -> dict:
         return {
-            'sigmas': None,  # Noneの場合は自動決定
-            'agg': 'mean',
-            'auto_sigma': True
+            'mode': 'radius',  # デフォルトは効率的な半径モード
+            'radii': None,     # Noneの場合は自動決定
+            'weights': None,   # Noneの場合は均等重み
+            'sigmas': None,    # 従来モード用（互換性）
+            'agg': 'mean',     # 従来モード用（互換性）
+            'auto_sigma': False,  # 従来のsigma自動決定は無効化
         }
 
 ###############################################################################
