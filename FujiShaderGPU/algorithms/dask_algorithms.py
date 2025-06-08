@@ -134,24 +134,35 @@ def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str,
             depth=depth,
             boundary="reflect",
             dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),  # 改善：明示的なメタデータ
+            meta=cp.empty((0, 0), dtype=cp.float32),
             sigma=sigma,
         )
         results.append(hp)
 
-    # スタック操作の最適化
-    stacked = da.stack(results, axis=0)
-    
+    # メモリ効率化：直接集約する
     if agg == "stack":
-        return stacked
+        return da.stack(results, axis=0)
     elif agg == "mean":
-        return da.mean(stacked, axis=0)
+        # より効率的な平均計算
+        result = results[0]
+        for i in range(1, len(results)):
+            result = result + results[i]
+        return result / len(results)
     elif agg == "min":
-        return da.min(stacked, axis=0)
+        result = results[0]
+        for i in range(1, len(results)):
+            result = da.minimum(result, results[i])
+        return result
     elif agg == "max":
-        return da.max(stacked, axis=0)
+        result = results[0]
+        for i in range(1, len(results)):
+            result = da.maximum(result, results[i])
+        return result
     elif agg == "sum":
-        return da.sum(stacked, axis=0)
+        result = results[0]
+        for i in range(1, len(results)):
+            result = result + results[i]
+        return result
     else:
         raise ValueError(f"Unknown aggregation method: {agg}")
     
