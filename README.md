@@ -7,6 +7,7 @@ GPUを使って処理することでCPUの数百倍の速度で計算できま�
 ## Install インストール
 - Requires CUDA environment (nVidia GPU)
 - CUDA実行環境が必要です。(nVidia社のGPU)
+
 ```pip install git+https://github.com/geoign/FujiShaderGPU.git```
 
 ## Usage 使い方
@@ -17,7 +18,7 @@ GPUを使って処理することでCPUの数百倍の速度で計算できま�
 fujishadergpu infile.tif outfile.tif
 ```
 
-⭐![Try at Google Colab.](https://colab.research.google.com/drive/1IbIGtaoKM9e1OsdxdnzNN7KeO1W_gRwZ?usp=sharing)⭐ ←Google Colabで試すことができます。Google Driveから読み込み書き出します。 
+⭐[Try at Google Colab.](https://colab.research.google.com/drive/1IbIGtaoKM9e1OsdxdnzNN7KeO1W_gRwZ?usp=sharing)⭐ ←Google Colabで試すことができます。Google Driveから読み込み書き出します。 
 
 ## Limitations 注意事項
 - FujiShaderGPU is designed for the Cartesian DEMs.
