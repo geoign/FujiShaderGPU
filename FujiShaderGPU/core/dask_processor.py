@@ -352,14 +352,47 @@ def write_cog_da(data: xr.DataArray, dst: Path, show_progress: bool = True):
             logger.info(f"Using COG driver (GDAL {major}.{minor}) with dtype={dtype_str}")
             with rasterio.Env(GDAL_CACHEMAX=512):
                 if show_progress:
-                    # Daskの計算進捗を表示
-                    from dask.diagnostics import ProgressBar
+                    # Daskクライアントから進捗を取得
+                    from distributed import as_completed
+                    from dask import delayed
                     
-                    # 計算と書き込みを分離
-                    logger.info("Computing result...")
-                    with ProgressBar():
-                        # まず計算を実行（これがメインの処理時間）
-                        computed_data = data.compute()
+                    # チャンク数を計算
+                    n_chunks = 1
+                    for chunk_dim in data.chunks:
+                        n_chunks *= len(chunk_dim)
+                    
+                    logger.info(f"Computing {n_chunks} chunks...")
+                    
+                    # persist()を使って計算を開始し、進捗を追跡
+                    data_persisted = data.persist()
+                    
+                    # tqdmで進捗表示
+                    with tqdm(total=100, desc="Computing result", unit="%") as pbar:
+                        last_progress = 0
+                        while True:
+                            try:
+                                # Daskの進捗を確認
+                                progress = data_persisted._cached_keys / data_persisted.npartitions if hasattr(data_persisted, '_cached_keys') else 0
+                                progress = min(progress * 100, 100)
+                                
+                                # 進捗を更新
+                                if progress > last_progress:
+                                    pbar.update(progress - last_progress)
+                                    last_progress = progress
+                                
+                                # 完了チェック
+                                if progress >= 100:
+                                    break
+                                    
+                                # 少し待機
+                                import time
+                                time.sleep(0.1)
+                            except:
+                                # エラーが出た場合は単純にcompute()
+                                break
+                    
+                    # 最終的な計算結果を取得
+                    computed_data = data_persisted.compute()
                     
                     # 計算済みデータをxarrayに戻す
                     computed_da = xr.DataArray(
@@ -370,13 +403,15 @@ def write_cog_da(data: xr.DataArray, dst: Path, show_progress: bool = True):
                         name=data.name
                     )
                     
-                    # COG書き込み（これは比較的高速）
+                    # COG書き込み
                     logger.info("Writing to COG...")
-                    computed_da.rio.to_raster(
-                        dst,
-                        driver="COG",
-                        **cog_options,
-                    )
+                    with tqdm(total=1, desc="Writing COG", unit="file") as pbar:
+                        computed_da.rio.to_raster(
+                            dst,
+                            driver="COG",
+                            **cog_options,
+                        )
+                        pbar.update(1)
                 else:
                     data.rio.to_raster(
                         dst,
@@ -650,9 +685,36 @@ def run_pipeline(
                 params['pixel_size'] = 1.0
                 logger.warning("Could not determine pixel size, using 1.0")
         
-        # 6‑3) アルゴリズム実行
+        # 6‑3) アルゴリズム実行（run_pipeline内）
         logger.info(f"Computing {algorithm} with parameters: {params}")
-        result_gpu: da.Array = algo.process(gpu_arr, **params)
+
+        # 進捗表示付きでアルゴリズムを実行
+        if show_progress:
+            with tqdm(total=100, desc=f"Processing {algorithm.upper()}", unit="%") as pbar:
+                pbar.update(10)  # 開始
+                
+                result_gpu: da.Array = algo.process(gpu_arr, **params)
+                pbar.update(30)  # アルゴリズム適用完了
+                
+                # GPU→CPU 戻し
+                result_cpu = result_gpu.map_blocks(
+                    cp.asnumpy, 
+                    dtype="float32",
+                    meta=cp.empty((0, 0), dtype=cp.float32).get()
+                )
+                pbar.update(20)  # 変換完了
+                
+                # メタデータ設定など
+                # ... (既存のコード)
+                
+                pbar.update(40)  # 完了
+        else:
+            result_gpu: da.Array = algo.process(gpu_arr, **params)
+            result_cpu = result_gpu.map_blocks(
+                cp.asnumpy, 
+                dtype="float32",
+                meta=cp.empty((0, 0), dtype=cp.float32).get()
+            )
         
         # 6‑4) GPU→CPU 戻し（改善：明示的なdtype）
         result_cpu = result_gpu.map_blocks(
