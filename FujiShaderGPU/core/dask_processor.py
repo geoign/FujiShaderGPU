@@ -536,6 +536,19 @@ def run_pipeline(
         
         # 6‑2.5) 自動決定（RVIアルゴリズムの場合）
         if algorithm == "rvi":
+            # ピクセルサイズを先に取得（座標系から）
+            try:
+                x_res = abs(float(dem.rio.resolution()[0]))
+                y_res = abs(float(dem.rio.resolution()[1]))
+                pixel_size = (x_res + y_res) / 2
+                logger.info(f"Detected pixel size: {pixel_size:.2f}")
+            except:
+                pixel_size = 1.0  # デフォルト
+                logger.warning("Could not determine pixel size, using 1.0")
+            
+            # パラメータに設定
+            params['pixel_size'] = pixel_size
+            
             # 新しい効率的なモードをデフォルトに
             if radii is None and sigmas is None and auto_radii:
                 logger.info("Analyzing terrain for automatic radii determination...")
@@ -572,22 +585,13 @@ def run_pipeline(
             
             else:
                 raise ValueError("Either provide radii/sigmas or enable auto_radii/auto_sigma")
-        
+
         # 6‑2.5) 自動sigma決定（必要な場合、RVIアルゴリズムのみ）
         if algorithm == "rvi" and sigmas is None and auto_sigma:
             logger.info("Analyzing terrain for automatic sigma determination...")
             
             # 地形解析
             terrain_stats = analyze_terrain_scales(gpu_arr)
-            
-            # ピクセルサイズを取得（座標系から）
-            try:
-                x_res = abs(float(dem.rio.resolution()[0]))
-                y_res = abs(float(dem.rio.resolution()[1]))
-                pixel_size = (x_res + y_res) / 2
-            except:
-                pixel_size = 1.0  # デフォルト
-                logger.warning("Could not determine pixel size, using 1.0")
             
             # 最適なsigmaを決定
             sigmas = determine_optimal_sigmas(terrain_stats, pixel_size)
@@ -600,17 +604,17 @@ def run_pipeline(
             
             # パラメータに設定
             params['sigmas'] = sigmas
-        
+
         elif algorithm == "rvi" and sigmas is None:
             # auto_sigmaがFalseでsigmasも指定されていない場合
             raise ValueError("Either provide sigmas or enable auto_sigma")
-        
+
         # RVIの場合は手動指定のsigmasを設定
         if algorithm == "rvi" and sigmas is not None:
             params['sigmas'] = sigmas
-        
-        # 多くのアルゴリズムでピクセルサイズが必要
-        if 'pixel_size' not in params or params['pixel_size'] == 1.0:
+
+        # 多くのアルゴリズムでピクセルサイズが必要（RVI以外の場合）
+        if algorithm != "rvi" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
             try:
                 x_res = abs(float(dem.rio.resolution()[0]))
                 y_res = abs(float(dem.rio.resolution()[1]))
