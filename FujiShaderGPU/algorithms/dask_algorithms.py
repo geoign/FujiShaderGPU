@@ -119,15 +119,20 @@ class RVIAlgorithm(DaskAlgorithm):
 
 def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str, 
                    show_progress: bool = True) -> da.Array:
-    """複数 σ の RVI を計算し、集約 (mean/min/max/sum/stack)。"""
-    results: List[da.Array] = []
+    """複数 σ の RVI を計算し、集約 (メモリ効率版)"""
     
-    # 進捗表示
+    # 最初のsigmaで初期化
+    if not sigmas:
+        raise ValueError("At least one sigma value is required")
+    
     iterator = tqdm(sigmas, desc="Computing scales") if show_progress else sigmas
     
-    for sigma in iterator:
+    result = None
+    
+    for i, sigma in enumerate(iterator):
         depth = int(4 * sigma)
-        # メタデータを明示的に指定
+        
+        # 各sigmaを個別に計算（メモリ効率向上）
         hp = da.map_overlap(
             high_pass,
             gpu_arr,
@@ -137,34 +142,32 @@ def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str,
             meta=cp.empty((0, 0), dtype=cp.float32),
             sigma=sigma,
         )
-        results.append(hp)
-
-    # メモリ効率化：直接集約する
-    if agg == "stack":
-        return da.stack(results, axis=0)
-    elif agg == "mean":
-        # より効率的な平均計算
-        result = results[0]
-        for i in range(1, len(results)):
-            result = result + results[i]
-        return result / len(results)
-    elif agg == "min":
-        result = results[0]
-        for i in range(1, len(results)):
-            result = da.minimum(result, results[i])
-        return result
-    elif agg == "max":
-        result = results[0]
-        for i in range(1, len(results)):
-            result = da.maximum(result, results[i])
-        return result
-    elif agg == "sum":
-        result = results[0]
-        for i in range(1, len(results)):
-            result = result + results[i]
-        return result
-    else:
-        raise ValueError(f"Unknown aggregation method: {agg}")
+        
+        if i == 0:
+            # 最初のsigma
+            if agg == "stack":
+                result = da.expand_dims(hp, axis=0)
+            else:
+                result = hp
+        else:
+            # 2番目以降のsigma
+            if agg == "stack":
+                result = da.concatenate([result, da.expand_dims(hp, axis=0)], axis=0)
+            elif agg == "mean":
+                result = (result * i + hp) / (i + 1)  # 累積平均
+            elif agg == "min":
+                result = da.minimum(result, hp)
+            elif agg == "max":
+                result = da.maximum(result, hp)
+            elif agg == "sum":
+                result = result + hp
+            else:
+                raise ValueError(f"Unknown aggregation method: {agg}")
+        
+        # メモリクリーンアップ
+        del hp
+    
+    return result
     
 ###############################################################################
 # 2.2. Hillshade アルゴリズム

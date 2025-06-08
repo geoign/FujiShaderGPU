@@ -44,7 +44,7 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     # 512の倍数に丸める（COGブロックサイズとの整合性）
     return max(2048, min(8192, (base_chunk // 512) * 512))
 
-def make_cluster(memory_fraction: float = 0.8) -> Tuple[LocalCUDACluster, Client]:
+def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:  # 0.8 → 0.6に削減
     """Colab A100 (40 GB VRAM) 用の最適化されたクラスタを構築"""
     try:
         # GPU情報を取得
@@ -55,7 +55,7 @@ def make_cluster(memory_fraction: float = 0.8) -> Tuple[LocalCUDACluster, Client
         else:
             gpu_memory_gb = 40  # デフォルトA100想定
             
-        rmm_size = int(gpu_memory_gb * memory_fraction * 0.9)  # 少し余裕を持たせる
+        rmm_size = int(gpu_memory_gb * memory_fraction * 0.7)  # さらに保守的に
         
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
@@ -162,7 +162,7 @@ def analyze_terrain_scales(dem_arr: da.Array, sample_ratio: float = 0.01) -> dic
 
 def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> List[float]:
     """地形統計に基づいて最適なsigma値を決定"""
-    sigmas = []
+    sigmas_set = set()  # setを使って重複を確実に排除
     
     # 1. 標高レンジと勾配に基づく基本スケール
     elev_range = terrain_stats['elevation_range']
@@ -184,30 +184,30 @@ def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> Li
         for scale in terrain_stats['dominant_scales']:
             if 10 < scale < 500:  # 現実的な範囲のスケールのみ
                 # Gaussianフィルタのsigmaは、検出されたスケールの約1/4
-                sigma_candidate = scale / 4
-                if sigma_candidate not in sigmas:  # 重複チェック追加
-                    sigmas.append(sigma_candidate)
+                sigma_candidate = round(scale / 4, 0)  # 整数に丸める
+                if 5 <= sigma_candidate <= 500:
+                    sigmas_set.add(sigma_candidate)
     
     # 3. 曲率に基づく微細スケール
     mean_curv = terrain_stats['mean_curvature']
     if mean_curv > 0.01:  # 曲率が高い場合は細かいスケールも追加
-        if 10 not in sigmas:  # 重複チェック
-            sigmas.append(10)
+        sigmas_set.add(10)
     
-    # 基本スケールとマージ
-    sigmas.extend(base_scales)
+    # 基本スケールを追加
+    for scale in base_scales:
+        if 5 <= scale <= 500:
+            sigmas_set.add(scale)
     
-    # 重複除去とソート（修正）
-    sigmas = sorted(list(set([round(s, 1) for s in sigmas if 5 <= s <= 500])))
+    # setをリストに変換してソート
+    sigmas = sorted(list(sigmas_set))
     
-    # 最大5つまでに制限（計算効率のため）
-    if len(sigmas) > 5:
-        # 対数的に間隔を取る（修正：NumPyを使用）
+    # 最大3つまでに制限（メモリ効率のため、5→3に削減）
+    if len(sigmas) > 3:
         import numpy as np
-        indices = np.logspace(0, np.log10(len(sigmas)-1), 5).astype(int)
+        indices = np.linspace(0, len(sigmas)-1, 3).astype(int)
         sigmas = [sigmas[i] for i in indices]
     
-    return sigmas
+    return [float(s) for s in sigmas]
 
 
 ###############################################################################
@@ -410,12 +410,13 @@ def run_pipeline(
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
         
-        # 地理座標系の大きなデータの場合はチャンクサイズを調整
+        # 地理座標系の大きなデータの場合はチャンクサイズを大幅に調整
         if dem.shape[0] > 30000 or dem.shape[1] > 30000:
-            logger.info("Large geographic dataset detected, adjusting chunk size for memory optimization")
-            chunk = min(chunk, 1024)  # チャンクサイズを小さくする
+            logger.info("Very large geographic dataset detected, using minimal chunk size")
+            chunk = 512  # より小さなチャンクサイズ
             # データを再チャンク
             dem = dem.chunk({"y": chunk, "x": chunk})
+            logger.info(f"Rechunked to {chunk}x{chunk}")
         
         # 6‑2) CuPy 配列へ変換（改善：メタデータ指定）
         gpu_arr: da.Array = dem.data.map_blocks(
