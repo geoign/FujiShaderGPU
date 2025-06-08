@@ -200,8 +200,8 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         """引数をパース（基底クラスをオーバーライド）"""
         parsed_args = super().parse_args(args)
         
-        # radiiのパース
-        if parsed_args.radii:
+        # radiiのパース（属性の存在チェックを追加）
+        if hasattr(parsed_args, 'radii') and parsed_args.radii:
             try:
                 parsed_args.radii_list = [int(r.strip()) for r in parsed_args.radii.split(",")]
             except ValueError:
@@ -209,8 +209,8 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         else:
             parsed_args.radii_list = None
         
-        # weightsのパース
-        if parsed_args.weights:
+        # weightsのパース（属性の存在チェックを追加）
+        if hasattr(parsed_args, 'weights') and parsed_args.weights:
             try:
                 parsed_args.weights_list = [float(w.strip()) for w in parsed_args.weights.split(",")]
             except ValueError:
@@ -246,11 +246,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # パラメータの準備
         params = self.get_common_params(args)
         
-        # アルゴリズム固有パラメータの準備
-        algo_params = {}
-        
-        # ... 既存のアルゴリズム固有パラメータ処理 ...
-        
         # ログ出力
         self.logger.info(f"=== Dask-CUDA地形解析 ===")
         self.logger.info(f"入力: {args.input}")
@@ -266,8 +261,17 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             args.auto_sigma = False
         if not hasattr(args, 'radii'):
             args.radii = None
+        if not hasattr(args, 'radii_list'):  # 追加
+            args.radii_list = None
         if not hasattr(args, 'weights'):
             args.weights = None
+        if not hasattr(args, 'weights_list'):  # 追加
+            args.weights_list = None
+
+        # アルゴリズム固有パラメータの準備
+        algo_params = {}
+        
+        # ... 既存のアルゴリズム固有パラメータ処理 ...
         
         # RVI用ログ出力
         if args.algorithm == "rvi":

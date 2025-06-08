@@ -117,7 +117,6 @@ def analyze_terrain_for_radii(dem_arr: da.Array, pixel_size: float = 1.0,
         'pixel_size': pixel_size
     }
 
-
 def determine_optimal_radii(terrain_stats: dict) -> tuple[List[int], List[float]]:
     """地形統計に基づいて最適な半径を決定"""
     pixel_size = terrain_stats.get('pixel_size', 1.0)
