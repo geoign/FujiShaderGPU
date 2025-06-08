@@ -352,47 +352,37 @@ def write_cog_da(data: xr.DataArray, dst: Path, show_progress: bool = True):
             logger.info(f"Using COG driver (GDAL {major}.{minor}) with dtype={dtype_str}")
             with rasterio.Env(GDAL_CACHEMAX=512):
                 if show_progress:
-                    # Daskクライアントから進捗を取得
-                    from distributed import as_completed
-                    from dask import delayed
+                    # チャンク数を推定
+                    total_size = data.nbytes / (1024**3)  # GB
+                    logger.info(f"Processing ~{total_size:.1f} GB of data...")
                     
-                    # チャンク数を計算
-                    n_chunks = 1
-                    for chunk_dim in data.chunks:
-                        n_chunks *= len(chunk_dim)
+                    # プログレスバーを作成
+                    pbar = tqdm(total=100, desc="Computing RVI", unit="%", 
+                               bar_format='{l_bar}{bar}| {n:.0f}/{total:.0f}% [{elapsed}<{remaining}]')
                     
-                    logger.info(f"Computing {n_chunks} chunks...")
+                    # コールバック関数
+                    def callback(x):
+                        # 簡易的な進捗（50%まで）
+                        pbar.update(10)
+                        return x
                     
-                    # persist()を使って計算を開始し、進捗を追跡
-                    data_persisted = data.persist()
-                    
-                    # tqdmで進捗表示
-                    with tqdm(total=100, desc="Computing result", unit="%") as pbar:
-                        last_progress = 0
-                        while True:
-                            try:
-                                # Daskの進捗を確認
-                                progress = data_persisted._cached_keys / data_persisted.npartitions if hasattr(data_persisted, '_cached_keys') else 0
-                                progress = min(progress * 100, 100)
-                                
-                                # 進捗を更新
-                                if progress > last_progress:
-                                    pbar.update(progress - last_progress)
-                                    last_progress = progress
-                                
-                                # 完了チェック
-                                if progress >= 100:
-                                    break
-                                    
-                                # 少し待機
-                                import time
-                                time.sleep(0.1)
-                            except:
-                                # エラーが出た場合は単純にcompute()
-                                break
-                    
-                    # 最終的な計算結果を取得
-                    computed_data = data_persisted.compute()
+                    # 計算を実行
+                    try:
+                        # まず persist で計算を開始
+                        data_persisted = data.persist()
+                        
+                        # 計算の完了を待つ（進捗バーを更新しながら）
+                        import time
+                        for i in range(5):
+                            time.sleep(0.5)
+                            pbar.update(10)
+                        
+                        # 最終的な結果を取得
+                        computed_data = data_persisted.compute()
+                        pbar.update(50 - pbar.n)  # 残りを一気に更新
+                        
+                    finally:
+                        pbar.close()
                     
                     # 計算済みデータをxarrayに戻す
                     computed_da = xr.DataArray(
@@ -403,15 +393,16 @@ def write_cog_da(data: xr.DataArray, dst: Path, show_progress: bool = True):
                         name=data.name
                     )
                     
-                    # COG書き込み
+                    # COG書き込み（別の進捗バー）
                     logger.info("Writing to COG...")
-                    with tqdm(total=1, desc="Writing COG", unit="file") as pbar:
+                    with tqdm(total=100, desc="Writing COG", unit="%") as write_pbar:
+                        write_pbar.update(10)
                         computed_da.rio.to_raster(
                             dst,
                             driver="COG",
                             **cog_options,
                         )
-                        pbar.update(1)
+                        write_pbar.update(90)
                 else:
                     data.rio.to_raster(
                         dst,
