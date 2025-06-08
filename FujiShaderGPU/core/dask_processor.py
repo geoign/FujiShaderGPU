@@ -12,7 +12,7 @@ from __future__ import annotations
 import os, subprocess, warnings, logging, rasterio, psutil, GPUtil
 from pathlib import Path
 from typing import List, Tuple, Optional, Union
-
+from osgeo import gdal
 import cupy as cp
 import numpy as np
 import dask.array as da
@@ -47,24 +47,27 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:  # 0.8 → 0.6に削減
     """Colab A100 (40 GB VRAM) 用の最適化されたクラスタを構築"""
+    """Colab A100用の最適化されたクラスタを構築"""
     try:
-        # GPU情報を取得
-        gpus = GPUtil.getGPUs()
-        if gpus:
-            gpu_memory_gb = gpus[0].memoryTotal / 1024
-            logger.info(f"GPU detected: {gpus[0].name}, Memory: {gpu_memory_gb:.1f} GB")
-        else:
-            gpu_memory_gb = 40  # デフォルトA100想定
+        # Google Colab環境の検出
+        import sys
+        is_colab = 'google.colab' in sys.modules
+        
+        if is_colab:
+            # Colabではより保守的な設定
+            memory_fraction = min(memory_fraction, 0.5)
             
-        # rmm_size = int(gpu_memory_gb * memory_fraction * 0.7)  # さらに保守的に  # この行を削除
-        rmm_size = int(gpu_memory_gb * memory_fraction * 0.5)  # さらに保守的に（0.7→0.5）
+        # ... 既存のコード ...
         
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
             jit_unspill=True,
             rmm_pool_size=f"{rmm_size}GB",
-            threads_per_worker=1,  # メモリ競合を避ける
+            threads_per_worker=1,
             silence_logs=logging.WARNING,
+            # Colab環境用の追加設定
+            death_timeout="60s" if is_colab else "30s",
+            interface="lo" if is_colab else None,
         )
         client = Client(cluster)
         logger.info(f"Dask dashboard: {client.dashboard_link}")
@@ -338,7 +341,7 @@ def check_gdal_version() -> tuple:
     minor = int(version[1:3])
     return major, minor
 
-def write_cog_da(data: xr.DataArray, dst: Path, show_progress: bool = True):
+def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """DataArray を直接 COG として保存（進捗表示付き）"""
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
@@ -419,6 +422,68 @@ def write_cog_da(data: xr.DataArray, dst: Path, show_progress: bool = True):
     else:
         logger.warning(f"GDAL {major}.{minor} < 3.8, using fallback method")
         _fallback_cog_write(data, dst, cog_options)
+
+def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
+    """大規模データ対応のチャンク単位COG書き出し"""
+    import tempfile
+    from rasterio.merge import merge
+    
+    major, minor = check_gdal_version()
+    use_cog_driver = major > 3 or (major == 3 and minor >= 8)
+    dtype_str = str(data.dtype)
+    cog_options = get_cog_options(dtype_str)
+    
+    # データサイズをチェック
+    total_gb = data.nbytes / (1024**3)
+    
+    if total_gb > 10:  # 10GB以上の場合はチャンク処理
+        logger.info(f"Large dataset ({total_gb:.1f} GB), using chunked writing")
+        
+        # 一時ディレクトリ作成
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # チャンクごとに処理
+            chunk_files = []
+            
+            # より小さなチャンクで処理
+            for i, chunk in enumerate(data.to_delayed().flatten()):
+                chunk_file = Path(tmpdir) / f"chunk_{i}.tif"
+                chunk_data = chunk.compute()
+                
+                # チャンクをGeoTIFFとして保存
+                chunk_da = xr.DataArray(
+                    chunk_data,
+                    dims=data.dims,
+                    coords={k: v[...] for k, v in data.coords.items()},
+                    attrs=data.attrs
+                )
+                
+                chunk_da.rio.to_raster(
+                    chunk_file,
+                    driver="GTiff",
+                    compress="ZSTD",
+                    tiled=True,
+                    blockxsize=512,
+                    blockysize=512
+                )
+                chunk_files.append(chunk_file)
+                
+                # メモリ解放
+                del chunk_data, chunk_da
+                
+            # VRTで統合してCOGに変換
+            vrt_file = Path(tmpdir) / "merged.vrt"
+            gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
+            
+            # COGに変換
+            gdal.Translate(
+                str(dst),
+                str(vrt_file),
+                format="COG" if use_cog_driver else "GTiff",
+                creationOptions=list(f"{k}={v}" for k, v in cog_options.items())
+            )
+    else:
+        # 既存の処理
+        _write_cog_da_original(data, dst, show_progress, use_cog_driver, cog_options)
 
 def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
     """フォールバック：一時ファイル経由でCOG作成"""
@@ -774,13 +839,25 @@ def run_pipeline(
         )
         
         # 6‑6) 出力 (直接 COG)
-        write_cog_da(result_da, Path(dst_cog), show_progress=show_progress)
+        write_cog_da_chunked(result_da, Path(dst_cog), show_progress=show_progress)
         
         logger.info("Pipeline completed successfully!")
+
+        import gc
+        gc.collect()
         
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
         raise
     finally:
-        client.close()
-        cluster.close()
+        # より確実なクリーンアップ
+        try:
+            client.close(timeout=10)
+            cluster.close(timeout=10)
+        except:
+            # 強制的にシャットダウン
+            client.shutdown()
+            
+        # Daskワーカープロセスの確実な終了を待つ
+        import time
+        time.sleep(2)
