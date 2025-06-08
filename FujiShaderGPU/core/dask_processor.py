@@ -45,9 +45,8 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     # return max(2048, min(8192, (base_chunk // 512) * 512))  # この行を削除
     return max(4096, min(8192, (base_chunk // 512) * 512))  # 最小値を4096に増加
 
-def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:  # 0.8 → 0.6に削減
+def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     """Colab A100 (40 GB VRAM) 用の最適化されたクラスタを構築"""
-    """Colab A100用の最適化されたクラスタを構築"""
     try:
         # Google Colab環境の検出
         import sys
@@ -56,14 +55,24 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         if is_colab:
             # Colabではより保守的な設定
             memory_fraction = min(memory_fraction, 0.5)
-            
-        # ... 既存のコード ...
+            logger.info("Google Colab環境を検出: メモリ設定を調整")
+        
+        # GPU情報を取得
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            gpu_memory_gb = gpus[0].memoryTotal / 1024
+            logger.info(f"GPU detected: {gpus[0].name}, Memory: {gpu_memory_gb:.1f} GB")
+        else:
+            gpu_memory_gb = 40  # デフォルトA100想定
+        
+        # rmm_sizeの計算（この行が重要！）
+        rmm_size = int(gpu_memory_gb * memory_fraction * 0.5)  # さらに保守的に
         
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
             jit_unspill=True,
             rmm_pool_size=f"{rmm_size}GB",
-            threads_per_worker=1,
+            threads_per_worker=1,  # メモリ競合を避ける
             silence_logs=logging.WARNING,
             # Colab環境用の追加設定
             death_timeout="60s" if is_colab else "30s",
