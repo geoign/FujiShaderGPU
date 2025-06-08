@@ -9,23 +9,18 @@ Dask-CUDA地形解析処理のコア実装
 ###############################################################################
 from __future__ import annotations
 
-import os
-import subprocess
-import warnings
+import os, subprocess, warnings, logging, rasterio, psutil, GPUtil
 from pathlib import Path
 from typing import List, Tuple, Optional
-import logging
 
 import cupy as cp
+import numpy as np
 import dask.array as da
 from dask_cuda import LocalCUDACluster
 from distributed import Client
 import xarray as xr
 import rioxarray as rxr
-import rasterio
 from tqdm.auto import tqdm
-import psutil
-import GPUtil
 
 # アルゴリズムのインポート
 try:
@@ -205,7 +200,7 @@ def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> Li
     # 最大5つまでに制限（計算効率のため）
     if len(sigmas) > 5:
         # 対数的に間隔を取る
-        indices = cp.logspace(0, cp.log10(len(sigmas)-1), 5).astype(int)
+        indices = np.logspace(0, np.log10(len(sigmas)-1), 5).astype(int)
         sigmas = [sigmas[i] for i in indices]
     
     return sigmas

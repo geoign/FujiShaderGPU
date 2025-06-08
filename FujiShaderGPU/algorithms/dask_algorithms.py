@@ -1062,7 +1062,11 @@ class SpecularAlgorithm(DaskAlgorithm):
 
 def compute_atmospheric_scattering_block(block: cp.ndarray, *, 
                                        scattering_strength: float = 0.5,
+                                       intensity: float | None = None,
                                        pixel_size: float = 1.0) -> cp.ndarray:
+    # intensity は scattering_strength のエイリアス（後方互換）
+    if intensity is not None:
+        scattering_strength = intensity
     """大気散乱によるシェーディング（Rayleigh散乱の簡略版）"""
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
