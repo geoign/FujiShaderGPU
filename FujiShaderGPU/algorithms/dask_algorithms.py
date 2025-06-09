@@ -471,8 +471,10 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     nan_mask = cp.isnan(block)
     
     # 基本の勾配を最初に計算（すべてのスケールで使用）
-    dy_orig, dx_orig = cp.gradient(block, pixel_size)
+    # 修正: NaN処理を追加
+    dy_orig, dx_orig, _ = handle_nan_for_gradient(block, scale=1.0, pixel_size=pixel_size)
     gradient_mag_base = cp.sqrt(dx_orig**2 + dy_orig**2)
+    gradient_mag_base = cp.where(cp.isnan(gradient_mag_base), 0, gradient_mag_base)
     
     saliency_maps = []
     
@@ -496,12 +498,22 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         
         # 勾配の強度（スケールに応じてスムージング）
         if scale > 1:
-            gradient_mag = gaussian_filter(gradient_mag_base, sigma=scale/2, mode='nearest')
+            # 修正: NaN処理を追加
+            if nan_mask.any():
+                filled_grad = cp.where(nan_mask, 0, gradient_mag_base)
+                valid = (~nan_mask).astype(cp.float32)
+                
+                smoothed_values = gaussian_filter(filled_grad * valid, sigma=scale/2, mode='nearest')
+                smoothed_weights = gaussian_filter(valid, sigma=scale/2, mode='nearest')
+                gradient_mag = cp.where(smoothed_weights > 0, smoothed_values / smoothed_weights, 0)
+            else:
+                gradient_mag = gaussian_filter(gradient_mag_base, sigma=scale/2, mode='nearest')
         else:
             gradient_mag = gradient_mag_base
         
         # 特徴の組み合わせ
         feature = contrast * 0.5 + gradient_mag * 0.5
+        feature = cp.where(cp.isnan(feature), 0, feature)
         saliency_maps.append(feature)
     
     # スケール間での正規化と統合
@@ -790,7 +802,7 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             
             # 高さの差と遮蔽角度
             height_diff = shifted - block
-            occlusion_angle = cp.maximum(0, cp.arctan(height_diff / (r + 1e-6)))
+            occlusion_angle = cp.maximum(0, cp.arctan(height_diff / (r * pixel_size + 1e-6)))
             
             # 距離による減衰
             distance_factor = 1.0 - (r_factor * 0.5)
@@ -802,7 +814,7 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
                                       0)
     
     # 正規化
-    ao = 1.0 - (occlusion_total / (num_samples * 4)) * intensity
+    ao = 1.0 - (occlusion_total / (num_samples * len(r_factors))) * intensity
     ao = cp.clip(ao, 0, 1)
     
     # スムージング（NaN考慮）
@@ -1367,6 +1379,16 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             
             # 詳細成分の抽出
             detail = gpu_arr - smoothed
+            def clean_detail(block):
+                nan_mask = cp.isnan(block)
+                if nan_mask.any():
+                    return cp.where(nan_mask, 0, block)
+                return block
+            detail = detail.map_blocks(
+                clean_detail,
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32)
+            )
             results.append(detail)
         
         # 重み付き合成（修正版）
@@ -1382,7 +1404,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             nan_mask = cp.isnan(blocks[0])
             
             # 正規化（0から1の範囲に）
-            valid_result = result[~nan_mask]
+            valid_result = result[~nan_mask] if nan_mask.any() else result.ravel()
             if len(valid_result) > 0:
                 min_val = cp.min(valid_result)
                 max_val = cp.max(valid_result)
