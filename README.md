@@ -23,6 +23,9 @@ fujishadergpu infile.tif outfile.tif --algo [See below for the supported algorit
 Colab Notebook Last Updated on: 2025/06/09.
 
 ## Algorithms アルゴリズム
+- The result of the most of the algorithms are calibrated to human vision gamma.
+- 多くの手法の結果データは、人間の知覚ガンマに合致するように正規化されています。
+
 ### Ridge Valley Index (RVI) 尾根谷度
 ![Sample image](images/RVI.jpg)
 ```bash
