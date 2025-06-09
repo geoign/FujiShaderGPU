@@ -66,7 +66,7 @@ def handle_nan_with_uniform(block: cp.ndarray, size: int, mode: str = 'nearest')
     
     sum_values = uniform_filter(filled * valid, size=size, mode=mode)
     sum_weights = uniform_filter(valid, size=size, mode=mode)
-    mean = cp.where(sum_weights > 0, sum_values / sum_weights, 0)
+    mean = uniform_filter(filled * valid, size=size, mode='reflect')
     
     return mean, nan_mask
 
@@ -147,7 +147,7 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
         else:
             # 大きな半径の場合
             kernel_size = 2 * radius + 1
-            mean_elev, _ = handle_nan_with_uniform(block, size=kernel_size, mode='nearest')
+            mean_elev, _ = handle_nan_with_uniform(block, size=kernel_size, mode='reflect')
         
         # インプレース演算でメモリ効率向上
         rvi_combined += weight * (block - mean_elev)
@@ -171,7 +171,7 @@ def multiscale_rvi_efficient(gpu_arr: da.Array, *,
     
     # 最大半径に基づいてdepthを設定（Gaussianよりも大幅に小さい）
     max_radius = max(radii)
-    depth = max_radius + 1  # 半径+1で十分
+    depth = max_radius * 2 + 1  # 半径の2倍+1に変更
     
     # 単一のmap_overlapで全スケールを計算（効率的）
     result = gpu_arr.map_overlap(
@@ -1363,7 +1363,7 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     light_alt_rad = cp.radians(light_altitude)
     light_dir = cp.array([
         cp.sin(light_az_rad) * cp.cos(light_alt_rad),
-        cp.cos(light_az_rad) * cp.cos(light_alt_rad),
+        -cp.cos(light_az_rad) * cp.cos(light_alt_rad),
         cp.sin(light_alt_rad)
     ])
     
@@ -1548,28 +1548,52 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             else:
                 smoothed = gpu_arr
             
-            # 詳細成分の抽出（NaN対応版）
-            def extract_detail(original, smoothed):
-                """NaNを考慮した詳細成分の抽出"""
-                nan_mask = cp.isnan(original)
+            # 詳細成分の抽出（map_overlapを使用）
+            def extract_detail_block(original_block, *, smoothed_arr, scale):
+                """NaNを考慮した詳細成分の抽出（単一ブロック用）"""
+                # smoothed_arrから同じ位置のブロックを取得
+                # map_overlapのdepthを考慮してスライス
+                depth = min(int(4 * scale), Constants.MAX_DEPTH) if scale > 1 else 0
                 
-                # NaNでない部分のみ差分を計算
-                detail = cp.zeros_like(original)
-                valid_mask = ~nan_mask & ~cp.isnan(smoothed)
-                detail[valid_mask] = original[valid_mask] - smoothed[valid_mask]
+                # smoothedブロックを取得（元のブロックと同じサイズ）
+                # この処理はmap_overlap内で自動的に行われるため、
+                # ここでは単純に差分を計算
+                nan_mask = cp.isnan(original_block)
                 
-                # NaN位置を保持
-                detail[nan_mask] = cp.nan
-                
-                return detail
+                # スムージングされたデータも同じdepthでmap_overlapを適用
+                return original_block  # 一時的に返す（下記の別アプローチを使用
             
-            detail = da.map_blocks(
-                extract_detail,
-                gpu_arr,
-                smoothed,
-                dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32)
-            )
+             # 別のアプローチ：差分計算もmap_overlapで統一
+            if scale > 1:
+                depth = min(int(4 * scale), Constants.MAX_DEPTH)
+                
+                # 差分計算用の関数
+                def compute_detail_with_smooth(block, *, scale):
+                    """ブロック内でスムージングと差分を同時に計算"""
+                    # スムージング
+                    smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
+                    
+                    # 差分計算
+                    detail = block - smoothed
+                    
+                    # NaN位置を保持
+                    detail = restore_nan(detail, nan_mask)
+                    
+                    return detail
+                
+                # map_overlapで差分を直接計算
+                detail = gpu_arr.map_overlap(
+                    compute_detail_with_smooth,
+                    depth=depth,
+                    boundary='reflect',
+                    dtype=cp.float32,
+                    meta=cp.empty((0, 0), dtype=cp.float32),
+                    scale=scale
+                )
+            else:
+                # scale=1の場合は元のデータをそのまま使用
+                detail = gpu_arr
+                
             results.append(detail)
         
         # 重み付き合成（NaN対応版）
