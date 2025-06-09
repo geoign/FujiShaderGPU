@@ -323,8 +323,24 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                 if show_progress:
                     # より詳細な進捗表示
                     logger.info("Computing result chunks...")
-                    from dask.diagnostics import ProgressBar
-                    with ProgressBar(dt=0.5, minimum=0, desc='Computing'):
+                    # tqdmを使用した進捗表示
+                    from tqdm.auto import tqdm
+                    from dask.callbacks import Callback
+                    
+                    class TqdmCallback(Callback):
+                        def __init__(self):
+                            self.tqdm = None
+                            
+                        def _start(self, dsk):
+                            self.tqdm = tqdm(total=len(dsk), desc='Computing', unit='tasks')
+                            
+                        def _posttask(self, key, result, dsk, state, worker_id):
+                            self.tqdm.update(1)
+                            
+                        def _finish(self, dsk, state, failed):
+                            self.tqdm.close()
+                    
+                    with TqdmCallback():
                         computed_data = data.compute()
                 else:
                     computed_data = data.compute()
@@ -756,14 +772,19 @@ def run_pipeline(
         # 進捗表示付きで計算を実行
         if show_progress:
             logger.info("Processing data chunks...")
-            from dask.diagnostics import ProgressBar
-            with ProgressBar(dt=0.5):
-                # ここで実際の計算を実行
-                result_cpu = result_cpu.persist()
-                
-        # Daskの計算が完了するまで待機
-        from dask.distributed import wait
-        wait(result_cpu)
+            # 分散環境用の進捗表示
+            from dask.distributed import as_completed, progress
+            
+            # persistを実行してFutureを取得
+            result_future = client.persist(result_cpu)
+            
+            # 進捗表示（分散環境対応）
+            progress(result_future, interval='1s')
+            
+            # 結果を取得
+            result_cpu = result_future
+        else:
+            result_cpu = result_cpu.persist()
     
         # 6‑5) xarray ラップ（改善：座標構築の簡略化）
         if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
