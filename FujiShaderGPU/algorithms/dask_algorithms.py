@@ -657,8 +657,12 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     
     # ヒステリシス処理（簡易版）- 弱いエッジを強いエッジに接続
     for _ in range(2):  # 2回繰り返して接続を強化
-        dilated = cp.roll(edges, 1, axis=0) | cp.roll(edges, -1, axis=0) | \
-                  cp.roll(edges, 1, axis=1) | cp.roll(edges, -1, axis=1)
+        dilated = cp.maximum.reduce([
+            cp.roll(edges, 1, axis=0),
+            cp.roll(edges, -1, axis=0),
+            cp.roll(edges, 1, axis=1),
+            cp.roll(edges, -1, axis=1)
+        ])
         edges = cp.where(weak & (dilated > 0.5), 1.0, edges)
     
     # エッジ強度を調整（完全な黒線を避ける）
@@ -815,9 +819,8 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
         dx_all = (r * directions[:, 0] / pixel_size).astype(int)
         dy_all = (r * directions[:, 1] / pixel_size).astype(int)
         
-        # パディング（最大変位分）
-        max_disp = int(r / pixel_size) + 1
-        padded = cp.pad(block, max_disp, mode='edge')
+        # パディング値の決定を削除（不要なコード）
+        # pad_value = Constants.NAN_FILL_VALUE_POSITIVE if openness_type == 'positive' else Constants.NAN_FILL_VALUE_NEGATIVE
         
         for i in range(num_samples):
             # CuPy配列から個別の値を取得して明示的にintに変換
@@ -833,10 +836,11 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             pad_top = max(0, -dy)
             pad_bottom = max(0, dy)
             
-            # パディング（NaN考慮）
+            # パディング（NaN考慮）- 修正: 定数値を適切に設定
             if nan_mask.any():
+                # AOの場合は周囲が低い値だと遮蔽が少ないので、低い値でパディング
                 padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                            mode='constant', constant_values=-1e6)
+                            mode='constant', constant_values=cp.nanmin(block))
             else:
                 padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
                             mode='edge')
