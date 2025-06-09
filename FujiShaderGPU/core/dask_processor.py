@@ -321,9 +321,10 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
             logger.info(f"Using COG driver (GDAL {major}.{minor}) with dtype={dtype_str}")
             with rasterio.Env(GDAL_CACHEMAX=512):
                 if show_progress:
-                    # Daskの組み込みプログレスバーを使用
+                    # より詳細な進捗表示
+                    logger.info("Computing result chunks...")
                     from dask.diagnostics import ProgressBar
-                    with ProgressBar(dt=0.5):
+                    with ProgressBar(dt=0.5, minimum=0, desc='Computing'):
                         computed_data = data.compute()
                 else:
                     computed_data = data.compute()
@@ -430,7 +431,7 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 },
                                 attrs=data.attrs
                             )
-                            
+
                             # 座標参照系を設定（存在する場合のみ）
                             if hasattr(data, 'rio') and data.rio.crs is not None:
                                 chunk_da.rio.write_crs(data.rio.crs, inplace=True)
@@ -739,40 +740,31 @@ def run_pipeline(
                 params['pixel_size'] = 1.0
                 logger.warning("Could not determine pixel size, using 1.0")
         
-        # 6‑3) アルゴリズム実行（run_pipeline内）
+        # 6-3) アルゴリズム実行（run_pipeline内）
         logger.info(f"Computing {algorithm} with parameters: {params}")
 
-        # 進捗表示付きでアルゴリズムを実行
+        # アルゴリズムを適用（遅延評価）
+        result_gpu: da.Array = algo.process(gpu_arr, **params)
+
+        # 6-4) GPU→CPU 戻し（改善：明示的なdtype）
+        result_cpu = result_gpu.map_blocks(
+            cp.asnumpy, 
+            dtype="float32",
+            meta=cp.empty((0, 0), dtype=cp.float32).get()
+        )
+
+        # 進捗表示付きで計算を実行
         if show_progress:
-            with tqdm(total=100, desc=f"Processing {algorithm.upper()}", unit="%") as pbar:
-                pbar.update(10)  # 開始
+            logger.info("Processing data chunks...")
+            from dask.diagnostics import ProgressBar
+            with ProgressBar(dt=0.5):
+                # ここで実際の計算を実行
+                result_cpu = result_cpu.persist()
                 
-                result_gpu: da.Array = algo.process(gpu_arr, **params)
-                pbar.update(30)  # アルゴリズム適用完了
-                
-                # GPU→CPU 戻し
-                result_cpu = result_gpu.map_blocks(
-                    cp.asnumpy, 
-                    dtype="float32",
-                    meta=cp.empty((0, 0), dtype=cp.float32).get()
-                )
-                pbar.update(20)  # 変換完了
-                
-                # メタデータ設定など
-                # ... (既存のコード)
-                
-                pbar.update(40)  # 完了
-        else:
-            result_gpu: da.Array = algo.process(gpu_arr, **params)
-            result_cpu = result_gpu.map_blocks(
-                cp.asnumpy, 
-                dtype="float32",
-                meta=cp.empty((0, 0), dtype=cp.float32).get()
-            )
-        
-        # 6‑4) GPU→CPU 戻し（改善：明示的なdtype）
+        # Daskの計算が完了するまで待機
+        from dask.distributed import wait
+        wait(result_cpu)
     
-        
         # 6‑5) xarray ラップ（改善：座標構築の簡略化）
         if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
             dims = ("scale", *dem.dims)
