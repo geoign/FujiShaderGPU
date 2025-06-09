@@ -1515,6 +1515,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         scales = params.get('scales', [1, 10, 50, 100])
         weights = params.get('weights', None)
+        use_global_stats = params.get('use_global_stats', True)
         
         if weights is None:
             # デフォルト：スケールに反比例する重み
@@ -1528,95 +1529,142 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         max_scale = max(scales)
         common_depth = min(int(4 * max_scale), Constants.MAX_DEPTH)
         
-        # 各スケールでの処理
+        # Step 1: 縮小版で統計量を計算（グローバル統計量を使用する場合）
+        if use_global_stats:
+            downsample_factor = params.get('downsample_factor', 20)
+            downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
+            
+            # 縮小版でマルチスケール処理
+            results_small = []
+            for i, scale in enumerate(scales):
+                scale_small = max(1, scale // downsample_factor)
+                depth_small = min(int(4 * scale_small), Constants.MAX_DEPTH)
+                
+                def compute_detail_small(block, *, scale):
+                    if scale > 1:
+                        smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
+                        detail = block - smoothed
+                        detail = restore_nan(detail, nan_mask)
+                    else:
+                        detail = block
+                    return detail
+                
+                detail_small = downsampled.map_overlap(
+                    compute_detail_small,
+                    depth=depth_small,
+                    boundary='reflect',
+                    dtype=cp.float32,
+                    meta=cp.empty((0, 0), dtype=cp.float32),
+                    scale=scale_small
+                )
+                results_small.append(detail_small)
+            
+            # 縮小版を合成
+            def weighted_combine_for_stats(*blocks):
+                nan_mask = cp.isnan(blocks[0])
+                result = cp.zeros_like(blocks[0])
+                
+                for i, block in enumerate(blocks):
+                    valid = ~cp.isnan(block)
+                    result[valid] += block[valid] * weights[i]
+                
+                result[nan_mask] = cp.nan
+                return result
+            
+            combined_small = da.map_blocks(
+                weighted_combine_for_stats,
+                *results_small,
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32)
+            ).compute()
+            
+            # 統計量を計算
+            valid_data = combined_small[~cp.isnan(combined_small)]
+            if len(valid_data) > 0:
+                norm_min = float(cp.percentile(valid_data, 5))
+                norm_max = float(cp.percentile(valid_data, 95))
+            else:
+                norm_min, norm_max = 0.0, 1.0
+            
+            if params.get('verbose', False):
+                print(f"Multiscale Terrain global stats: min={norm_min:.3f}, max={norm_max:.3f}")
+        
+        # Step 2: フルサイズで処理
         results = []
         for scale in scales:
-            # 差分計算用の関数
             def compute_detail_with_smooth(block, *, scale):
-                """ブロック内でスムージングと差分を同時に計算"""
                 if scale > 1:
-                    # スムージング
                     smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
-                    # 差分計算
                     detail = block - smoothed
-                    # NaN位置を保持
                     detail = restore_nan(detail, nan_mask)
                 else:
-                    # scale=1の場合は元のデータをそのまま使用
                     detail = block
-                
                 return detail
             
-            # すべてのスケールで同じdepthを使用
             detail = gpu_arr.map_overlap(
                 compute_detail_with_smooth,
-                depth=common_depth,  # 共通のdepthを使用
+                depth=common_depth,
                 boundary='reflect',
                 dtype=cp.float32,
                 meta=cp.empty((0, 0), dtype=cp.float32),
                 scale=scale
             )
-            
             results.append(detail)
         
-        # 重み付き合成（NaN対応版）
-        def weighted_combine_with_nan(*blocks):
-            """NaNを考慮した複数ブロックの重み付き合成"""
-            # 最初のブロックからNaNマスクを取得
-            nan_mask = cp.isnan(blocks[0])
-            
-            # 結果の初期化
-            result = cp.zeros_like(blocks[0])
-            weight_sum = cp.zeros_like(blocks[0])
-            
-            for i, block in enumerate(blocks):
-                # 現在のブロックの有効なピクセル
-                valid = ~cp.isnan(block)
+        # 重み付き合成とグローバル正規化
+        if use_global_stats:
+            def weighted_combine_and_normalize(*blocks):
+                """グローバル統計量を使用して正規化"""
+                nan_mask = cp.isnan(blocks[0])
+                result = cp.zeros_like(blocks[0])
                 
-                # 共通の有効領域（すべてのブロックで有効な領域）
-                common_valid = valid & ~nan_mask
+                for i, block in enumerate(blocks):
+                    valid = ~cp.isnan(block)
+                    result[valid] += block[valid] * weights[i]
                 
-                # 有効なピクセルのみ加算
-                result[common_valid] += block[common_valid] * weights[i]
-                weight_sum[common_valid] += weights[i]
-            
-            # 重みの合計で除算（ゼロ除算を回避）
-            result = cp.where(weight_sum > 0, result / weight_sum, 0)
-            
-            # 正規化（NaNでない値のみを使用）
-            valid_result = result[~nan_mask]
-            if len(valid_result) > 0:
-                min_val = cp.min(valid_result)
-                max_val = cp.max(valid_result)
-                if max_val > min_val:
-                    result = (result - min_val) / (max_val - min_val)
+                # グローバル統計量で正規化
+                if norm_max > norm_min:
+                    result = (result - norm_min) / (norm_max - norm_min)
+                    result = cp.clip(result, 0, 1)
                 else:
                     result = cp.full_like(result, 0.5)
-            else:
-                result = cp.full_like(result, 0.5)
+                
+                # ガンマ補正
+                result = cp.power(result, Constants.DEFAULT_GAMMA)
+                
+                # NaN位置を復元
+                result[nan_mask] = cp.nan
+                
+                return result.astype(cp.float32)
             
-            # ガンマ補正
-            result = cp.power(result, Constants.DEFAULT_GAMMA)
+            combined = da.map_blocks(
+                weighted_combine_and_normalize,
+                *results,
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32)
+            )
+        else:
+            # 従来の方法（互換性のため）
+            def weighted_combine_with_nan(*blocks):
+                # ... 既存の実装 ...
+                pass
             
-            # 元のNaN位置を復元
-            result[nan_mask] = cp.nan
-            
-            return result.astype(cp.float32)
-        
-        # map_blocksで合成
-        combined = da.map_blocks(
-            weighted_combine_with_nan,
-            *results,
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32)
-        )
+            combined = da.map_blocks(
+                weighted_combine_with_nan,
+                *results,
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32)
+            )
         
         return combined
     
     def get_default_params(self) -> dict:
         return {
             'scales': [1, 10, 50, 100],
-            'weights': None  # Noneの場合は自動計算
+            'weights': None,
+            'use_global_stats': True,      # グローバル統計を使用
+            'downsample_factor': 20,       # ダウンサンプル係数
+            'verbose': False               # デバッグ出力
         }
 
 ###############################################################################

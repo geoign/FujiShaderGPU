@@ -74,7 +74,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             help="複数スケールの集約方法 (default: mean)"
         )
         
-        # RVI固有（新しいオプション）
+        # RVI固有
         parser.add_argument(
             "--radii",
             type=str,
@@ -187,6 +187,150 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             default=50,
             help="最大探索距離 (ピクセル, default: 50)"
         )
+
+        # Frequency Enhancement固有
+        parser.add_argument(
+            "--target-frequency",
+            type=float,
+            default=0.1,
+            help="強調する周波数 (0-0.5の範囲, default: 0.1)"
+        )
+
+        parser.add_argument(
+            "--bandwidth",
+            type=float,
+            default=0.05,
+            help="周波数帯域幅 (default: 0.05)"
+        )
+
+        parser.add_argument(
+            "--enhancement",
+            type=float,
+            default=2.0,
+            help="強調の強度 (default: 2.0)"
+        )
+
+        # Specular固有
+        parser.add_argument(
+            "--roughness-scale",
+            type=float,
+            default=20.0,
+            help="ラフネス計算のスケール (default: 20.0)"
+        )
+
+        parser.add_argument(
+            "--shininess",
+            type=float,
+            default=10.0,
+            help="光沢の強さ (default: 10.0)"
+        )
+
+        parser.add_argument(
+            "--light-azimuth",
+            type=float,
+            default=315,
+            help="光源の方位角 (度, default: 315)"
+        )
+
+        parser.add_argument(
+            "--light-altitude",
+            type=float,
+            default=45,
+            help="光源の高度角 (度, default: 45)"
+        )
+
+        # Atmospheric Scattering固有
+        parser.add_argument(
+            "--scattering-strength",
+            type=float,
+            default=0.5,
+            help="大気散乱の強度 (default: 0.5)"
+        )
+
+        # Multiscale Terrain固有
+        parser.add_argument(
+            "--scales",
+            type=str,
+            help="マルチスケール地形のスケール。カンマ区切り (例: 1,10,50,100)"
+        )
+
+        parser.add_argument(
+            "--mst-weights",  # weightsと衝突を避けるため
+            type=str,
+            help="マルチスケール地形の重み。カンマ区切り (例: 0.4,0.3,0.2,0.1)"
+        )
+
+        # Visual Saliency固有
+        parser.add_argument(
+            "--vs-scales",  # scalesと衝突を避けるため
+            type=str,
+            help="視覚的顕著性のスケール。カンマ区切り (例: 2,4,8,16)"
+        )
+
+        parser.add_argument(
+            "--use-global-stats",
+            action="store_true",
+            default=True,
+            help="グローバル統計を使用 (default: True)"
+        )
+
+        parser.add_argument(
+            "--no-global-stats",
+            action="store_true",
+            help="グローバル統計を無効化"
+        )
+
+        parser.add_argument(
+            "--downsample-factor",
+            type=int,
+            default=20,
+            help="ダウンサンプル係数 (default: 20)"
+        )
+
+        # NPR Edges固有
+        parser.add_argument(
+            "--edge-sigma",
+            type=float,
+            default=1.0,
+            help="エッジ検出のぼかし強度 (default: 1.0)"
+        )
+
+        parser.add_argument(
+            "--threshold-low",
+            type=float,
+            default=0.2,
+            help="エッジ検出の下限閾値 (default: 0.2)"
+        )
+
+        parser.add_argument(
+            "--threshold-high",
+            type=float,
+            default=0.5,
+            help="エッジ検出の上限閾値 (default: 0.5)"
+        )
+
+        # Atmospheric Perspective固有
+        parser.add_argument(
+            "--depth-scale",
+            type=float,
+            default=1000.0,
+            help="深度スケール (default: 1000.0)"
+        )
+
+        parser.add_argument(
+            "--haze-strength",
+            type=float,
+            default=0.7,
+            help="ヘイズの強度 (default: 0.7)"
+        )
+
+        # Ambient Occlusion固有（num-samplesのみ追加）
+        parser.add_argument(
+            "--num-samples",
+            type=int,
+            default=16,
+            help="AO計算のサンプル数 (default: 16)"
+        )
         
         # 汎用強度パラメータ
         parser.add_argument(
@@ -218,6 +362,33 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         else:
             parsed_args.weights_list = None
         
+        # scalesのパース（multiscale_terrain用）
+        if hasattr(parsed_args, 'scales') and parsed_args.scales:
+            try:
+                parsed_args.scales_list = [float(s.strip()) for s in parsed_args.scales.split(",")]
+            except ValueError:
+                self.parser.error("無効なscales形式です。カンマ区切りの数値を指定してください: 1,10,50,100")
+        else:
+            parsed_args.scales_list = None
+
+        # mst_weightsのパース（multiscale_terrain用）
+        if hasattr(parsed_args, 'mst_weights') and parsed_args.mst_weights:
+            try:
+                parsed_args.mst_weights_list = [float(w.strip()) for w in parsed_args.mst_weights.split(",")]
+            except ValueError:
+                self.parser.error("無効なmst-weights形式です。カンマ区切りの数値を指定してください: 0.4,0.3,0.2,0.1")
+        else:
+            parsed_args.mst_weights_list = None
+
+        # vs_scalesのパース（visual_saliency用）
+        if hasattr(parsed_args, 'vs_scales') and parsed_args.vs_scales:
+            try:
+                parsed_args.vs_scales_list = [float(s.strip()) for s in parsed_args.vs_scales.split(",")]
+            except ValueError:
+                self.parser.error("無効なvs-scales形式です。カンマ区切りの数値を指定してください: 2,4,8,16")
+        else:
+            parsed_args.vs_scales_list = None
+
         return parsed_args
     
     def _validate_platform_args(self, args: argparse.Namespace):
@@ -228,6 +399,10 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # auto-sigmaフラグの処理（互換性）
         if hasattr(args, 'auto_sigma') and hasattr(args, 'no_auto_sigma'):
             args.auto_sigma = args.auto_sigma and not args.no_auto_sigma
+
+        # use_global_statsフラグの処理
+        if hasattr(args, 'use_global_stats') and hasattr(args, 'no_global_stats'):
+            args.use_global_stats = args.use_global_stats and not args.no_global_stats
         
         # RVIでradii/sigmaが未指定かつ自動決定も無効の場合エラー
         if args.algorithm == "rvi":
@@ -330,6 +505,65 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'radius'):
                 algo_params['radius'] = args.radius
         
+        # Frequency Enhancement固有
+        elif args.algorithm == 'frequency_enhancement':
+            if hasattr(args, 'target_frequency'):
+                algo_params['target_frequency'] = args.target_frequency
+            if hasattr(args, 'bandwidth'):
+                algo_params['bandwidth'] = args.bandwidth
+            if hasattr(args, 'enhancement'):
+                algo_params['enhancement'] = args.enhancement
+
+        # Specular固有
+        elif args.algorithm == 'specular':
+            if hasattr(args, 'roughness_scale'):
+                algo_params['roughness_scale'] = args.roughness_scale
+            if hasattr(args, 'shininess'):
+                algo_params['shininess'] = args.shininess
+            if hasattr(args, 'light_azimuth'):
+                algo_params['light_azimuth'] = args.light_azimuth
+            if hasattr(args, 'light_altitude'):
+                algo_params['light_altitude'] = args.light_altitude
+
+        # Atmospheric Scattering固有
+        elif args.algorithm == 'atmospheric_scattering':
+            if hasattr(args, 'scattering_strength'):
+                algo_params['scattering_strength'] = args.scattering_strength
+
+        # Multiscale Terrain固有
+        elif args.algorithm == 'multiscale_terrain':
+            if hasattr(args, 'scales_list') and args.scales_list:
+                algo_params['scales'] = args.scales_list
+            if hasattr(args, 'mst_weights_list') and args.mst_weights_list:
+                algo_params['weights'] = args.mst_weights_list
+
+        # Visual Saliency固有
+        elif args.algorithm == 'visual_saliency':
+            if hasattr(args, 'vs_scales_list') and args.vs_scales_list:
+                algo_params['scales'] = args.vs_scales_list
+            if hasattr(args, 'use_global_stats'):
+                # no_global_statsとの処理
+                use_global = args.use_global_stats and not getattr(args, 'no_global_stats', False)
+                algo_params['use_global_stats'] = use_global
+            if hasattr(args, 'downsample_factor'):
+                algo_params['downsample_factor'] = args.downsample_factor
+
+        # NPR Edges固有
+        elif args.algorithm == 'npr_edges':
+            if hasattr(args, 'edge_sigma'):
+                algo_params['edge_sigma'] = args.edge_sigma
+            if hasattr(args, 'threshold_low'):
+                algo_params['threshold_low'] = args.threshold_low
+            if hasattr(args, 'threshold_high'):
+                algo_params['threshold_high'] = args.threshold_high
+
+        # Atmospheric Perspective固有
+        elif args.algorithm == 'atmospheric_perspective':
+            if hasattr(args, 'depth_scale'):
+                algo_params['depth_scale'] = args.depth_scale
+            if hasattr(args, 'haze_strength'):
+                algo_params['haze_strength'] = args.haze_strength
+
         # RVI用ログ出力
         if args.algorithm == "rvi":
             if args.use_sigma_mode:
