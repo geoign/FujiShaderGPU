@@ -803,118 +803,93 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
                                   radius: float = 10.0,
                                   intensity: float = 1.0,
                                   pixel_size: float = 1.0) -> cp.ndarray:
-    """スクリーン空間環境光遮蔽（SSAO）の地形版（デバッグ版）"""
+    """スクリーン空間環境光遮蔽（SSAO）の地形版（高速ベクトル化版）"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
-    
-    # デバッグ: 入力データの確認
-    if not nan_mask.all():
-        valid_data = block[~nan_mask]
-        print(f"[DEBUG] Input block stats - min: {cp.min(valid_data):.2f}, max: {cp.max(valid_data):.2f}, mean: {cp.mean(valid_data):.2f}")
     
     # サンプリング方向を事前計算
     angles = cp.linspace(0, 2 * cp.pi, num_samples, endpoint=False)
     directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
     
-    # 距離のサンプリング（より細かく）
-    r_factors = cp.array([0.1, 0.3, 0.5, 0.7, 0.9])
+    # 距離のサンプリング
+    r_factors = cp.array([0.25, 0.5, 0.75, 1.0])
     
-    # 遮蔽カウント用
-    occlusion_count = cp.zeros((h, w), dtype=cp.float32)
-    total_samples = cp.zeros((h, w), dtype=cp.float32)
+    # 全サンプル点の座標を事前計算（ベクトル化）
+    occlusion_total = cp.zeros((h, w), dtype=cp.float32)
+    sample_count = cp.zeros((h, w), dtype=cp.float32)  # 有効なサンプル数をカウント
     
-    # デバッグ用カウンタ
-    positive_occlusion_count = 0
-    total_comparisons = 0
+    # パディング値の決定
+    pad_value = Constants.NAN_FILL_VALUE_POSITIVE
     
     # バッチ処理で高速化
-    for r_idx, r_factor in enumerate(r_factors):
+    for r_factor in r_factors:
         r = radius * r_factor
         
-        # 全方向の変位を一度に計算
-        dx_all = cp.round(r * directions[:, 0] / pixel_size).astype(int)
-        dy_all = cp.round(r * directions[:, 1] / pixel_size).astype(int)
+        # 全方向の変位を一度に計算（ピクセル単位に変換）
+        # 修正: radiusはピクセル単位として扱う（pixel_sizeで除算しない）
+        dx_all = cp.round(r * directions[:, 0]).astype(int)
+        dy_all = cp.round(r * directions[:, 1]).astype(int)
         
         for i in range(num_samples):
+            # CuPy配列から個別の値を取得して明示的にintに変換
             dx = int(dx_all[i])
             dy = int(dy_all[i])
             
             if dx == 0 and dy == 0:
                 continue
             
-            # 必要な方向のみパディング（constant modeに変更）
+            # 必要な方向のみパディング
             pad_left = max(0, -dx)
             pad_right = max(0, dx)
             pad_top = max(0, -dy)
             pad_bottom = max(0, dy)
             
-            # パディング（constant modeで最小値を使用）
-            if nan_mask.any():
-                pad_value = cp.nanmin(block)
-            else:
-                pad_value = cp.min(block)
-            
+            # パディング（edge modeを使用）
             padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                        mode='constant', constant_values=pad_value)
+                        mode='edge')
             
             # シフト
             start_y = pad_top + dy
             start_x = pad_left + dx
             shifted = padded[start_y:start_y+h, start_x:start_x+w]
             
-            # 高さの差
+            # 高さの差と遮蔽角度
             height_diff = shifted - block
+            # 修正: 実際の距離（メートル）を使用
+            distance = r * pixel_size
+            occlusion_angle = cp.arctan(height_diff / distance)
             
-            # 有効なピクセルのマスク
+            # 正の角度のみを遮蔽として扱う（修正: より適切な遮蔽の計算）
+            # 角度を0-1の範囲に正規化（最大45度を1とする）
+            max_angle = cp.pi / 4  # 45度
+            occlusion = cp.maximum(0, occlusion_angle) / max_angle
+            occlusion = cp.minimum(occlusion, 1.0)  # 1を超えないようにクリップ
+            
+            # 距離による減衰（修正: より緩やかな減衰）
+            distance_factor = 1.0 - (r_factor * 0.3)  # 0.5から0.3に変更
+            
+            # 遮蔽の累積（NaNを除外）
             valid = ~(cp.isnan(shifted) | nan_mask)
-            
-            # デバッグ: 最初のサンプルで統計を出力
-            if r_idx == 0 and i == 0 and cp.any(valid):
-                valid_diff = height_diff[valid]
-                if len(valid_diff) > 0:
-                    print(f"[DEBUG] Height diff stats - min: {cp.min(valid_diff):.4f}, max: {cp.max(valid_diff):.4f}, positive ratio: {cp.sum(valid_diff > 0) / len(valid_diff):.2%}")
-            
-            # 遮蔽の判定（高い点による遮蔽）
-            # height_diffが正の場合、サンプル点の方が高い = 遮蔽あり
-            is_occluded = (height_diff > 0) & valid
-            
-            # 距離による重み（近いほど影響大）
-            weight = 1.0 - r_factor * 0.5
-            
-            # 遮蔽カウント
-            occlusion_count += cp.where(is_occluded, weight, 0)
-            total_samples += cp.where(valid, weight, 0)
-            
-            # デバッグカウンタ更新
-            total_comparisons += cp.sum(valid)
-            positive_occlusion_count += cp.sum(is_occluded)
+            occlusion_total += cp.where(valid, 
+                                      occlusion * distance_factor,
+                                      0)
+            sample_count += cp.where(valid, 1.0, 0)
     
-    # デバッグ: 遮蔽統計
-    if total_comparisons > 0:
-        occlusion_ratio = positive_occlusion_count / total_comparisons
-        print(f"[DEBUG] Total occlusion ratio: {occlusion_ratio:.2%}")
-        print(f"[DEBUG] Occlusion count - min: {cp.min(occlusion_count):.2f}, max: {cp.max(occlusion_count):.2f}")
-        print(f"[DEBUG] Total samples - min: {cp.min(total_samples):.2f}, max: {cp.max(total_samples):.2f}")
-    
+    # 正規化（修正: 有効なサンプル数で除算）
     # ゼロ除算を防ぐ
-    total_samples = cp.maximum(total_samples, 1.0)
+    sample_count = cp.maximum(sample_count, 1.0)
     
-    # 遮蔽率を計算（0-1の範囲）
-    occlusion_ratio = occlusion_count / total_samples
+    # 平均遮蔽を計算（修正: すでに0-1の範囲）
+    mean_occlusion = occlusion_total / sample_count
     
-    # デバッグ: 遮蔽率の統計
-    print(f"[DEBUG] Occlusion ratio - min: {cp.min(occlusion_ratio):.4f}, max: {cp.max(occlusion_ratio):.4f}, mean: {cp.mean(occlusion_ratio):.4f}")
-    
-    # AOの計算（遮蔽が多いほど暗く）
-    ao = 1.0 - occlusion_ratio * intensity
+    # AOの計算（修正: より直接的な計算）
+    # 遮蔽が多いほど暗くなる（0に近づく）
+    ao = 1.0 - mean_occlusion * intensity
     ao = cp.clip(ao, 0, 1)
-    
-    # デバッグ: AO値の統計
-    print(f"[DEBUG] AO before smoothing - min: {cp.min(ao):.4f}, max: {cp.max(ao):.4f}, mean: {cp.mean(ao):.4f}")
     
     # スムージング（NaN考慮）
     if nan_mask.any():
-        filled_ao = cp.where(nan_mask, 1.0, ao)
+        filled_ao = cp.where(nan_mask, 1.0, ao)  # NaN領域は明るく（遮蔽なし）
         ao = gaussian_filter(filled_ao, sigma=1.0, mode='nearest')
     else:
         ao = gaussian_filter(ao, sigma=1.0, mode='nearest')
@@ -922,14 +897,11 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     # ガンマ補正
     result = cp.power(ao, Constants.DEFAULT_GAMMA)
     
-    # デバッグ: 最終結果の統計
-    print(f"[DEBUG] Final result - min: {cp.min(result):.4f}, max: {cp.max(result):.4f}, mean: {cp.mean(result):.4f}")
-    print("-" * 50)
-    
     # NaN処理
     result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
+
 
 class AmbientOcclusionAlgorithm(DaskAlgorithm):
     """環境光遮蔽アルゴリズム"""
@@ -940,7 +912,8 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         intensity = params.get('intensity', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
         
-        # AOは計算量が多いため、チャンクごとに処理
+        # 修正: radiusをピクセル単位として扱うので、pixel_sizeで除算しない
+        # ユーザーが指定するradiusは既にピクセル単位
         return gpu_arr.map_overlap(
             compute_ambient_occlusion_block,
             depth=int(radius + 1),
@@ -956,7 +929,7 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
     def get_default_params(self) -> dict:
         return {
             'num_samples': 16,
-            'radius': 10.0,
+            'radius': 10.0,     # ピクセル単位の探索半径
             'intensity': 1.0,
             'pixel_size': 1.0
         }
