@@ -277,6 +277,58 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         algo_params = {}
         
         # ... 既存のアルゴリズム固有パラメータ処理 ...
+        # 共通パラメータ
+        if hasattr(args, 'intensity'):
+            algo_params['intensity'] = args.intensity
+
+        # Hillshade固有
+        if args.algorithm == 'hillshade':
+            if hasattr(args, 'azimuth'):
+                algo_params['azimuth'] = args.azimuth
+            if hasattr(args, 'altitude'):
+                algo_params['altitude'] = args.altitude
+            if hasattr(args, 'z_factor'):
+                algo_params['z_factor'] = args.z_factor
+            if hasattr(args, 'multiscale'):
+                algo_params['multiscale'] = args.multiscale
+
+        # Slope固有
+        elif args.algorithm == 'slope':
+            if hasattr(args, 'unit'):
+                algo_params['unit'] = args.unit
+
+        # Curvature固有
+        elif args.algorithm == 'curvature':
+            if hasattr(args, 'curvature_type'):
+                algo_params['curvature_type'] = args.curvature_type
+
+        # TPI固有
+        elif args.algorithm == 'tpi':
+            if hasattr(args, 'radius'):
+                algo_params['radius'] = args.radius
+
+        # LRM固有
+        elif args.algorithm == 'lrm':
+            if hasattr(args, 'kernel_size'):
+                algo_params['kernel_size'] = args.kernel_size
+
+        # Openness固有
+        elif args.algorithm == 'openness':
+            if hasattr(args, 'radius'):
+                algo_params['radius'] = args.radius
+            if hasattr(args, 'openness_type'):
+                algo_params['openness_type'] = args.openness_type
+            if hasattr(args, 'num_directions'):
+                algo_params['num_directions'] = args.num_directions
+            if hasattr(args, 'max_distance'):
+                algo_params['max_distance'] = args.max_distance
+
+        # Ambient Occlusion固有
+        elif args.algorithm == 'ambient_occlusion':
+            if hasattr(args, 'num_samples'):
+                algo_params['num_samples'] = args.num_samples
+            if hasattr(args, 'radius'):
+                algo_params['radius'] = args.radius
         
         # RVI用ログ出力
         if args.algorithm == "rvi":
