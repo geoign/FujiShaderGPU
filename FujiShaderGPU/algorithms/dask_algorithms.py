@@ -1003,6 +1003,9 @@ def compute_openness_vectorized(block: cp.ndarray, *,
         
         for offset in offsets:
             offset_x, offset_y = offset
+            # CuPy配列要素をPython intに明示的に変換
+            offset_x = int(offset_x)
+            offset_y = int(offset_y)
             
             if offset_x == 0 and offset_y == 0:
                 continue
@@ -1021,6 +1024,7 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                 padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
                               mode='edge')
             
+            # 以下は変更なし
             # シフト（簡潔な記述）
             start_y = pad_top + offset_y
             start_x = pad_left + offset_x
@@ -1143,23 +1147,34 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     # ラフネスの計算（局所的な標高の分散）
     kernel_size = int(roughness_scale)
     
-    roughness = cp.zeros_like(block)
-    # ラフネスの高速計算（局所標準偏差）
-
-    # 平均と平均二乗を計算
-    mean_filter = uniform_filter(block, size=kernel_size, mode='constant')
-    mean_sq_filter = uniform_filter(block**2, size=kernel_size, mode='constant')
-
+    # NaN対応のラフネス計算
+    if nan_mask.any():
+        filled = cp.where(nan_mask, 0, block)
+        valid = (~nan_mask).astype(cp.float32)
+        
+        # 平均と平均二乗を計算（NaN考慮）
+        mean_values = uniform_filter(filled * valid, size=kernel_size, mode='constant')
+        mean_weights = uniform_filter(valid, size=kernel_size, mode='constant')
+        mean_filter = cp.where(mean_weights > 0, mean_values / mean_weights, 0)
+        
+        sq_values = uniform_filter((filled**2) * valid, size=kernel_size, mode='constant')
+        mean_sq_filter = cp.where(mean_weights > 0, sq_values / mean_weights, 0)
+    else:
+        # 平均と平均二乗を計算
+        mean_filter = uniform_filter(block, size=kernel_size, mode='constant')
+        mean_sq_filter = uniform_filter(block**2, size=kernel_size, mode='constant')
+    
     # 標準偏差 = sqrt(E[X^2] - E[X]^2)
     roughness = cp.sqrt(cp.maximum(mean_sq_filter - mean_filter**2, 0))
-
-    # NaN処理
-    roughness = restore_nan(roughness, nan_mask)
     
-    # ラフネスを正規化
-    roughness_valid = roughness[~cp.isnan(roughness)]
-    if len(roughness_valid) > 0:
-        roughness = cp.clip(roughness / cp.max(roughness_valid), 0.01, 1.0)
+    # ラフネスを正規化（より適切な範囲に）
+    roughness_valid = roughness[~nan_mask] if nan_mask.any() else roughness
+    if len(roughness_valid) > 0 and cp.max(roughness_valid) > 0:
+        roughness = roughness / cp.max(roughness_valid)
+        # 最小値を設定して完全な鏡面反射を防ぐ
+        roughness = cp.clip(roughness, 0.1, 1.0)
+    else:
+        roughness = cp.full_like(block, 0.5)
     
     # 光源方向
     light_az_rad = cp.radians(light_azimuth)
@@ -1176,12 +1191,25 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     # ハーフベクトル
     half_vec = (light_dir + view_dir) / cp.linalg.norm(light_dir + view_dir)
     
-    # スペキュラー計算
-    n_dot_h = cp.clip(cp.dot(normal, half_vec), 0, 1)
-    specular = cp.power(n_dot_h, shininess / roughness)
+    # スペキュラー計算（ドット積を正しく計算）
+    n_dot_h = cp.sum(normal * half_vec.reshape(1, 1, 3), axis=-1)
+    n_dot_h = cp.clip(n_dot_h, 0, 1)
     
-    # ガンマ補正（視覚的に適切な明るさに）
-    result = cp.power(specular, Constants.DEFAULT_GAMMA)
+    # より穏やかな指数を使用
+    exponent = shininess * (1.0 - roughness * 0.8)  # roughnessが高いほど指数を下げる
+    specular = cp.power(n_dot_h, exponent)
+    
+    # ディフューズ成分も追加（完全な黒を防ぐ）
+    n_dot_l = cp.sum(normal * light_dir.reshape(1, 1, 3), axis=-1)
+    n_dot_l = cp.clip(n_dot_l, 0, 1)
+    diffuse = n_dot_l * 0.3  # ディフューズ成分を30%
+    
+    # 合成
+    result = diffuse + specular * 0.7
+    result = cp.clip(result, 0, 1)
+    
+    # ガンマ補正（より明るくするため、ガンマ値を調整）
+    result = cp.power(result, 0.7)  # Constants.DEFAULT_GAMMAの代わりに0.7を使用
     
     # NaN処理
     result = restore_nan(result, nan_mask)
@@ -1213,8 +1241,8 @@ class SpecularAlgorithm(DaskAlgorithm):
     
     def get_default_params(self) -> dict:
         return {
-            'roughness_scale': 50.0,
-            'shininess': 20.0,
+            'roughness_scale': 20.0,  # 50.0から20.0に変更
+            'shininess': 10.0,        # 20.0から10.0に変更
             'light_azimuth': Constants.DEFAULT_AZIMUTH,
             'light_altitude': Constants.DEFAULT_ALTITUDE,
             'pixel_size': 1.0
