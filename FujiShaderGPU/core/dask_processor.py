@@ -89,15 +89,14 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
 # 3. 地形解析によるsigma自動決定
 ###############################################################################
 
-def analyze_terrain_for_radii(dem_arr: da.Array, pixel_size: float = 1.0, 
-                             sample_ratio: float = 0.01) -> dict:
-    """地形の特性を解析して最適な半径を推定"""
-    # サンプリングして計算を高速化
+def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01, 
+                                   include_fft: bool = False) -> dict:
+    """地形の特性を統合的に解析"""
+    # サンプリング処理（共通部分）
     h, w = dem_arr.shape
     sample_size = int(min(h, w) * sample_ratio)
-    sample_size = max(512, min(2048, sample_size))  # 512-2048の範囲に制限
+    sample_size = max(512, min(4096, sample_size))
     
-    # 中央部分をサンプリング
     cy, cx = h // 2, w // 2
     y1 = max(0, cy - sample_size // 2)
     y2 = min(h, cy + sample_size // 2)
@@ -106,28 +105,69 @@ def analyze_terrain_for_radii(dem_arr: da.Array, pixel_size: float = 1.0,
     
     sample = dem_arr[y1:y2, x1:x2].compute()
     
-    # NaN除去
+    # 基本統計（共通部分）
     valid_mask = ~cp.isnan(sample)
     if not valid_mask.any():
         raise ValueError("No valid elevation data found")
     
-    # 基本統計量
     elevations = sample[valid_mask]
-    elev_range = float(cp.ptp(elevations))
-    std_dev = float(cp.std(elevations))
+    stats = {
+        'elevation_range': float(cp.ptp(elevations)),
+        'std_dev': float(cp.std(elevations)),
+        'sample_size': sample.shape
+    }
     
-    # 勾配計算
+    # 勾配計算（共通部分）
     dy, dx = cp.gradient(sample)
     slope = cp.sqrt(dy**2 + dx**2)
     valid_slope = slope[valid_mask]
-    mean_slope = float(cp.mean(valid_slope))
+    stats['mean_slope'] = float(cp.mean(valid_slope))
+    stats['max_slope'] = float(cp.percentile(valid_slope, 95))
     
-    return {
-        'elevation_range': elev_range,
-        'std_dev': std_dev,
-        'mean_slope': mean_slope,
-        'pixel_size': pixel_size
-    }
+    # FFT解析（オプション）
+    if include_fft:
+        # 2次微分と曲率
+        dyy, dyx = cp.gradient(dy)
+        dxy, dxx = cp.gradient(dx)
+        curvature = cp.abs(dxx + dyy)
+        valid_curv = curvature[valid_mask]
+        stats['mean_curvature'] = float(cp.mean(valid_curv))
+        
+        # FFTによる周波数解析
+        if valid_mask.sum() > 1000:  # 十分なデータがある場合
+            # 2D FFTで主要な周波数成分を検出
+            fft = cp.fft.fft2(sample - cp.mean(elevations))
+            power = cp.abs(fft)**2
+            
+            # 放射状平均パワースペクトル
+            freq = cp.fft.fftfreq(sample.shape[0])
+            freq_grid = cp.sqrt(freq[:, None]**2 + freq[None, :]**2)
+            
+            # 周波数ビンごとの平均パワー
+            n_bins = 50
+            freq_bins = cp.linspace(0, 0.5, n_bins)
+            power_spectrum = []
+            
+            for i in range(n_bins - 1):
+                mask = (freq_grid >= freq_bins[i]) & (freq_grid < freq_bins[i+1])
+                if mask.any():
+                    power_spectrum.append(float(cp.mean(power[mask])))
+                else:
+                    power_spectrum.append(0)
+            
+            # 主要な周波数成分を検出
+            power_spectrum = cp.array(power_spectrum)
+            peak_indices = cp.where(power_spectrum > cp.percentile(power_spectrum, 90))[0]
+            
+            if len(peak_indices) > 0:
+                dominant_freqs = freq_bins[peak_indices]
+                # 周波数を空間スケールに変換（ピクセル単位）
+                dominant_scales = [float(1.0 / (f + 1e-10)) for f in dominant_freqs if f > 0.01]
+            else:
+                dominant_scales = []
+        else:
+            dominant_scales = []
+    return stats
 
 def determine_optimal_radii(terrain_stats: dict) -> tuple[List[int], List[float]]:
     """地形統計に基づいて最適な半径を決定"""
@@ -178,91 +218,6 @@ def determine_optimal_radii(terrain_stats: dict) -> tuple[List[int], List[float]
     weights = [w / total for w in weights]
     
     return radii, weights
-
-def analyze_terrain_scales(dem_arr: da.Array, sample_ratio: float = 0.01) -> dict:
-    """地形の特性を解析してスケールパラメータを推定"""
-    # サンプリングして計算を高速化
-    h, w = dem_arr.shape
-    sample_size = int(min(h, w) * sample_ratio)
-    sample_size = max(512, min(4096, sample_size))  # 512-4096の範囲に制限
-    
-    # 中央部分をサンプリング
-    cy, cx = h // 2, w // 2
-    y1 = max(0, cy - sample_size // 2)
-    y2 = min(h, cy + sample_size // 2)
-    x1 = max(0, cx - sample_size // 2)
-    x2 = min(w, cx + sample_size // 2)
-    
-    sample = dem_arr[y1:y2, x1:x2].compute()
-    
-    # NaN除去
-    valid_mask = ~cp.isnan(sample)
-    if not valid_mask.any():
-        raise ValueError("No valid elevation data found")
-    
-    # 基本統計量
-    elevations = sample[valid_mask]
-    elev_range = float(cp.ptp(elevations))
-    std_dev = float(cp.std(elevations))
-    
-    # 勾配計算
-    dy, dx = cp.gradient(sample)
-    slope = cp.sqrt(dy**2 + dx**2)
-    valid_slope = slope[valid_mask]
-    mean_slope = float(cp.mean(valid_slope))
-    max_slope = float(cp.percentile(valid_slope, 95))  # 95パーセンタイル
-    
-    # 2次微分（曲率の代理）
-    dyy, dyx = cp.gradient(dy)
-    dxy, dxx = cp.gradient(dx)
-    curvature = cp.abs(dxx + dyy)
-    valid_curv = curvature[valid_mask]
-    mean_curv = float(cp.mean(valid_curv))
-    
-    # FFTによる周波数解析
-    if valid_mask.sum() > 1000:  # 十分なデータがある場合
-        # 2D FFTで主要な周波数成分を検出
-        fft = cp.fft.fft2(sample - cp.mean(elevations))
-        power = cp.abs(fft)**2
-        
-        # 放射状平均パワースペクトル
-        freq = cp.fft.fftfreq(sample.shape[0])
-        freq_grid = cp.sqrt(freq[:, None]**2 + freq[None, :]**2)
-        
-        # 周波数ビンごとの平均パワー
-        n_bins = 50
-        freq_bins = cp.linspace(0, 0.5, n_bins)
-        power_spectrum = []
-        
-        for i in range(n_bins - 1):
-            mask = (freq_grid >= freq_bins[i]) & (freq_grid < freq_bins[i+1])
-            if mask.any():
-                power_spectrum.append(float(cp.mean(power[mask])))
-            else:
-                power_spectrum.append(0)
-        
-        # 主要な周波数成分を検出
-        power_spectrum = cp.array(power_spectrum)
-        peak_indices = cp.where(power_spectrum > cp.percentile(power_spectrum, 90))[0]
-        
-        if len(peak_indices) > 0:
-            dominant_freqs = freq_bins[peak_indices]
-            # 周波数を空間スケールに変換（ピクセル単位）
-            dominant_scales = [float(1.0 / (f + 1e-10)) for f in dominant_freqs if f > 0.01]
-        else:
-            dominant_scales = []
-    else:
-        dominant_scales = []
-    
-    return {
-        'elevation_range': elev_range,
-        'std_dev': std_dev,
-        'mean_slope': mean_slope,
-        'max_slope': max_slope,
-        'mean_curvature': mean_curv,
-        'dominant_scales': dominant_scales,
-        'sample_size': sample.shape
-    }
 
 def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> List[float]:
     """地形統計に基づいて最適なsigma値を決定"""
@@ -355,11 +310,9 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
     
-    # データ型を取得
     dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
-    # CRSが設定されていない場合の警告
     if not hasattr(data, 'rio') or data.rio.crs is None:
         logger.warning("No CRS found in data. Output may not have proper georeferencing.")
     
@@ -368,67 +321,33 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
             logger.info(f"Using COG driver (GDAL {major}.{minor}) with dtype={dtype_str}")
             with rasterio.Env(GDAL_CACHEMAX=512):
                 if show_progress:
-                    # チャンク数を推定
-                    total_size = data.nbytes / (1024**3)  # GB
-                    logger.info(f"Processing ~{total_size:.1f} GB of data...")
-                    
-                    # プログレスバーを作成
-                    pbar = tqdm(total=100, desc="Computing RVI", unit="%", 
-                               bar_format='{l_bar}{bar}| {n:.0f}/{total:.0f}% [{elapsed}<{remaining}]')
-                    
-                    # コールバック関数
-                    def callback(x):
-                        # 簡易的な進捗（50%まで）
-                        pbar.update(10)
-                        return x
-                    
-                    # 計算を実行
-                    try:
-                        # まず persist で計算を開始
-                        data_persisted = data.persist()
-                        
-                        # 計算の完了を待つ（進捗バーを更新しながら）
-                        import time
-                        for i in range(5):
-                            time.sleep(0.5)
-                            pbar.update(10)
-                        
-                        # 最終的な結果を取得
-                        computed_data = data_persisted.compute()
-                        pbar.update(50 - pbar.n)  # 残りを一気に更新
-                        
-                    finally:
-                        pbar.close()
-                    
-                    # 計算済みデータをxarrayに戻す
-                    computed_da = xr.DataArray(
-                        computed_data,
-                        dims=data.dims,
-                        coords=data.coords,
-                        attrs=data.attrs,
-                        name=data.name
-                    )
-                    
-                    # CRS情報を引き継ぐ
-                    if hasattr(data, 'rio') and data.rio.crs is not None:
-                        computed_da.rio.write_crs(data.rio.crs, inplace=True)
-                    
-                    # COG書き込み（別の進捗バー）
-                    logger.info("Writing to COG...")
-                    with tqdm(total=100, desc="Writing COG", unit="%") as write_pbar:
-                        write_pbar.update(10)
-                        computed_da.rio.to_raster(
-                            dst,
-                            driver="COG",
-                            **cog_options,
-                        )
-                        write_pbar.update(90)
+                    # Daskの組み込みプログレスバーを使用
+                    from dask.diagnostics import ProgressBar
+                    with ProgressBar(dt=0.5):
+                        computed_data = data.compute()
                 else:
-                    data.rio.to_raster(
-                        dst,
-                        driver="COG",
-                        **cog_options,
-                    )
+                    computed_data = data.compute()
+                
+                # 計算済みデータをxarrayに戻す
+                computed_da = xr.DataArray(
+                    computed_data,
+                    dims=data.dims,
+                    coords=data.coords,
+                    attrs=data.attrs,
+                    name=data.name
+                )
+                
+                # CRS情報を引き継ぐ
+                if hasattr(data, 'rio') and data.rio.crs is not None:
+                    computed_da.rio.write_crs(data.rio.crs, inplace=True)
+                
+                # COG書き込み
+                logger.info("Writing to COG...")
+                computed_da.rio.to_raster(
+                    dst,
+                    driver="COG",
+                    **cog_options,
+                )
             
             size_mb = os.path.getsize(dst) / 2**20
             logger.info(f"✔ COG written: {dst} ({size_mb:.1f} MB)")
@@ -506,8 +425,8 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 chunk_data,
                                 dims=data.dims,
                                 coords={
-                                    data.dims[0]: data.coords[data.dims[0]][y_slice],
-                                    data.dims[1]: data.coords[data.dims[1]][x_slice]
+                                    data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
+                                    data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
                                 },
                                 attrs=data.attrs
                             )
@@ -756,7 +675,7 @@ def run_pipeline(
                 logger.info("Analyzing terrain for automatic radii determination...")
                 
                 # 地形解析
-                terrain_stats = analyze_terrain_for_radii(gpu_arr, pixel_size)
+                terrain_stats = analyze_terrain_characteristics(gpu_arr, pixel_size, include_fft=False)
                 
                 # 最適な半径を決定
                 radii, weights = determine_optimal_radii(terrain_stats)
@@ -785,7 +704,7 @@ def run_pipeline(
                     logger.info("Analyzing terrain for automatic sigma determination...")
                     
                     # 地形解析
-                    terrain_stats = analyze_terrain_scales(gpu_arr)
+                    terrain_stats = analyze_terrain_characteristics(gpu_arr, pixel_size, include_fft=True)
                     
                     # 最適なsigmaを決定
                     sigmas = determine_optimal_sigmas(terrain_stats, pixel_size)

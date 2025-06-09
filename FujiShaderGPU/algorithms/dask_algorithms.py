@@ -10,6 +10,14 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, convolve
 from tqdm.auto import tqdm
 
+class Constants:
+    DEFAULT_GAMMA = 1/2.2
+    DEFAULT_AZIMUTH = 315
+    DEFAULT_ALTITUDE = 45
+    MAX_DEPTH = 200
+    NAN_FILL_VALUE_POSITIVE = -1e6
+    NAN_FILL_VALUE_NEGATIVE = 1e6
+    
 ###############################################################################
 # アルゴリズム基底クラスと共通インターフェース
 ###############################################################################
@@ -26,6 +34,57 @@ class DaskAlgorithm(ABC):
     def get_default_params(self) -> dict:
         """デフォルトパラメータを返す"""
         pass
+
+###############################################################################
+# NaN処理のユーティリティ関数
+###############################################################################
+
+def handle_nan_with_gaussian(block: cp.ndarray, sigma: float, mode: str = 'nearest') -> Tuple[cp.ndarray, cp.ndarray]:
+    """NaNを考慮したガウシアンフィルタ処理"""
+    nan_mask = cp.isnan(block)
+    if not nan_mask.any():
+        return gaussian_filter(block, sigma=sigma, mode=mode), nan_mask
+    
+    filled = cp.where(nan_mask, 0, block)
+    valid = (~nan_mask).astype(cp.float32)
+    
+    smoothed_values = gaussian_filter(filled * valid, sigma=sigma, mode=mode)
+    smoothed_weights = gaussian_filter(valid, sigma=sigma, mode=mode)
+    smoothed = cp.where(smoothed_weights > 0, smoothed_values / smoothed_weights, 0)
+    
+    return smoothed, nan_mask
+
+def handle_nan_with_uniform(block: cp.ndarray, size: int, mode: str = 'nearest') -> Tuple[cp.ndarray, cp.ndarray]:
+    """NaNを考慮したuniform_filter処理"""
+    nan_mask = cp.isnan(block)
+    if not nan_mask.any():
+        return uniform_filter(block, size=size, mode=mode), nan_mask
+    
+    filled = cp.where(nan_mask, 0, block)
+    valid = (~nan_mask).astype(cp.float32)
+    
+    sum_values = uniform_filter(filled * valid, size=size, mode=mode)
+    sum_weights = uniform_filter(valid, size=size, mode=mode)
+    mean = cp.where(sum_weights > 0, sum_values / sum_weights, 0)
+    
+    return mean, nan_mask
+
+def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0, 
+                          pixel_size: float = 1.0) -> Tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """NaNを考慮した勾配計算"""
+    nan_mask = cp.isnan(block)
+    if nan_mask.any():
+        filled = cp.where(nan_mask, cp.nanmean(block), block)
+    else:
+        filled = block
+    dy, dx = cp.gradient(filled * scale, pixel_size, edge_order=2)
+    return dy, dx, nan_mask
+    
+def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
+    """NaN位置を復元"""
+    if nan_mask.any():
+        result[nan_mask] = cp.nan
+    return result
 
 ###############################################################################
 # 2.1. RVI (Ridge-Valley Index) アルゴリズム
@@ -53,8 +112,7 @@ def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
     result = block - blurred
     
     # NaN位置を復元
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
         
     return result
 
@@ -62,52 +120,41 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
                                radii: List[int] = [4, 16, 64], 
                                weights: Optional[List[float]] = None,
                                pixel_size: float = 1.0) -> cp.ndarray:
-    """効率的なRVI計算（固定半径ベース）"""
-    # NaNマスクを保存
+    """効率的なRVI計算（メモリ最適化版）"""
     nan_mask = cp.isnan(block)
     
     if weights is None:
-        weights = [1.0 / len(radii)] * len(radii)
+        weights = cp.array([1.0 / len(radii)] * len(radii), dtype=cp.float32)
+    else:
+        weights = cp.array(weights, dtype=cp.float32)
     
-    # 結果の初期化
+    # 結果をインプレースで累積（メモリ効率向上）
     rvi_combined = cp.zeros_like(block, dtype=cp.float32)
+    
+    # NaN処理の前処理
+    if nan_mask.any():
+        filled = cp.where(nan_mask, 0, block)
+        valid = (~nan_mask).astype(cp.float32)
+    else:
+        filled = block
+        valid = None
     
     for radius, weight in zip(radii, weights):
         if radius <= 1:
-            # 小さな半径の場合はGaussianフィルタ
-            if nan_mask.any():
-                filled = cp.where(nan_mask, 0, block)
-                valid = (~nan_mask).astype(cp.float32)
-                smoothed_values = gaussian_filter(filled * valid, sigma=1.0, mode='nearest')
-                smoothed_weights = gaussian_filter(valid, sigma=1.0, mode='nearest')
-                mean_elev = cp.where(smoothed_weights > 0, smoothed_values / smoothed_weights, 0)
-            else:
-                mean_elev = gaussian_filter(block, sigma=1.0, mode='nearest')
+            # 小さな半径の場合
+            mean_elev, _ = handle_nan_with_gaussian(block, sigma=1.0, mode='nearest')
         else:
-            # 大きな半径の場合は効率的なuniform_filter
-            if nan_mask.any():
-                filled = cp.where(nan_mask, 0, block)
-                valid = (~nan_mask).astype(cp.float32)
-                
-                # 円形カーネルの近似として正方形カーネルを使用（高速）
-                kernel_size = 2 * radius + 1
-                sum_values = uniform_filter(filled * valid, size=kernel_size, mode='nearest')
-                sum_weights = uniform_filter(valid, size=kernel_size, mode='nearest')
-                mean_elev = cp.where(sum_weights > 0, sum_values / sum_weights, 0)
-            else:
-                kernel_size = 2 * radius + 1
-                mean_elev = uniform_filter(block, size=kernel_size, mode='nearest')
+            # 大きな半径の場合
+            kernel_size = 2 * radius + 1
+            mean_elev, _ = handle_nan_with_uniform(block, size=kernel_size, mode='nearest')
         
-        # RVI = 元の標高 - 平均標高
-        rvi_scale = block - mean_elev
-        rvi_combined += weight * rvi_scale
+        # インプレース演算でメモリ効率向上
+        rvi_combined += weight * (block - mean_elev)
         
-        # メモリクリーンアップ
-        del mean_elev, rvi_scale
+        # 明示的なメモリ解放は不要（CuPyが管理）
     
     # NaN処理
-    if nan_mask.any():
-        rvi_combined[nan_mask] = cp.nan
+    rvi_combined = restore_nan(rvi_combined, nan_mask)
     
     return rvi_combined
 
@@ -184,8 +231,7 @@ class RVIAlgorithm(DaskAlgorithm):
                 normalized = cp.zeros_like(block)
             
             # NaN位置を復元
-            if nan_mask.any():
-                normalized[nan_mask] = cp.nan
+            normalized = restore_nan(normalized, nan_mask)
             
             return normalized.astype(cp.float32)
         
@@ -251,7 +297,7 @@ def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str,
     for i, sigma in enumerate(iterator):
         # depth = int(4 * sigma)  # この行を削除
         # 大きなsigmaに対してdepthを制限
-        depth = min(int(4 * sigma), 200)  # 最大depth=200に制限
+        depth = min(int(4 * sigma), Constants.MAX_DEPTH)  # 最大depth=200に制限
         
         # 各sigmaを個別に計算（メモリ効率向上）
         hp = da.map_overlap(
@@ -294,8 +340,8 @@ def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str,
 # 2.2. Hillshade アルゴリズム
 ###############################################################################
 
-def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = 315, 
-                           altitude: float = 45, z_factor: float = 1.0,
+def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = Constants.DEFAULT_AZIMUTH, 
+                           altitude: float = Constants.DEFAULT_ALTITUDE, z_factor: float = 1.0,
                            pixel_size: float = 1.0) -> cp.ndarray:
     """1ブロックに対するHillshade計算"""
     # NaNマスクを保存
@@ -306,12 +352,7 @@ def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = 315,
     altitude_rad = cp.radians(altitude)
     
     # 勾配計算（中央差分）- NaNを含む場合は隣接値で補間
-    if nan_mask.any():
-        # NaNを隣接値で一時的に埋める
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
-        dy, dx = cp.gradient(filled * z_factor, pixel_size, edge_order=2)
-    else:
-        dy, dx = cp.gradient(block * z_factor, pixel_size, edge_order=2)
+    dy, dx, nan_mask = handle_nan_for_gradient(block, scale=z_factor, pixel_size=pixel_size)
     
     # 勾配と傾斜角
     slope = cp.arctan(cp.sqrt(dx**2 + dy**2))
@@ -331,8 +372,7 @@ def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = 315,
     hillshade = ((hillshade + 1) / 2 * 255).astype(cp.float32)
     
     # NaN処理
-    if nan_mask.any():
-        hillshade[nan_mask] = cp.nan
+    hillshade = restore_nan(hillshade, nan_mask)
     
     return hillshade
 
@@ -340,8 +380,8 @@ class HillshadeAlgorithm(DaskAlgorithm):
     """Hillshadeアルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        azimuth = params.get('azimuth', 315)
-        altitude = params.get('altitude', 45)
+        azimuth = params.get('azimuth', Constants.DEFAULT_AZIMUTH)
+        altitude = params.get('altitude', Constants.DEFAULT_ALTITUDE)
         z_factor = params.get('z_factor', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
         multiscale = params.get('multiscale', False)
@@ -407,8 +447,8 @@ class HillshadeAlgorithm(DaskAlgorithm):
     
     def get_default_params(self) -> dict:
         return {
-            'azimuth': 315,
-            'altitude': 45,
+            'azimuth': Constants.DEFAULT_AZIMUTH,
+            'altitude': Constants.DEFAULT_ALTITUDE,
             'z_factor': 1.0,
             'pixel_size': 1.0,
             'multiscale': False,
@@ -436,16 +476,7 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     for scale in scales:
         # ガウシアンピラミッドの作成
         if scale > 1:
-            if nan_mask.any():
-                # NaN領域を考慮したガウシアンフィルタ
-                filled = cp.where(nan_mask, 0, block)
-                valid = (~nan_mask).astype(cp.float32)
-                smoothed_values = gaussian_filter(filled * valid, sigma=scale, mode='nearest')
-                smoothed_weights = gaussian_filter(valid, sigma=scale, mode='nearest')
-                smoothed = cp.where(smoothed_weights > 0, smoothed_values / smoothed_weights, 0)
-            else:
-                smoothed = gaussian_filter(block, sigma=scale, mode='nearest')
-            center = smoothed  # この行を追加
+            smoothed, _ = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
         else:
             smoothed = block.copy()
         
@@ -455,13 +486,8 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         
         if nan_mask.any():
             # NaNがある場合はcenterとsurroundを両方計算
-            center = gaussian_filter(filled * valid, sigma=center_sigma, mode='nearest')
-            center_w = gaussian_filter(valid, sigma=center_sigma, mode='nearest')
-            center = cp.where(center_w > 0, center / center_w, 0)
-            
-            surround = gaussian_filter(filled * valid, sigma=surround_sigma, mode='nearest')
-            surround_w = gaussian_filter(valid, sigma=surround_sigma, mode='nearest')
-            surround = cp.where(surround_w > 0, surround / surround_w, 0)
+            center, _ = handle_nan_with_gaussian(block, sigma=center_sigma, mode='nearest')
+            surround, _ = handle_nan_with_gaussian(block, sigma=surround_sigma, mode='nearest')
         else:
             # NaNがない場合の最適化
             if scale > 1:
@@ -500,11 +526,10 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     combined_saliency /= len(scales)
     
     # ガンマ補正
-    result = cp.power(combined_saliency, 1/2.2)
+    result = cp.power(combined_saliency, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -512,14 +537,18 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
     """視覚的顕著性アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        max_scale = max(params.get('scales', [2, 4, 8, 16]))
+        scales = params.get('scales', [2, 4, 8, 16])
+        pixel_size = params.get('pixel_size', 1.0)
+        max_scale = max(scales)
+        
         return gpu_arr.map_overlap(
             compute_visual_saliency_block,
             depth=int(max_scale * 4),
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            scales=scales,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
@@ -601,11 +630,10 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     result = 1.0 - edges
     
     # ガンマ補正
-    result = cp.power(result, 1/2.2)
+    result = cp.power(result, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -613,13 +641,21 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     """NPR輪郭線アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        edge_sigma = params.get('edge_sigma', 1.0)
+        threshold_low = params.get('threshold_low', 0.1)
+        threshold_high = params.get('threshold_high', 0.3)
+        pixel_size = params.get('pixel_size', 1.0)
+        
         return gpu_arr.map_overlap(
             compute_npr_edges_block,
-            depth=int(params.get('edge_sigma', 1.0) * 4 + 2),
+            depth=int(edge_sigma * 4 + 2),
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            edge_sigma=edge_sigma,
+            threshold_low=threshold_low,
+            threshold_high=threshold_high,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
@@ -647,17 +683,13 @@ def compute_atmospheric_perspective_block(block: cp.ndarray, *,
     depth = cp.clip(depth, 0, 1)
     
     # Hillshadeの計算
-    if nan_mask.any():
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
-        dy, dx = cp.gradient(filled, pixel_size)
-    else:
-        dy, dx = cp.gradient(block, pixel_size)
+    dy, dx, nan_mask = handle_nan_for_gradient(block, scale=1, pixel_size=pixel_size)
     
     slope = cp.arctan(cp.sqrt(dx**2 + dy**2))
     aspect = cp.arctan2(-dy, dx)
     
-    azimuth_rad = cp.radians(315)
-    altitude_rad = cp.radians(45)
+    azimuth_rad = cp.radians(Constants.DEFAULT_AZIMUTH)
+    altitude_rad = cp.radians(Constants.DEFAULT_ALTITUDE)
     
     hillshade = cp.cos(altitude_rad) * cp.cos(slope) + \
                 cp.sin(altitude_rad) * cp.sin(slope) * cp.cos(aspect - azimuth_rad)
@@ -678,11 +710,10 @@ def compute_atmospheric_perspective_block(block: cp.ndarray, *,
     result = cp.clip(result, 0, 1)
     
     # ガンマ補正
-    result = cp.power(result, 1/2.2)
+    result = cp.power(result, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -690,13 +721,19 @@ class AtmosphericPerspectiveAlgorithm(DaskAlgorithm):
     """大気遠近法アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        depth_scale = params.get('depth_scale', 1000.0)
+        haze_strength = params.get('haze_strength', 0.7)
+        pixel_size = params.get('pixel_size', 1.0)
+        
         return gpu_arr.map_overlap(
             compute_atmospheric_perspective_block,
             depth=1,
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            depth_scale=depth_scale,
+            haze_strength=haze_strength,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
@@ -771,11 +808,10 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
         ao = gaussian_filter(ao, sigma=1.0, mode='nearest')
     
     # ガンマ補正
-    result = cp.power(ao, 1/2.2)
+    result = cp.power(ao, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -783,14 +819,22 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
     """環境光遮蔽アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        num_samples = params.get('num_samples', 16)
+        radius = params.get('radius', 10.0)
+        intensity = params.get('intensity', 1.0)
+        pixel_size = params.get('pixel_size', 1.0)
+        
         # AOは計算量が多いため、チャンクごとに処理
         return gpu_arr.map_overlap(
             compute_ambient_occlusion_block,
-            depth=int(params.get('radius', 10.0) + 1),
+            depth=int(radius + 1),
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            num_samples=num_samples,
+            radius=radius,
+            intensity=intensity,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
@@ -844,8 +888,7 @@ def compute_tpi_block(block: cp.ndarray, *, radius: int = 10,
     result = cp.clip(tpi, -1, 1)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -854,13 +897,15 @@ class TPIAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         radius = params.get('radius', 10)
+        pixel_size = params.get('pixel_size', 1.0)  # pixel_sizeを取得
         return gpu_arr.map_overlap(
             compute_tpi_block,
             depth=radius+1,
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            radius=radius,  # 明示的に必要なパラメータのみ渡す
+            pixel_size=pixel_size  # 明示的に必要なパラメータのみ渡す
         )
     
     def get_default_params(self) -> dict:
@@ -881,15 +926,7 @@ def compute_lrm_block(block: cp.ndarray, *, kernel_size: int = 25,
     
     # 大規模な地形トレンドを計算（NaN考慮）
     sigma = kernel_size / 3.0
-    if nan_mask.any():
-        filled = cp.where(nan_mask, 0, block)
-        valid = (~nan_mask).astype(cp.float32)
-        
-        trend_values = gaussian_filter(filled * valid, sigma=sigma, mode='nearest')
-        trend_weights = gaussian_filter(valid, sigma=sigma, mode='nearest')
-        trend = cp.where(trend_weights > 0, trend_values / trend_weights, 0)
-    else:
-        trend = gaussian_filter(block, sigma=sigma, mode='nearest')
+    trend, _ = handle_nan_with_gaussian(block, sigma=sigma, mode='nearest')
     
     # 微地形の抽出
     lrm = block - trend
@@ -905,8 +942,7 @@ def compute_lrm_block(block: cp.ndarray, *, kernel_size: int = 25,
     result = cp.clip(lrm, -1, 1)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -915,6 +951,7 @@ class LRMAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         kernel_size = params.get('kernel_size', 25)
+        pixel_size = params.get('pixel_size', 1.0)
         depth = int(kernel_size * 2)  # 十分なマージン
         return gpu_arr.map_overlap(
             compute_lrm_block,
@@ -922,7 +959,8 @@ class LRMAlgorithm(DaskAlgorithm):
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            kernel_size=kernel_size,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
@@ -940,62 +978,57 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                               num_directions: int = 16,
                               max_distance: int = 50,
                               pixel_size: float = 1.0) -> cp.ndarray:
-    """開度の計算（ベクトル化された高速版）"""
+    """開度の計算（最適化版）"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
     
-    # 方向ベクトル
+    # 方向ベクトルの事前計算
     angles = cp.linspace(0, 2 * cp.pi, num_directions, endpoint=False)
-    cos_angles = cp.cos(angles)
-    sin_angles = cp.sin(angles)
+    directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
     
-    # 結果の初期化
-    if openness_type == 'positive':
-        max_angles = cp.full((h, w), -cp.pi/2, dtype=cp.float32)
-    else:
-        max_angles = cp.full((h, w), cp.pi/2, dtype=cp.float32)
+    # 初期化
+    init_val = -cp.pi/2 if openness_type == 'positive' else cp.pi/2
+    max_angles = cp.full((h, w), init_val, dtype=cp.float32)
     
-    # アダプティブな距離サンプリング
-    for r_factor in cp.linspace(0.1, 1.0, 10):
-        r = int(max_distance * r_factor)
-        if r == 0:
-            continue
+    # 距離サンプルを事前計算（整数値に）
+    distances = cp.unique(cp.linspace(0.1, 1.0, 10) * max_distance).astype(int)
+    distances = distances[distances > 0]  # 0を除外
+    
+    # パディング値の決定
+    pad_value = Constants.NAN_FILL_VALUE_POSITIVE if openness_type == 'positive' else Constants.NAN_FILL_VALUE_NEGATIVE
+    
+    for r in distances:
+        # 全方向のオフセットを一度に計算
+        offsets = cp.round(r * directions).astype(int)
         
-        for i, (cos_a, sin_a) in enumerate(zip(cos_angles, sin_angles)):
-            # オフセット計算
-            offset_x = int(round(r * cos_a))
-            offset_y = int(round(r * sin_a))
+        for offset in offsets:
+            offset_x, offset_y = offset
             
             if offset_x == 0 and offset_y == 0:
                 continue
             
-            # パディングしてシフト
-            pad_x = (max(0, offset_x), max(0, -offset_x))
-            pad_y = (max(0, offset_y), max(0, -offset_y))
+            # パディングサイズの計算（簡潔に）
+            pad_left = max(0, -offset_x)
+            pad_right = max(0, offset_x)
+            pad_top = max(0, -offset_y)
+            pad_bottom = max(0, offset_y)
             
-            # NaN領域は非常に低い/高い値で埋める（遮蔽を計算しない）
+            # パディング（NaN考慮）
             if nan_mask.any():
-                fill_value = -1e6 if openness_type == 'positive' else 1e6
-                padded = cp.pad(block, (pad_y, pad_x), mode='constant', constant_values=fill_value)
+                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
+                              mode='constant', constant_values=pad_value)
             else:
-                padded = cp.pad(block, (pad_y, pad_x), mode='constant', constant_values=cp.nan)
+                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
+                              mode='edge')
             
-            # シフトして切り出し
-            if offset_y >= 0 and offset_x >= 0:
-                shifted = padded[offset_y:offset_y+h, offset_x:offset_x+w]
-            elif offset_y >= 0 and offset_x < 0:
-                # 負のオフセットの場合、パディングされた配列の適切な部分を取得
-                shifted = padded[offset_y:offset_y+h, pad_x[0]:pad_x[0]+w]
-            elif offset_y < 0 and offset_x >= 0:
-                shifted = padded[pad_y[0]:pad_y[0]+h, offset_x:offset_x+w]
-            else:
-                shifted = padded[pad_y[0]:pad_y[0]+h, pad_x[0]:pad_x[0]+w]
+            # シフト（簡潔な記述）
+            start_y = pad_top + offset_y
+            start_x = pad_left + offset_x
+            shifted = padded[start_y:start_y+h, start_x:start_x+w]
             
-            # 高さの差と角度
-            height_diff = shifted - block
-            angle = cp.arctan(height_diff / (r * pixel_size))
+            # 角度計算と更新
+            angle = cp.arctan((shifted - block) / (r * pixel_size))
             
-            # 最大/最小角度の更新
             if openness_type == 'positive':
                 valid = ~(cp.isnan(angle) | nan_mask)
                 max_angles = cp.where(valid, cp.maximum(max_angles, angle), max_angles)
@@ -1003,21 +1036,14 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                 valid = ~(cp.isnan(angle) | nan_mask)
                 max_angles = cp.where(valid, cp.minimum(max_angles, angle), max_angles)
     
-    # 開度の計算
-    if openness_type == 'positive':
-        openness = cp.pi/2 - max_angles
-    else:
-        openness = cp.pi/2 + max_angles
-    
-    # 正規化（0-1に）
+    # 開度の計算と正規化
+    openness = (cp.pi/2 - max_angles if openness_type == 'positive' 
+                else cp.pi/2 + max_angles)
     openness = cp.clip(openness / (cp.pi/2), 0, 1)
     
-    # ガンマ補正
-    result = cp.power(openness, 1/2.2)
-    
-    # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    # ガンマ補正とNaN処理
+    result = cp.power(openness, Constants.DEFAULT_GAMMA)
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -1026,13 +1052,19 @@ class OpennessAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         max_distance = params.get('max_distance', 50)
+        openness_type = params.get('openness_type', 'positive')
+        num_directions = params.get('num_directions', 16)
+        pixel_size = params.get('pixel_size', 1.0)
         return gpu_arr.map_overlap(
             compute_openness_vectorized,  # ベクトル化版を使用
             depth=max_distance+1,
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            openness_type=openness_type,
+            num_directions=num_directions,
+            max_distance=max_distance,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
@@ -1050,11 +1082,7 @@ def compute_slope_block(block: cp.ndarray, *, unit: str = 'degree',
     nan_mask = cp.isnan(block)
     
     # 勾配計算（NaN考慮）
-    if nan_mask.any():
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
-        dy, dx = cp.gradient(filled, pixel_size, edge_order=2)
-    else:
-        dy, dx = cp.gradient(block, pixel_size, edge_order=2)
+    dy, dx, nan_mask = handle_nan_for_gradient(block, scale=1, pixel_size=pixel_size)
     
     # 勾配の大きさ
     slope_rad = cp.arctan(cp.sqrt(dx**2 + dy**2))
@@ -1068,8 +1096,7 @@ def compute_slope_block(block: cp.ndarray, *, unit: str = 'degree',
         slope = slope_rad
     
     # NaN処理
-    if nan_mask.any():
-        slope[nan_mask] = cp.nan
+    slope = restore_nan(slope, nan_mask)
     
     return slope.astype(cp.float32)
 
@@ -1102,25 +1129,19 @@ class SlopeAlgorithm(DaskAlgorithm):
 
 def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
                           shininess: float = 20.0, pixel_size: float = 1.0,
-                          light_azimuth: float = 315, light_altitude: float = 45) -> cp.ndarray:
+                          light_azimuth: float = Constants.DEFAULT_AZIMUTH, light_altitude: float = Constants.DEFAULT_ALTITUDE) -> cp.ndarray:
     """金属光沢効果の計算（Cook-Torranceモデルの簡略版）"""
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
     # 法線ベクトルの計算
-    if nan_mask.any():
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
-        dy, dx = cp.gradient(filled, pixel_size, edge_order=2)
-    else:
-        dy, dx = cp.gradient(block, pixel_size, edge_order=2)
+    dy, dx, nan_mask = handle_nan_for_gradient(block, scale=1, pixel_size=pixel_size)
     
     normal = cp.stack([-dx, -dy, cp.ones_like(dx)], axis=-1)
     normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
     
     # ラフネスの計算（局所的な標高の分散）
     kernel_size = int(roughness_scale)
-    pad_width = kernel_size // 2
-    padded = cp.pad(block, pad_width, mode='edge')
     
     roughness = cp.zeros_like(block)
     # ラフネスの高速計算（局所標準偏差）
@@ -1133,8 +1154,7 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     roughness = cp.sqrt(cp.maximum(mean_sq_filter - mean_filter**2, 0))
 
     # NaN処理
-    if nan_mask.any():
-        roughness[nan_mask] = cp.nan
+    roughness = restore_nan(roughness, nan_mask)
     
     # ラフネスを正規化
     roughness_valid = roughness[~cp.isnan(roughness)]
@@ -1161,11 +1181,10 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     specular = cp.power(n_dot_h, shininess / roughness)
     
     # ガンマ補正（視覚的に適切な明るさに）
-    result = cp.power(specular, 1/2.2)
+    result = cp.power(specular, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -1173,21 +1192,31 @@ class SpecularAlgorithm(DaskAlgorithm):
     """金属光沢効果アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        roughness_scale = params.get('roughness_scale', 50.0)
+        shininess = params.get('shininess', 20.0)
+        pixel_size = params.get('pixel_size', 1.0)
+        light_azimuth = params.get('light_azimuth', Constants.DEFAULT_AZIMUTH)
+        light_altitude = params.get('light_altitude', Constants.DEFAULT_ALTITUDE)
+        
         return gpu_arr.map_overlap(
             compute_specular_block,
-            depth=int(params.get('roughness_scale', 50)),
+            depth=int(roughness_scale),
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            roughness_scale=roughness_scale,
+            shininess=shininess,
+            pixel_size=pixel_size,
+            light_azimuth=light_azimuth,
+            light_altitude=light_altitude
         )
     
     def get_default_params(self) -> dict:
         return {
             'roughness_scale': 50.0,
             'shininess': 20.0,
-            'light_azimuth': 315,
-            'light_altitude': 45,
+            'light_azimuth': Constants.DEFAULT_AZIMUTH,
+            'light_altitude': Constants.DEFAULT_ALTITUDE,
             'pixel_size': 1.0
         }
 
@@ -1199,19 +1228,16 @@ def compute_atmospheric_scattering_block(block: cp.ndarray, *,
                                        scattering_strength: float = 0.5,
                                        intensity: float | None = None,
                                        pixel_size: float = 1.0) -> cp.ndarray:
+    """大気散乱によるシェーディング（Rayleigh散乱の簡略版）"""
     # intensity は scattering_strength のエイリアス（後方互換）
     if intensity is not None:
         scattering_strength = intensity
-    """大気散乱によるシェーディング（Rayleigh散乱の簡略版）"""
+        
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
     # 法線計算
-    if nan_mask.any():
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
-        dy, dx = cp.gradient(filled, pixel_size, edge_order=2)
-    else:
-        dy, dx = cp.gradient(block, pixel_size, edge_order=2)
+    dy, dx, nan_mask = handle_nan_for_gradient(block, scale=1, pixel_size=pixel_size)
     
     slope = cp.sqrt(dx**2 + dy**2)
     
@@ -1228,8 +1254,8 @@ def compute_atmospheric_scattering_block(block: cp.ndarray, *,
     ambient = 0.4 + 0.6 * scattering
     
     # 通常のHillshadeと組み合わせ
-    azimuth_rad = cp.radians(315)
-    altitude_rad = cp.radians(45)
+    azimuth_rad = cp.radians(Constants.DEFAULT_AZIMUTH)
+    altitude_rad = cp.radians(Constants.DEFAULT_ALTITUDE)
     aspect = cp.arctan2(-dy, dx)
     
     hillshade = cp.cos(altitude_rad) * cp.cos(slope) + \
@@ -1240,11 +1266,10 @@ def compute_atmospheric_scattering_block(block: cp.ndarray, *,
     result = cp.clip(result, 0, 1)
     
     # ガンマ補正
-    result = cp.power(result, 1/2.2)
+    result = cp.power(result, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -1252,13 +1277,19 @@ class AtmosphericScatteringAlgorithm(DaskAlgorithm):
     """大気散乱光アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        scattering_strength = params.get('scattering_strength', 0.5)
+        intensity = params.get('intensity', None)
+        pixel_size = params.get('pixel_size', 1.0)
+        
         return gpu_arr.map_overlap(
             compute_atmospheric_scattering_block,
             depth=1,
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            scattering_strength=scattering_strength,
+            intensity=intensity,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
@@ -1325,11 +1356,10 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                     result = cp.full_like(result, 0.5)
             
             # ガンマ補正
-            result = cp.power(result, 1/2.2)
+            result = cp.power(result, Constants.DEFAULT_GAMMA)
             
             # NaN処理
-            if nan_mask.any():
-                result[nan_mask] = cp.nan
+            result = restore_nan(result, nan_mask)
             
             return result.astype(cp.float32)
         
@@ -1395,11 +1425,10 @@ def enhance_frequency_block(block: cp.ndarray, *, target_frequency: float = 0.1,
             enhanced = cp.full_like(enhanced, 0.5)
     
     # ガンマ補正
-    result = cp.power(enhanced, 1/2.2)
+    result = cp.power(enhanced, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -1407,11 +1436,17 @@ class FrequencyEnhancementAlgorithm(DaskAlgorithm):
     """周波数強調アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        target_frequency = params.get('target_frequency', 0.1)
+        bandwidth = params.get('bandwidth', 0.05)
+        enhancement = params.get('enhancement', 2.0)
+        
         return gpu_arr.map_blocks(
             enhance_frequency_block,
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            target_frequency=target_frequency,
+            bandwidth=bandwidth,
+            enhancement=enhancement
         )
     
     def get_default_params(self) -> dict:
@@ -1477,11 +1512,10 @@ def compute_curvature_block(block: cp.ndarray, *, curvature_type: str = 'mean',
     result = (curvature_normalized + 1) / 2  # 0-1に正規化
     
     # ガンマ補正
-    result = cp.power(result, 1/2.2)
+    result = cp.power(result, Constants.DEFAULT_GAMMA)
     
     # NaN処理
-    if nan_mask.any():
-        result[nan_mask] = cp.nan
+    result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
@@ -1489,13 +1523,17 @@ class CurvatureAlgorithm(DaskAlgorithm):
     """曲率アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        curvature_type = params.get('curvature_type', 'mean')
+        pixel_size = params.get('pixel_size', 1.0)
+        
         return gpu_arr.map_overlap(
             compute_curvature_block,
             depth=2,
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            **params
+            curvature_type=curvature_type,
+            pixel_size=pixel_size
         )
     
     def get_default_params(self) -> dict:
