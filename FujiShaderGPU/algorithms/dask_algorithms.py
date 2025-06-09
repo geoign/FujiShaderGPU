@@ -1536,9 +1536,14 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             
             # 縮小版でマルチスケール処理
             results_small = []
+
+            # 共通のdepthを計算（追加）
+            max_scale_small = max([max(1, s // downsample_factor) for s in scales])
+            common_depth_small = min(int(4 * max_scale_small), Constants.MAX_DEPTH)
+
             for i, scale in enumerate(scales):
                 scale_small = max(1, scale // downsample_factor)
-                depth_small = min(int(4 * scale_small), Constants.MAX_DEPTH)
+                # depth_small = min(int(4 * scale_small), Constants.MAX_DEPTH)  # この行を削除
                 
                 def compute_detail_small(block, *, scale):
                     if scale > 1:
@@ -1551,7 +1556,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                 
                 detail_small = downsampled.map_overlap(
                     compute_detail_small,
-                    depth=depth_small,
+                    depth=common_depth_small,  # 共通のdepthを使用
                     boundary='reflect',
                     dtype=cp.float32,
                     meta=cp.empty((0, 0), dtype=cp.float32),
