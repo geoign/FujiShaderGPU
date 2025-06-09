@@ -470,16 +470,14 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
+    # 基本の勾配を最初に計算（すべてのスケールで使用）
+    dy_orig, dx_orig = cp.gradient(block, pixel_size)
+    gradient_mag_base = cp.sqrt(dx_orig**2 + dy_orig**2)
+    
     saliency_maps = []
     
     # マルチスケールでの特徴抽出
     for scale in scales:
-        # ガウシアンピラミッドの作成
-        if scale > 1:
-            smoothed, _ = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
-        else:
-            smoothed = block.copy()
-        
         # 局所的なコントラスト（Center-Surround差分）
         center_sigma = scale
         surround_sigma = scale * 2
@@ -489,41 +487,48 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
             center, _ = handle_nan_with_gaussian(block, sigma=center_sigma, mode='nearest')
             surround, _ = handle_nan_with_gaussian(block, sigma=surround_sigma, mode='nearest')
         else:
-            # NaNがない場合の最適化
-            if scale > 1:
-                # smoothedはすでに計算済み（sigma=scale）なので再利用
-                center = smoothed  # 再計算を避ける
-                # surroundは追加のぼかし
-                surround = gaussian_filter(center, sigma=scale, mode='nearest')
-            else:
-                # scale == 1 の場合
-                center = smoothed  # または block.copy()
-                surround = gaussian_filter(block, sigma=surround_sigma, mode='nearest')
+            # NaNがない場合
+            center = gaussian_filter(block, sigma=center_sigma, mode='nearest')
+            surround = gaussian_filter(block, sigma=surround_sigma, mode='nearest')
         
         # 差分の絶対値
         contrast = cp.abs(center - surround)
         
-        # 勾配の強度
-        if scale == scales[0]:  # 最初のスケールのみ
-            dy_orig, dx_orig = cp.gradient(block, pixel_size)
-            gradient_mag_base = cp.sqrt(dx_orig**2 + dy_orig**2)
-        # その後のスケールでは、基本勾配をスムージング
-        gradient_mag = gaussian_filter(gradient_mag_base, sigma=scale/2, mode='nearest')
-
+        # 勾配の強度（スケールに応じてスムージング）
+        if scale > 1:
+            gradient_mag = gaussian_filter(gradient_mag_base, sigma=scale/2, mode='nearest')
+        else:
+            gradient_mag = gradient_mag_base
+        
         # 特徴の組み合わせ
         feature = contrast * 0.5 + gradient_mag * 0.5
         saliency_maps.append(feature)
     
     # スケール間での正規化と統合
     combined_saliency = cp.zeros_like(block)
+    valid_count = 0
+    
     for smap in saliency_maps:
         # 各マップを正規化
-        valid_smap = smap[~nan_mask] if nan_mask.any() else smap
-        if len(valid_smap) > 0 and cp.max(valid_smap) > cp.min(valid_smap):
-            normalized = (smap - cp.min(valid_smap)) / (cp.max(valid_smap) - cp.min(valid_smap))
-            combined_saliency += normalized
+        if nan_mask.any():
+            valid_smap = smap[~nan_mask]
+        else:
+            valid_smap = smap.ravel()
+            
+        if len(valid_smap) > 0:
+            min_val = cp.min(valid_smap)
+            max_val = cp.max(valid_smap)
+            if max_val > min_val:
+                normalized = (smap - min_val) / (max_val - min_val)
+                combined_saliency += normalized
+                valid_count += 1
     
-    combined_saliency /= len(scales)
+    # 平均化
+    if valid_count > 0:
+        combined_saliency /= valid_count
+    else:
+        # すべてのマップが無効な場合のフォールバック
+        combined_saliency = cp.full_like(block, 0.5)
     
     # ガンマ補正
     result = cp.power(combined_saliency, Constants.DEFAULT_GAMMA)
@@ -1341,6 +1346,10 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             # デフォルト：スケールに反比例する重み
             weights = [1.0 / s for s in scales]
         
+        # 重みを正規化
+        weights = cp.array(weights, dtype=cp.float32)
+        weights = weights / weights.sum()
+        
         # 各スケールでの処理
         results = []
         for scale in scales:
@@ -1360,20 +1369,19 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             detail = gpu_arr - smoothed
             results.append(detail)
         
-        # 重み付き合成
-        def weighted_combine(blocks_and_weights):
+        # 重み付き合成（修正版）
+        def weighted_combine(*blocks):
             """複数のブロックを重み付き合成"""
-            blocks = blocks_and_weights[:-1]
-            weights_arr = blocks_and_weights[-1]
-            
             result = cp.zeros_like(blocks[0])
-            for block, weight in zip(blocks, weights_arr):
-                result += block * weight
+            
+            # 重みとブロックを組み合わせて合成
+            for i, block in enumerate(blocks):
+                result += block * weights[i]
             
             # NaNマスクを保存
             nan_mask = cp.isnan(blocks[0])
             
-            # 正規化（-1から+1の範囲に）
+            # 正規化（0から1の範囲に）
             valid_result = result[~nan_mask]
             if len(valid_result) > 0:
                 min_val = cp.min(valid_result)
@@ -1382,6 +1390,8 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                     result = (result - min_val) / (max_val - min_val)
                 else:
                     result = cp.full_like(result, 0.5)
+            else:
+                result = cp.full_like(result, 0.5)
             
             # ガンマ補正
             result = cp.power(result, Constants.DEFAULT_GAMMA)
@@ -1391,16 +1401,11 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             
             return result.astype(cp.float32)
         
-        # Dask配列として重みを作成
-        weights_da = da.from_array(cp.array(weights), chunks=(len(weights),))
-        
-        # map_blocksで合成
+        # map_blocksで合成（修正版）
         combined = da.map_blocks(
             weighted_combine,
             *results,
-            weights_da,
             dtype=cp.float32,
-            drop_axis=0,  # weightsの軸を削除
             meta=cp.empty((0, 0), dtype=cp.float32)
         )
         
