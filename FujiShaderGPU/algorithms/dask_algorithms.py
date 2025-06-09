@@ -795,10 +795,32 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
         max_disp = int(r / pixel_size) + 1
         padded = cp.pad(block, max_disp, mode='edge')
         
-        for i, (dx, dy) in enumerate(zip(dx_all, dy_all)):
-            # シフトされた配列を取得
-            shifted = padded[max_disp+dy:max_disp+dy+h, 
-                           max_disp+dx:max_disp+dx+w]
+        for i in range(num_samples):
+            # CuPy配列から個別の値を取得して明示的にintに変換
+            dx = int(dx_all[i])
+            dy = int(dy_all[i])
+            
+            if dx == 0 and dy == 0:
+                continue
+            
+            # 必要な方向のみパディング
+            pad_left = max(0, -dx)
+            pad_right = max(0, dx)
+            pad_top = max(0, -dy)
+            pad_bottom = max(0, dy)
+            
+            # パディング（NaN考慮）
+            if nan_mask.any():
+                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
+                            mode='constant', constant_values=-1e6)
+            else:
+                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
+                            mode='edge')
+            
+            # シフト
+            start_y = pad_top + dy
+            start_x = pad_left + dx
+            shifted = padded[start_y:start_y+h, start_x:start_x+w]
             
             # 高さの差と遮蔽角度
             height_diff = shifted - block
@@ -1366,9 +1388,15 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         results = []
         for scale in scales:
             if scale > 1:
-                depth = int(4 * scale)
+                depth = min(int(4 * scale), Constants.MAX_DEPTH)  # depthを制限
+                
+                # NaN対応のガウシアンフィルタを使用
+                def smooth_with_nan_handling(block):
+                    smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
+                    return smoothed
+                
                 smoothed = gpu_arr.map_overlap(
-                    lambda x: gaussian_filter(x, sigma=scale, mode='nearest'),
+                    smooth_with_nan_handling,
                     depth=depth,
                     boundary='reflect',
                     dtype=cp.float32,
@@ -1377,34 +1405,53 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             else:
                 smoothed = gpu_arr
             
-            # 詳細成分の抽出
-            detail = gpu_arr - smoothed
-            def clean_detail(block):
-                nan_mask = cp.isnan(block)
-                if nan_mask.any():
-                    return cp.where(nan_mask, 0, block)
-                return block
-            detail = detail.map_blocks(
-                clean_detail,
+            # 詳細成分の抽出（NaN対応版）
+            def extract_detail(original, smoothed):
+                """NaNを考慮した詳細成分の抽出"""
+                nan_mask = cp.isnan(original)
+                
+                # NaNでない部分のみ差分を計算
+                detail = cp.zeros_like(original)
+                valid_mask = ~nan_mask & ~cp.isnan(smoothed)
+                detail[valid_mask] = original[valid_mask] - smoothed[valid_mask]
+                
+                # NaN位置を保持
+                detail[nan_mask] = cp.nan
+                
+                return detail
+            
+            detail = da.map_blocks(
+                extract_detail,
+                gpu_arr,
+                smoothed,
                 dtype=cp.float32,
                 meta=cp.empty((0, 0), dtype=cp.float32)
             )
             results.append(detail)
         
-        # 重み付き合成（修正版）
-        def weighted_combine(*blocks):
-            """複数のブロックを重み付き合成"""
-            result = cp.zeros_like(blocks[0])
-            
-            # 重みとブロックを組み合わせて合成
-            for i, block in enumerate(blocks):
-                result += block * weights[i]
-            
-            # NaNマスクを保存
+        # 重み付き合成（NaN対応版）
+        def weighted_combine_with_nan(*blocks):
+            """NaNを考慮した複数ブロックの重み付き合成"""
+            # 最初のブロックからNaNマスクを取得
             nan_mask = cp.isnan(blocks[0])
             
-            # 正規化（0から1の範囲に）
-            valid_result = result[~nan_mask] if nan_mask.any() else result.ravel()
+            # 各ピクセルで有効な値の重み付き平均を計算
+            result = cp.zeros_like(blocks[0])
+            weight_sum = cp.zeros_like(blocks[0])
+            
+            for i, block in enumerate(blocks):
+                # 現在のブロックの有効なピクセル
+                valid = ~cp.isnan(block)
+                
+                # 有効なピクセルのみ加算
+                result[valid] += block[valid] * weights[i]
+                weight_sum[valid] += weights[i]
+            
+            # 重みの合計で除算（ゼロ除算を回避）
+            result = cp.where(weight_sum > 0, result / weight_sum, 0)
+            
+            # 正規化（NaNでない値のみを使用）
+            valid_result = result[~nan_mask]
             if len(valid_result) > 0:
                 min_val = cp.min(valid_result)
                 max_val = cp.max(valid_result)
@@ -1418,14 +1465,14 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             # ガンマ補正
             result = cp.power(result, Constants.DEFAULT_GAMMA)
             
-            # NaN処理
-            result = restore_nan(result, nan_mask)
+            # 元のNaN位置を復元
+            result[nan_mask] = cp.nan
             
             return result.astype(cp.float32)
         
-        # map_blocksで合成（修正版）
+        # map_blocksで合成
         combined = da.map_blocks(
-            weighted_combine,
+            weighted_combine_with_nan,
             *results,
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32)
