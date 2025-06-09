@@ -103,7 +103,7 @@ fujishader DEM.tif FEH.tif --algo frequency_enhancement
 - Enhancing the certain pattern of topography. 
 - 地形の特定パターンを強調する。
 
-## Curvature 地形曲率
+### Curvature 地形曲率
 ![Sample image](images/CVT.jpg)
 ```bash
 fujishader DEM.tif CVT.tif --algo curvature
@@ -111,13 +111,13 @@ fujishader DEM.tif CVT.tif --algo curvature
 - Fringes of the topography.
 - 地形の輪郭。
 
-## Visual Saliency 視覚的顕著性
+### Visual Saliency 視覚的顕著性
 ![Sample image](images/VSL.jpg)
 ```bash
 fujishader DEM.tif VSL.tif --algo visual_saliency
 ```
 
-## NPR Edges (Canny) NPR輪郭検出
+### NPR Edges (Canny) NPR輪郭検出
 ![Sample image](images/NPR.jpg)
 ```bash
 fujishader DEM.tif NPR.tif --algo npr_edges
@@ -125,7 +125,7 @@ fujishader DEM.tif NPR.tif --algo npr_edges
 - Fringes of the topography.
 - 地形の輪郭。
 
-## Atmospheric Perspective 空気遠近法
+### Atmospheric Perspective 空気遠近法
 ![Sample image](images/APS.jpg)
 ```bash
 fujishader DEM.tif APS.tif --algo atmospheric_perspective
@@ -133,13 +133,20 @@ fujishader DEM.tif APS.tif --algo atmospheric_perspective
 - Blurring the distant low-relief terrain.
 - 視覚的に遠くに位置する低地がぼやけます。
 
-## Ambient Occlusion アンビエントオクルージョン
+### Ambient Occlusion アンビエントオクルージョン
 ![Sample image](images/AOC.jpg)
 ```bash
 fujishader DEM.tif AOC.tif --algo ambient_occlusion
 ```
 - Simulation of the ambient shadows. Popular in 3D modeling.
 - 環境陰影のシミュレーション。3Dモデリングでよく使われる。
+
+### Algorithms TBD? 実装検討中のアルゴリズム
+- Scale-space Blob Detection（LoG / DoG）
+- Hessian ベースの Vesselness / Ridge フィルタ
+- Superpixel Segmentation（SLIC／SEEDS／SNIC など）
+- Structure Tensor + Orientation Field
+- Persistent Homology / Topological Data Analysis (TDA)
 
 ## Limitations 注意事項
 - FujiShaderGPU is designed for the Cartesian DEMs.<br>It can process LatLon DEMs too but the result is not accurate.
