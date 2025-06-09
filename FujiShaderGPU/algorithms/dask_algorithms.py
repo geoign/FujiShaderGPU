@@ -855,8 +855,11 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             distance = r * pixel_size
             occlusion_angle = cp.arctan(height_diff / distance)
             
-            # 正の角度のみを遮蔽として扱う
-            occlusion_angle = cp.maximum(0, occlusion_angle)
+            # 正の角度のみを遮蔽として扱う（修正: より適切な遮蔽の計算）
+            # 角度を0-1の範囲に正規化（最大45度を1とする）
+            max_angle = cp.pi / 4  # 45度
+            occlusion = cp.maximum(0, occlusion_angle) / max_angle
+            occlusion = cp.minimum(occlusion, 1.0)  # 1を超えないようにクリップ
             
             # 距離による減衰（修正: より緩やかな減衰）
             distance_factor = 1.0 - (r_factor * 0.3)  # 0.5から0.3に変更
@@ -864,7 +867,7 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             # 遮蔽の累積（NaNを除外）
             valid = ~(cp.isnan(shifted) | nan_mask)
             occlusion_total += cp.where(valid, 
-                                      occlusion_angle * distance_factor,
+                                      occlusion * distance_factor,
                                       0)
             sample_count += cp.where(valid, 1.0, 0)
     
@@ -872,11 +875,12 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     # ゼロ除算を防ぐ
     sample_count = cp.maximum(sample_count, 1.0)
     
-    # 平均遮蔽角度を計算して、遮蔽度に変換
+    # 平均遮蔽を計算（修正: すでに0-1の範囲）
     mean_occlusion = occlusion_total / sample_count
     
-    # 遮蔽度を0-1の範囲に変換（修正: より適切なスケーリング）
-    ao = 1.0 - cp.tanh(mean_occlusion * intensity * 2.0)
+    # AOの計算（修正: より直接的な計算）
+    # 遮蔽が多いほど暗くなる（0に近づく）
+    ao = 1.0 - mean_occlusion * intensity
     ao = cp.clip(ao, 0, 1)
     
     # スムージング（NaN考慮）
