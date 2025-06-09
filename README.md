@@ -9,22 +9,22 @@ GPUを使って処理することでCPUの数百倍の速度で計算できま�
 pip install git+https://github.com/geoign/FujiShaderGPU.git
 ```
 - Requires CUDA environment (nVidia GPU). <br>See below if you are non-Linux user.
-- CUDA実行環境が必要です(nVidia社のGPU)。<br>非Linuxユーザーは後半のセクションを参照してください。
+- CUDA実行環境が必要(nVidia社のGPU)。<br>非Linuxユーザーは後半のセクションを参照のこと。
 
 ## Usage 使い方
 ```bash
 fujishadergpu infile.tif outfile.tif --algo [See below for the supported algorithms]
 ```
 - More than >10 algorithms are available.
-- 現在のバージョンでは、10個以上のアルゴリズムをサポートしています。
+- 現在のバージョンでは、10個以上のアルゴリズムをサポートしている。
 
 ⭐[Try at Google Colab.](https://colab.research.google.com/drive/1IbIGtaoKM9e1OsdxdnzNN7KeO1W_gRwZ?usp=sharing)⭐ <br>
-↑ Google Colabで試すことができます。Google Driveから読み込み書き出します。<br>
+↑ Google Colabで試すことができる。Google Driveから読み込み書き出しできる。<br>
 Colab Notebook Last Updated on: 2025/06/09.
 
 ## Algorithms アルゴリズム
 - The result of the most of the algorithms are calibrated to human vision gamma.
-- 多くの手法の結果データは、人間の知覚ガンマに合致するように正規化されています。
+- 多くの手法の結果データは、人間の知覚ガンマに合致するように正規化されている。
 
 ### Ridge Valley Index (RVI) 尾根谷度
 ![Sample image](images/RVI.jpg)
@@ -35,7 +35,7 @@ fujishader DEM.tif RVI.tif --algo rvi
 | :-------- | :------- | :-------- |
 | --radius | TBD | TBD    |
 - Highlights the ridges and shadows the valley.<br>Note that it is different implementation from the original for speed and effeciency.
-- 尾根を白くし谷を暗くします。<br>オリジナルとは異なる簡易的高速実装です。
+- 尾根を白くし谷を暗くする。<br>オリジナルとは異なる簡易的高速実装。
 
 ### Hillshade 疑似陰影
 ![Sample image](images/HLS.jpg)
@@ -59,13 +59,18 @@ fujishader DEM.tif SLP.tif --algo slope
 fujishader DEM.tif TPI.tif --algo tpi
 ```
 - Relative height against the surrounding pixels.
-- 相対標高です。
+- 相対標高。
 
 ### Local Relief Model (LRM)
 ![Sample image](images/LRM.jpg)
 ```bash
 fujishader DEM.tif LRM.tif --algo lrm
 ```
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --kernel_size | 50 | Remove fine terrain: 5~15<br>Remove medium-sized terrain: 20~50<br>Remove large-scaled terrain: 50~100 |
+- Not for noob. Set appropriate parameters to get a good result.
+- 上級者向け。適切なパラメータを指定しないとよい結果は得られない。
 
 ### Openness 地形開度
 ![Sample image](images/OPN.jpg)
@@ -79,7 +84,7 @@ fujishader DEM.tif OPN.tif --algo openness
 fujishader DEM.tif SPC.tif --algo specular
 ```
 - Simulation of specular surface based on the terrain roughness.<br>An original algorithm.
-- 地形の荒々しさを反映した光沢陰影。<br>独自アルゴリズム
+- 地形の荒々しさを反映した金属光沢陰影。<br>独自アルゴリズム
 
 ### Atmospheric Scattering 大気散乱光陰影
 ![Sample image](images/ASC.jpg)
@@ -100,8 +105,12 @@ fujishader DEM.tif MST.tif --algo multiscale_terrain
 ```bash
 fujishader DEM.tif FEH.tif --algo frequency_enhancement
 ```
-- Enhancing the certain pattern of topography. 
-- 地形の特定パターンを強調する。
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --target_frequency | (Low frequency) 0.05 ~ 0.3 (High frequency) | Enhance large-scale terrains -> Set 0.05<br>Enhance fine-scale terrains -> Set 0.2~0.3 |
+| --bandwidth | 0.02 ~ 0.2 | Window to enhance the terrain with certain frequency. |
+- Not for noob. Set appropriate parameters to get a good result.
+- 上級者向け。適切なパラメータを指定しないとよい結果は得られない。
 
 ### Curvature 地形曲率
 ![Sample image](images/CVT.jpg)
@@ -131,7 +140,7 @@ fujishader DEM.tif NPR.tif --algo npr_edges
 fujishader DEM.tif APS.tif --algo atmospheric_perspective
 ```
 - Blurring the distant low-relief terrain.
-- 視覚的に遠くに位置する低地がぼやけます。
+- 視覚的に遠くに位置する低地がぼやけ…るのか？
 
 ### Ambient Occlusion アンビエントオクルージョン
 ![Sample image](images/AOC.jpg)
