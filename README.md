@@ -68,7 +68,7 @@ fujishader DEM.tif LRM.tif --algo lrm
 ```
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
-| --kernel_size | 50 | Remove fine terrain: 5~15<br>Remove medium-sized terrain: 20~50<br>Remove large-scaled terrain: 50~100 |
+| --kernel_size | 50 | Remove fine terrain: 5-15<br>Remove medium-sized terrain: 20-50<br>Remove large-scaled terrain: 50~100 |
 - Not for noob. Set appropriate parameters to get a good result.
 - 上級者向け。適切なパラメータを指定しないとよい結果は得られない。
 
