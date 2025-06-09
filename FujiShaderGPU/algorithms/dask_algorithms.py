@@ -609,24 +609,21 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
             
             # 統計量を計算（Daskの遅延実行を利用）
             # NaN を除外した統計量を計算
-            def compute_stats(arr):
-                """NaNを除外して統計量を計算"""
+            def compute_stats(dask_array):
+                """Dask配列から統計量を計算"""
+                # Dask配列を計算してCuPy配列を取得
+                arr = dask_array.compute()
+                # CuPy配列から統計量を計算
                 valid_data = arr[~cp.isnan(arr)]
                 if len(valid_data) > 0:
-                    # パーセンタイルベースの統計（外れ値に強い）
                     p5 = float(cp.percentile(valid_data, 5))
                     p95 = float(cp.percentile(valid_data, 95))
                     return p5, p95
                 else:
                     return 0.0, 1.0
             
-            # 計算を実行
-            stats_delayed = da.from_delayed(
-                dask.delayed(compute_stats)(saliency_small),
-                shape=(2,),
-                dtype=cp.float32
-            )
-            norm_min, norm_max = da.compute(stats_delayed)[0]
+            # 統計量を計算
+            norm_min, norm_max = compute_stats(saliency_small)
             
             # デバッグ情報（オプション）
             if params.get('verbose', False):
