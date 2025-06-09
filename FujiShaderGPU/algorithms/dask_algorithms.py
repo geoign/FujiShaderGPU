@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 
 import cupy as cp
 import dask.array as da
+import dask
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, convolve
 from tqdm.auto import tqdm
 
@@ -465,7 +466,10 @@ class HillshadeAlgorithm(DaskAlgorithm):
 ###############################################################################
 
 def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2, 4, 8, 16],
-                                pixel_size: float = 1.0) -> cp.ndarray:
+                                pixel_size: float = 1.0,
+                                normalize: bool = True,
+                                norm_min: float = None,
+                                norm_max: float = None) -> cp.ndarray:
     """視覚的顕著性の計算（Itti-Kochモデルの簡略版）"""
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
@@ -539,11 +543,36 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     if valid_count > 0:
         combined_saliency /= valid_count
     else:
-        # すべてのマップが無効な場合のフォールバック
         combined_saliency = cp.full_like(block, 0.5)
     
-    # ガンマ補正
-    result = cp.power(combined_saliency, Constants.DEFAULT_GAMMA)
+    # 正規化処理を条件分岐に変更
+    if normalize:
+        if norm_min is not None and norm_max is not None:
+            # 提供された統計量で正規化
+            if norm_max > norm_min:
+                result = (combined_saliency - norm_min) / (norm_max - norm_min)
+                result = cp.clip(result, 0, 1)
+            else:
+                result = cp.full_like(block, 0.5)
+        else:
+            # 従来のローカル正規化（互換性のため残す）
+            valid_result = combined_saliency[~nan_mask]
+            if len(valid_result) > 0:
+                min_val = cp.min(valid_result)
+                max_val = cp.max(valid_result)
+                if max_val > min_val:
+                    result = (combined_saliency - min_val) / (max_val - min_val)
+                else:
+                    result = cp.full_like(combined_saliency, 0.5)
+            else:
+                result = cp.full_like(combined_saliency, 0.5)
+    else:
+        # 正規化なし
+        result = combined_saliency
+    
+    # ガンマ補正（正規化した場合のみ）
+    if normalize:
+        result = cp.power(result, Constants.DEFAULT_GAMMA)
     
     # NaN処理
     result = restore_nan(result, nan_mask)
@@ -557,21 +586,85 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         scales = params.get('scales', [2, 4, 8, 16])
         pixel_size = params.get('pixel_size', 1.0)
         max_scale = max(scales)
+        use_global_stats = params.get('use_global_stats', True)  # デフォルトで有効
         
-        return gpu_arr.map_overlap(
-            compute_visual_saliency_block,
-            depth=int(max_scale * 4),
-            boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            scales=scales,
-            pixel_size=pixel_size
-        )
+        if use_global_stats:
+            # Step 1: 縮小版で統計量を計算
+            downsample_factor = params.get('downsample_factor', 20)  # 1/20にダウンサンプル
+            
+            # ダウンサンプリング（メモリ効率のため、スライスを使用）
+            downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
+            
+            # 縮小版で視覚的顕著性を計算（正規化なし）
+            saliency_small = downsampled.map_overlap(
+                compute_visual_saliency_block,
+                depth=max(1, int(max_scale * 8 // downsample_factor)),
+                boundary='reflect',
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                scales=[s/downsample_factor for s in scales],  # スケールも調整
+                pixel_size=pixel_size * downsample_factor,
+                normalize=False  # 正規化なし
+            )
+            
+            # 統計量を計算（Daskの遅延実行を利用）
+            # NaN を除外した統計量を計算
+            def compute_stats(arr):
+                """NaNを除外して統計量を計算"""
+                valid_data = arr[~cp.isnan(arr)]
+                if len(valid_data) > 0:
+                    # パーセンタイルベースの統計（外れ値に強い）
+                    p5 = float(cp.percentile(valid_data, 5))
+                    p95 = float(cp.percentile(valid_data, 95))
+                    return p5, p95
+                else:
+                    return 0.0, 1.0
+            
+            # 計算を実行
+            stats_delayed = da.from_delayed(
+                dask.delayed(compute_stats)(saliency_small),
+                shape=(2,),
+                dtype=cp.float32
+            )
+            norm_min, norm_max = da.compute(stats_delayed)[0]
+            
+            # デバッグ情報（オプション）
+            if params.get('verbose', False):
+                print(f"Visual Saliency global stats: min={norm_min:.3f}, max={norm_max:.3f}")
+            
+            # Step 2: フルサイズで計算（統計量を使用）
+            return gpu_arr.map_overlap(
+                compute_visual_saliency_block,
+                depth=int(max_scale * 8),
+                boundary='reflect',
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                scales=scales,
+                pixel_size=pixel_size,
+                normalize=True,
+                norm_min=norm_min,
+                norm_max=norm_max
+            )
+        else:
+            # 従来の方法（互換性のため）
+            return gpu_arr.map_overlap(
+                compute_visual_saliency_block,
+                depth=int(max_scale * 8),
+                boundary='reflect',
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                scales=scales,
+                pixel_size=pixel_size,
+                normalize=True
+            )
     
     def get_default_params(self) -> dict:
         return {
             'scales': [2, 4, 8, 16],
-            'pixel_size': 1.0
+            'pixel_size': 1.0,
+            'use_global_stats': True,      # グローバル統計を使用
+            'downsample_factor': 20,       # ダウンサンプル係数
+            'verbose': False               # デバッグ出力
         }
 
 ###############################################################################
@@ -1552,8 +1645,14 @@ def enhance_frequency_block(block: cp.ndarray, *, target_frequency: float = 0.1,
     else:
         block_filled = block
     
+    # 窓関数を適用（境界での不連続性を軽減）
+    window_y = cp.hanning(block.shape[0])[:, None]
+    window_x = cp.hanning(block.shape[1])[None, :]
+    window = window_y * window_x
+    windowed_block = block_filled * window
+    
     # 2D FFT
-    fft = cp.fft.fft2(block_filled)
+    fft = cp.fft.fft2(windowed_block)
     freq_x = cp.fft.fftfreq(block.shape[0])
     freq_y = cp.fft.fftfreq(block.shape[1])
     freq_grid = cp.sqrt(freq_x[:, None]**2 + freq_y[None, :]**2)
@@ -1592,8 +1691,11 @@ class FrequencyEnhancementAlgorithm(DaskAlgorithm):
         bandwidth = params.get('bandwidth', 0.05)
         enhancement = params.get('enhancement', 2.0)
         
-        return gpu_arr.map_blocks(
+        # map_blocks を map_overlap に変更し、適切なdepthを設定
+        return gpu_arr.map_overlap(
             enhance_frequency_block,
+            depth=32,  # FFT処理のための十分なオーバーラップ
+            boundary='reflect',  # 境界条件を追加
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             target_frequency=target_frequency,
