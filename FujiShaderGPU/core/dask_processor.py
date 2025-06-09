@@ -408,68 +408,76 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                     _write_cog_da_original(data, dst, show_progress)
                     return
                 
+                # 進捗表示の準備
+                from tqdm.auto import tqdm
+                total_chunks = delayed_chunks.shape[0] * delayed_chunks.shape[1]
+                
                 # チャンクの形状を保持しながら処理
                 chunk_idx = 0
-                for i in range(delayed_chunks.shape[0]):
-                    for j in range(delayed_chunks.shape[1]):
-                        chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
-                        
-                        try:
-                            # チャンクを計算
-                            chunk_data = delayed_chunks[i, j].compute()
-                            
-                            # チャンクの実際のサイズを取得
-                            chunk_height, chunk_width = chunk_data.shape
-                            
-                            # チャンクの開始位置を計算
-                            y_start = sum(data.chunks[0][:i])
-                            x_start = sum(data.chunks[1][:j])
-                            
-                            # チャンクの終了位置を計算
-                            y_end = y_start + chunk_height
-                            x_end = x_start + chunk_width
-                            
-                            # 座標のスライスを作成
-                            y_slice = slice(y_start, y_end)
-                            x_slice = slice(x_start, x_end)
-                            
-                            # デバッグ情報
-                            logger.debug(f"Chunk {i},{j}: data shape={chunk_data.shape}, "
-                                       f"y_slice={y_start}:{y_end}, x_slice={x_start}:{x_end}")
-                            
-                            # チャンクをDataArrayとして作成
-                            chunk_da = xr.DataArray(
-                                chunk_data,
-                                dims=data.dims,
-                                coords={
-                                    data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
-                                    data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
-                                },
-                                attrs=data.attrs
-                            )
+                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                    for i in range(delayed_chunks.shape[0]):
+                        for j in range(delayed_chunks.shape[1]):
+                            chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
+                            try:
+                                # チャンクを計算
+                                chunk_data = delayed_chunks[i, j].compute()
+                                
+                                # チャンクの実際のサイズを取得
+                                chunk_height, chunk_width = chunk_data.shape
+                                
+                                # チャンクの開始位置を計算
+                                y_start = sum(data.chunks[0][:i])
+                                x_start = sum(data.chunks[1][:j])
+                                
+                                # チャンクの終了位置を計算
+                                y_end = y_start + chunk_height
+                                x_end = x_start + chunk_width
+                                
+                                # 座標のスライスを作成
+                                y_slice = slice(y_start, y_end)
+                                x_slice = slice(x_start, x_end)
+                                
+                                # デバッグ情報
+                                logger.debug(f"Chunk {i},{j}: data shape={chunk_data.shape}, "
+                                        f"y_slice={y_start}:{y_end}, x_slice={x_start}:{x_end}")
+                                
+                                # チャンクをDataArrayとして作成
+                                chunk_da = xr.DataArray(
+                                    chunk_data,
+                                    dims=data.dims,
+                                    coords={
+                                        data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
+                                        data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
+                                    },
+                                    attrs=data.attrs
+                                )
 
-                            # 座標参照系を設定（存在する場合のみ）
-                            if hasattr(data, 'rio') and data.rio.crs is not None:
-                                chunk_da.rio.write_crs(data.rio.crs, inplace=True)
-                            
-                            # チャンクをGeoTIFFとして保存
-                            chunk_da.rio.to_raster(
-                                chunk_file,
-                                driver="GTiff",
-                                compress="ZSTD",
-                                tiled=True,
-                                blockxsize=512,
-                                blockysize=512
-                            )
-                            chunk_files.append(chunk_file)
-                            
-                            # メモリ解放
-                            del chunk_data, chunk_da
-                            chunk_idx += 1
-                            
-                        except Exception as e:
-                            logger.error(f"Failed to process chunk {i},{j}: {e}")
-                            raise
+                                # 座標参照系を設定（存在する場合のみ）
+                                if hasattr(data, 'rio') and data.rio.crs is not None:
+                                    chunk_da.rio.write_crs(data.rio.crs, inplace=True)
+                                
+                                # チャンクをGeoTIFFとして保存
+                                chunk_da.rio.to_raster(
+                                    chunk_file,
+                                    driver="GTiff",
+                                    compress="ZSTD",
+                                    tiled=True,
+                                    blockxsize=512,
+                                    blockysize=512
+                                )
+                                chunk_files.append(chunk_file)
+                                
+                                # メモリ解放
+                                del chunk_data, chunk_da
+                                chunk_idx += 1
+                                
+                                # 進捗更新
+                                pbar.update(1)
+                                pbar.set_postfix({"saved": f"{len(chunk_files)}", "size_MB": f"{os.path.getsize(chunk_file)/(1024**2):.1f}"})
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to process chunk {i},{j}: {e}")
+                                raise
             else:
                 # Dask配列でない場合は通常の処理にフォールバック
                 logger.info("Data is not chunked with Dask, falling back to regular processing")
@@ -480,15 +488,29 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
             if not chunk_files:
                 raise ValueError("No chunks were successfully processed")
                 
+            logger.info(f"Creating VRT from {len(chunk_files)} chunks...")
             vrt_file = Path(tmpdir) / "merged.vrt"
             gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
             
             # COGに変換
+            logger.info("Converting to COG format...")
+            
+            # GDALの進捗コールバック
+            def gdal_progress_callback(complete, message, cb_data):
+                if not hasattr(gdal_progress_callback, 'pbar'):
+                    gdal_progress_callback.pbar = tqdm(total=100, desc="COG conversion", unit="%")
+                gdal_progress_callback.pbar.n = int(complete * 100)
+                gdal_progress_callback.pbar.refresh()
+                if complete >= 1.0:
+                    gdal_progress_callback.pbar.close()
+                return 1
+            
             gdal.Translate(
                 str(dst),
                 str(vrt_file),
                 format="COG" if use_cog_driver else "GTiff",
-                creationOptions=list(f"{k}={v}" for k, v in cog_options.items())
+                creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
+                callback=gdal_progress_callback
             )
             
             logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
