@@ -657,12 +657,18 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     
     # ヒステリシス処理（簡易版）- 弱いエッジを強いエッジに接続
     for _ in range(2):  # 2回繰り返して接続を強化
-        dilated = cp.maximum.reduce([
-            cp.roll(edges, 1, axis=0),
-            cp.roll(edges, -1, axis=0),
-            cp.roll(edges, 1, axis=1),
-            cp.roll(edges, -1, axis=1)
-        ])
+        # 修正: maximum.reduceの代わりに順次maximumを使用
+        dilated = cp.maximum(
+            cp.maximum(
+                cp.roll(edges, 1, axis=0),
+                cp.roll(edges, -1, axis=0)
+            ),
+            cp.maximum(
+                cp.roll(edges, 1, axis=1),
+                cp.roll(edges, -1, axis=1)
+            )
+        )
+        
         edges = cp.where(weak & (dilated > 0.5), 1.0, edges)
     
     # エッジ強度を調整（完全な黒線を避ける）
@@ -810,6 +816,7 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     
     # 全サンプル点の座標を事前計算（ベクトル化）
     occlusion_total = cp.zeros((h, w), dtype=cp.float32)
+    sample_count = cp.zeros((h, w), dtype=cp.float32)  # 有効なサンプル数をカウント
     
     # バッチ処理で高速化
     for r_factor in r_factors:
@@ -818,9 +825,6 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
         # 全方向の変位を一度に計算
         dx_all = (r * directions[:, 0] / pixel_size).astype(int)
         dy_all = (r * directions[:, 1] / pixel_size).astype(int)
-        
-        # パディング値の決定を削除（不要なコード）
-        # pad_value = Constants.NAN_FILL_VALUE_POSITIVE if openness_type == 'positive' else Constants.NAN_FILL_VALUE_NEGATIVE
         
         for i in range(num_samples):
             # CuPy配列から個別の値を取得して明示的にintに変換
@@ -836,14 +840,9 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             pad_top = max(0, -dy)
             pad_bottom = max(0, dy)
             
-            # パディング（NaN考慮）- 修正: 定数値を適切に設定
-            if nan_mask.any():
-                # AOの場合は周囲が低い値だと遮蔽が少ないので、低い値でパディング
-                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                            mode='constant', constant_values=cp.nanmin(block))
-            else:
-                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                            mode='edge')
+            # パディング（修正: edge modeを使用）
+            padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
+                        mode='edge')
             
             # シフト
             start_y = pad_top + dy
@@ -852,19 +851,32 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             
             # 高さの差と遮蔽角度
             height_diff = shifted - block
-            occlusion_angle = cp.maximum(0, cp.arctan(height_diff / (r * pixel_size + 1e-6)))
+            # 修正: 距離を考慮した角度計算
+            distance = r * pixel_size
+            occlusion_angle = cp.arctan(height_diff / distance)
             
-            # 距離による減衰
-            distance_factor = 1.0 - (r_factor * 0.5)
+            # 正の角度のみを遮蔽として扱う
+            occlusion_angle = cp.maximum(0, occlusion_angle)
             
-            # 遮蔽の累積
-            valid = ~(cp.isnan(occlusion_angle) | nan_mask)
+            # 距離による減衰（修正: より緩やかな減衰）
+            distance_factor = 1.0 - (r_factor * 0.3)  # 0.5から0.3に変更
+            
+            # 遮蔽の累積（NaNを除外）
+            valid = ~(cp.isnan(shifted) | nan_mask)
             occlusion_total += cp.where(valid, 
                                       occlusion_angle * distance_factor,
                                       0)
+            sample_count += cp.where(valid, 1.0, 0)
     
-    # 正規化
-    ao = 1.0 - (occlusion_total / (num_samples * len(r_factors))) * intensity
+    # 正規化（修正: 有効なサンプル数で除算）
+    # ゼロ除算を防ぐ
+    sample_count = cp.maximum(sample_count, 1.0)
+    
+    # 平均遮蔽角度を計算して、遮蔽度に変換
+    mean_occlusion = occlusion_total / sample_count
+    
+    # 遮蔽度を0-1の範囲に変換（修正: より適切なスケーリング）
+    ao = 1.0 - cp.tanh(mean_occlusion * intensity * 2.0)
     ao = cp.clip(ao, 0, 1)
     
     # スムージング（NaN考慮）
