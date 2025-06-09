@@ -1527,73 +1527,39 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         weights = cp.array(weights, dtype=cp.float32)
         weights = weights / weights.sum()
         
+        # 最大スケールに基づいて共通のdepthを決定
+        max_scale = max(scales)
+        common_depth = min(int(4 * max_scale), Constants.MAX_DEPTH)
+        
         # 各スケールでの処理
         results = []
         for scale in scales:
-            if scale > 1:
-                depth = min(int(4 * scale), Constants.MAX_DEPTH)  # depthを制限
-                
-                # NaN対応のガウシアンフィルタを使用
-                def smooth_with_nan_handling(block):
-                    smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
-                    return smoothed
-                
-                smoothed = gpu_arr.map_overlap(
-                    smooth_with_nan_handling,
-                    depth=depth,
-                    boundary='reflect',
-                    dtype=cp.float32,
-                    meta=cp.empty((0, 0), dtype=cp.float32)
-                )
-            else:
-                smoothed = gpu_arr
-            
-            # 詳細成分の抽出（map_overlapを使用）
-            def extract_detail_block(original_block, *, smoothed_arr, scale):
-                """NaNを考慮した詳細成分の抽出（単一ブロック用）"""
-                # smoothed_arrから同じ位置のブロックを取得
-                # map_overlapのdepthを考慮してスライス
-                depth = min(int(4 * scale), Constants.MAX_DEPTH) if scale > 1 else 0
-                
-                # smoothedブロックを取得（元のブロックと同じサイズ）
-                # この処理はmap_overlap内で自動的に行われるため、
-                # ここでは単純に差分を計算
-                nan_mask = cp.isnan(original_block)
-                
-                # スムージングされたデータも同じdepthでmap_overlapを適用
-                return original_block  # 一時的に返す（下記の別アプローチを使用
-            
-             # 別のアプローチ：差分計算もmap_overlapで統一
-            if scale > 1:
-                depth = min(int(4 * scale), Constants.MAX_DEPTH)
-                
-                # 差分計算用の関数
-                def compute_detail_with_smooth(block, *, scale):
-                    """ブロック内でスムージングと差分を同時に計算"""
+            # 差分計算用の関数
+            def compute_detail_with_smooth(block, *, scale):
+                """ブロック内でスムージングと差分を同時に計算"""
+                if scale > 1:
                     # スムージング
                     smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
-                    
                     # 差分計算
                     detail = block - smoothed
-                    
                     # NaN位置を保持
                     detail = restore_nan(detail, nan_mask)
-                    
-                    return detail
+                else:
+                    # scale=1の場合は元のデータをそのまま使用
+                    detail = block
                 
-                # map_overlapで差分を直接計算
-                detail = gpu_arr.map_overlap(
-                    compute_detail_with_smooth,
-                    depth=depth,
-                    boundary='reflect',
-                    dtype=cp.float32,
-                    meta=cp.empty((0, 0), dtype=cp.float32),
-                    scale=scale
-                )
-            else:
-                # scale=1の場合は元のデータをそのまま使用
-                detail = gpu_arr
-                
+                return detail
+            
+            # すべてのスケールで同じdepthを使用
+            detail = gpu_arr.map_overlap(
+                compute_detail_with_smooth,
+                depth=common_depth,  # 共通のdepthを使用
+                boundary='reflect',
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                scale=scale
+            )
+            
             results.append(detail)
         
         # 重み付き合成（NaN対応版）
@@ -1602,7 +1568,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             # 最初のブロックからNaNマスクを取得
             nan_mask = cp.isnan(blocks[0])
             
-            # 各ピクセルで有効な値の重み付き平均を計算
+            # 結果の初期化
             result = cp.zeros_like(blocks[0])
             weight_sum = cp.zeros_like(blocks[0])
             
@@ -1610,9 +1576,12 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                 # 現在のブロックの有効なピクセル
                 valid = ~cp.isnan(block)
                 
+                # 共通の有効領域（すべてのブロックで有効な領域）
+                common_valid = valid & ~nan_mask
+                
                 # 有効なピクセルのみ加算
-                result[valid] += block[valid] * weights[i]
-                weight_sum[valid] += weights[i]
+                result[common_valid] += block[common_valid] * weights[i]
+                weight_sum[common_valid] += weights[i]
             
             # 重みの合計で除算（ゼロ除算を回避）
             result = cp.where(weight_sum > 0, result / weight_sum, 0)
