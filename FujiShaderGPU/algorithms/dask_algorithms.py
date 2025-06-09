@@ -597,6 +597,23 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     gradient_mag = cp.sqrt(dx**2 + dy**2)
     gradient_dir = cp.arctan2(dy, dx)
     
+    # 勾配の統計情報を使用して適応的な閾値を計算
+    valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag
+    if len(valid_grad) > 0:
+        # パーセンタイルベースの閾値設定
+        low_percentile = 70  # 上位30%
+        high_percentile = 90  # 上位10%
+        
+        grad_low = cp.percentile(valid_grad, low_percentile)
+        grad_high = cp.percentile(valid_grad, high_percentile)
+        
+        # ユーザー指定の閾値でスケーリング
+        actual_threshold_low = grad_low + (grad_high - grad_low) * threshold_low
+        actual_threshold_high = grad_low + (grad_high - grad_low) * threshold_high
+    else:
+        actual_threshold_low = threshold_low
+        actual_threshold_high = threshold_high
+    
     # 非最大値抑制（簡易版）
     # 勾配方向を8方向に量子化
     angle = gradient_dir * 180.0 / cp.pi
@@ -629,22 +646,29 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     mask = ((angle >= 112.5) & (angle < 157.5))
     nms = cp.where(mask & ((gradient_mag < shifted_pos) | (gradient_mag < shifted_neg)), 0, nms)
     
-    # 正規化
-    valid_nms = nms[~nan_mask] if nan_mask.any() else nms
-    if len(valid_nms) > 0 and cp.max(valid_nms) > 0:
-        nms = nms / cp.max(valid_nms)
-    
-    # ダブルスレッショルド
-    strong = nms > threshold_high
-    weak = (nms > threshold_low) & (nms <= threshold_high)
+    # ダブルスレッショルド（適応的閾値を使用）
+    strong = nms > actual_threshold_high
+    weak = (nms > actual_threshold_low) & (nms <= actual_threshold_high)
     
     # エッジの強調（NPRスタイル）
     edges = cp.zeros_like(nms)
     edges[strong] = 1.0
     edges[weak] = 0.5
     
+    # ヒステリシス処理（簡易版）- 弱いエッジを強いエッジに接続
+    for _ in range(2):  # 2回繰り返して接続を強化
+        dilated = cp.roll(edges, 1, axis=0) | cp.roll(edges, -1, axis=0) | \
+                  cp.roll(edges, 1, axis=1) | cp.roll(edges, -1, axis=1)
+        edges = cp.where(weak & (dilated > 0.5), 1.0, edges)
+    
+    # エッジ強度を調整（完全な黒線を避ける）
+    edges = edges * 0.8  # エッジの最大強度を0.8に
+    
     # 輪郭線を反転（黒線で描画）
     result = 1.0 - edges
+    
+    # コントラスト調整（エッジをより見やすく）
+    result = cp.clip(result, 0.2, 1.0)  # 最小値を0.2に設定
     
     # ガンマ補正
     result = cp.power(result, Constants.DEFAULT_GAMMA)
@@ -659,8 +683,8 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         edge_sigma = params.get('edge_sigma', 1.0)
-        threshold_low = params.get('threshold_low', 0.1)
-        threshold_high = params.get('threshold_high', 0.3)
+        threshold_low = params.get('threshold_low', 0.2)  # デフォルト値を調整
+        threshold_high = params.get('threshold_high', 0.5)  # デフォルト値を調整
         pixel_size = params.get('pixel_size', 1.0)
         
         return gpu_arr.map_overlap(
@@ -678,8 +702,8 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     def get_default_params(self) -> dict:
         return {
             'edge_sigma': 1.0,
-            'threshold_low': 0.1,
-            'threshold_high': 0.3,
+            'threshold_low': 0.2,   # 0.1から0.2に変更
+            'threshold_high': 0.5,  # 0.3から0.5に変更
             'pixel_size': 1.0
         }
 
