@@ -1373,6 +1373,10 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     """開度の計算（最適化版）"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
+
+    # pixel_sizeがNoneの場合のチェックを追加
+    if pixel_size is None:
+        pixel_size = 1.0
     
     # 方向ベクトルの事前計算
     angles = cp.linspace(0, 2 * cp.pi, num_directions, endpoint=False)
