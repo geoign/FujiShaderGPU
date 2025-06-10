@@ -690,6 +690,22 @@ class HillshadeAlgorithm(DaskAlgorithm):
 ###############################################################################
 # 2.8. Visual Saliency (視覚的顕著性) アルゴリズム
 ###############################################################################
+def visual_saliency_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """Visual Saliency用の統計量計算（解像度適応型）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        # データの分布の広がりを確認
+        std_val = float(cp.std(valid_data))
+        mean_val = float(cp.mean(valid_data))
+        
+        # 分布が狭い場合（低解像度データでよくある）はパーセンタイルを調整
+        if std_val < mean_val * 0.1:  # 変動係数が小さい場合
+            return (float(cp.percentile(valid_data, 20)), 
+                    float(cp.percentile(valid_data, 80)))
+        else:
+            return (float(cp.percentile(valid_data, 5)), 
+                    float(cp.percentile(valid_data, 95)))
+    return (0.0, 1.0)
 
 def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2, 4, 8, 16],
                                 pixel_size: float = 1.0,
@@ -700,39 +716,48 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
-    # scalesを実世界距離に基づいて調整
-    if pixel_size > 5.0:  # 低解像度の場合
-        scales = [max(1, int(s * 0.5)) for s in scales]  # スケールを半分に
-
-    # 基本の勾配を最初に計算（すべてのスケールで使用）
-    # 修正: NaN処理を追加
+    # 解像度に基づいてスケールを完全に再計算
+    if scales == [2, 4, 8, 16]:  # デフォルト値の場合のみ
+        if pixel_size <= 1.0:
+            # 高解像度：デフォルトのまま
+            pass
+        elif pixel_size <= 5.0:
+            # 中解像度
+            scales = [1, 2, 4, 8]
+        else:
+            # 低解像度（10m以上）
+            scales = [1, 1.5, 2, 3]
+    
+    # 基本の勾配を最初に計算
     dy_orig, dx_orig, _ = handle_nan_for_gradient(block, scale=1.0, pixel_size=pixel_size)
     gradient_mag_base = cp.sqrt(dx_orig**2 + dy_orig**2)
+    
+    # 低解像度での勾配強調
+    if pixel_size > 5.0:
+        gradient_mag_base = gradient_mag_base * (pixel_size / 5.0)
+    
     gradient_mag_base = cp.where(cp.isnan(gradient_mag_base), 0, gradient_mag_base)
     
+    # 以下、マルチスケール処理は同じだが、特徴の組み合わせ方を調整
     saliency_maps = []
     
-    # マルチスケールでの特徴抽出
     for scale in scales:
         # 局所的なコントラスト（Center-Surround差分）
         center_sigma = scale
         surround_sigma = scale * 2
         
         if nan_mask.any():
-            # NaNがある場合はcenterとsurroundを両方計算
             center, _ = handle_nan_with_gaussian(block, sigma=center_sigma, mode='nearest')
             surround, _ = handle_nan_with_gaussian(block, sigma=surround_sigma, mode='nearest')
         else:
-            # NaNがない場合
             center = gaussian_filter(block, sigma=center_sigma, mode='nearest')
             surround = gaussian_filter(block, sigma=surround_sigma, mode='nearest')
         
         # 差分の絶対値
         contrast = cp.abs(center - surround)
         
-        # 勾配の強度（スケールに応じてスムージング）
+        # 勾配の強度
         if scale > 1:
-            # 修正: NaN処理を追加
             if nan_mask.any():
                 filled_grad = cp.where(nan_mask, 0, gradient_mag_base)
                 valid = (~nan_mask).astype(cp.float32)
@@ -745,8 +770,12 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         else:
             gradient_mag = gradient_mag_base
         
-        # 特徴の組み合わせ
-        feature = contrast * 0.5 + gradient_mag * 0.5
+        # 低解像度では勾配の重みを増やす
+        if pixel_size > 5.0:
+            feature = contrast * 0.3 + gradient_mag * 0.7
+        else:
+            feature = contrast * 0.5 + gradient_mag * 0.5
+            
         feature = cp.where(cp.isnan(feature), 0, feature)
         saliency_maps.append(feature)
     
@@ -865,16 +894,27 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
+    # 解像度に応じたスムージングの自動調整
+    # 実世界で0.5〜1mのスムージングを目標
+    adaptive_sigma = max(0.3, min(2.0, 0.75 / pixel_size))
+    
     # ノイズ除去（NaN考慮）
     if nan_mask.any():
         filled = cp.where(nan_mask, cp.nanmean(block), block)
-        smoothed = gaussian_filter(filled, sigma=edge_sigma, mode='nearest')
+        smoothed = gaussian_filter(filled, sigma=adaptive_sigma, mode='nearest')
     else:
-        smoothed = gaussian_filter(block, sigma=edge_sigma, mode='nearest')
+        smoothed = gaussian_filter(block, sigma=adaptive_sigma, mode='nearest')
     
     # Sobelフィルタによる勾配計算
+    # 解像度に応じて勾配を正規化
     dy, dx = cp.gradient(smoothed, pixel_size)
     gradient_mag = cp.sqrt(dx**2 + dy**2)
+    
+    # 低解像度では勾配が小さくなるため、スケーリング
+    if pixel_size > 2.0:
+        gradient_scale = pixel_size / 2.0
+        gradient_mag = gradient_mag * gradient_scale
+    
     gradient_dir = cp.arctan2(dy, dx)
     
     if grad_low is not None and grad_high is not None:
@@ -976,13 +1016,21 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     """NPR輪郭線アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        edge_sigma = params.get('edge_sigma', 1.0)
+        edge_sigma = params.get('edge_sigma', None)  # Noneをデフォルトに
         pixel_size = params.get('pixel_size', 1.0)
         
-        # pixel_sizeに応じてedge_sigmaを自動調整
-        if edge_sigma == 1.0:  # デフォルト値の場合のみ自動調整
-            # 実世界で約1-2mのスムージングを目標とする
-            edge_sigma = max(0.5, min(2.0, 1.5 / pixel_size))
+        # edge_sigmaが指定されていない場合は自動計算
+        if edge_sigma is None:
+            edge_sigma = max(0.3, min(2.0, 0.75 / pixel_size))
+        
+        # 解像度に応じて閾値も調整
+        threshold_low = params.get('threshold_low', 0.2)
+        threshold_high = params.get('threshold_high', 0.5)
+        
+        if pixel_size > 5.0:  # 低解像度の場合
+            # 閾値を下げてより多くのエッジを検出
+            threshold_low = threshold_low * 0.5
+            threshold_high = threshold_high * 0.7
         
         # 統計量を計算
         stats = compute_global_stats(
@@ -1001,9 +1049,9 @@ class NPREdgesAlgorithm(DaskAlgorithm):
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             edge_sigma=edge_sigma,
-            threshold_low=params.get('threshold_low', 0.2),
-            threshold_high=params.get('threshold_high', 0.5),
-            pixel_size=params.get('pixel_size', 1.0),
+            threshold_low=threshold_low,
+            threshold_high=threshold_high,
+            pixel_size=pixel_size,
             grad_low=stats[0],
             grad_high=stats[1]
         )
