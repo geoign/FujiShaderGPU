@@ -66,7 +66,7 @@ def handle_nan_with_uniform(block: cp.ndarray, size: int, mode: str = 'nearest')
     
     sum_values = uniform_filter(filled * valid, size=size, mode=mode)
     sum_weights = uniform_filter(valid, size=size, mode=mode)
-    mean = uniform_filter(filled * valid, size=size, mode='reflect')
+    mean = cp.where(sum_weights > 0, sum_values / sum_weights, 0)
     
     return mean, nan_mask
 
@@ -86,6 +86,264 @@ def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
     if nan_mask.any():
         result[nan_mask] = cp.nan
     return result
+
+###############################################################################
+# グローバル統計ユーティリティ
+###############################################################################
+def determine_optimal_downsample_factor(
+    data_shape: Tuple[int, int],
+    algorithm_name: str = None,
+    target_pixels: int = 1000000,  # 目標ピクセル数（1000x1000）
+    min_factor: int = 5,
+    max_factor: int = 100,
+    algorithm_complexity: Dict[str, float] = None) -> int:
+    """
+    データサイズとアルゴリズムの特性に基づいて最適なダウンサンプル係数を決定
+    
+    Parameters:
+    -----------
+    data_shape : Tuple[int, int]
+        入力データの形状 (height, width)
+    algorithm_name : str
+        アルゴリズム名（複雑度の調整用）
+    target_pixels : int
+        ダウンサンプル後の目標ピクセル数
+    min_factor : int
+        最小ダウンサンプル係数
+    max_factor : int
+        最大ダウンサンプル係数
+    algorithm_complexity : Dict[str, float]
+        アルゴリズムごとの複雑度係数（デフォルトは内蔵辞書）
+    
+    Returns:
+    --------
+    int : 最適なダウンサンプル係数
+    """
+    # アルゴリズムの複雑度係数（計算コストが高いほど大きい値）
+    if algorithm_complexity is None:
+        algorithm_complexity = {
+            'rvi': 1.2,                    # マルチスケール処理
+            'hillshade': 0.8,              # 単純な勾配計算
+            'slope': 0.8,                  # 単純な勾配計算
+            'specular': 1.5,               # ラフネス計算が重い
+            'atmospheric_scattering': 0.9,
+            'multiscale_terrain': 1.5,     # マルチスケール処理
+            'frequency_enhancement': 1.3,   # FFT処理
+            'curvature': 1.0,              # 2次微分
+            'visual_saliency': 1.4,        # マルチスケール特徴抽出
+            'npr_edges': 1.1,              # エッジ検出
+            'atmospheric_perspective': 0.9,
+            'ambient_occlusion': 2.0,      # 最も計算コストが高い
+            'tpi': 1.0,                    # 畳み込み処理
+            'lrm': 1.1,                    # ガウシアンフィルタ
+            'openness': 1.8,               # 多方向探索
+        }
+    
+    # 現在のピクセル数
+    current_pixels = data_shape[0] * data_shape[1]
+    
+    # 基本のダウンサンプル係数（平方根で計算）
+    base_factor = cp.sqrt(current_pixels / target_pixels).get()
+    
+    # アルゴリズムの複雑度で調整
+    complexity = algorithm_complexity.get(algorithm_name, 1.0)
+    adjusted_factor = base_factor * complexity
+    
+    # 整数化して範囲内に収める
+    downsample_factor = int(cp.clip(adjusted_factor, min_factor, max_factor))
+    
+    # データが小さい場合は係数を小さくする
+    if current_pixels < 1_000_000:  # 1Mピクセル未満
+        downsample_factor = min(downsample_factor, 2)
+    elif current_pixels < 10_000_000:  # 10Mピクセル未満
+        downsample_factor = min(downsample_factor, 4)
+    return downsample_factor
+
+def compute_global_stats(gpu_arr: da.Array, 
+                        stat_func: callable,
+                        algorithm_func: callable,
+                        algorithm_params: dict,
+                        downsample_factor: int = None,  # Noneの場合は自動決定
+                        depth: int = None,
+                        algorithm_name: str = None) -> Tuple[Any, ...]:
+    """
+    ダウンサンプリングしたデータで統計量を計算する共通関数
+    
+    Parameters:
+    -----------
+    gpu_arr : da.Array
+        入力データ
+    stat_func : callable
+        統計量を計算する関数。CuPy配列を受け取り、統計量のタプルを返す
+    algorithm_func : callable
+        アルゴリズムの処理関数（正規化なしバージョン）
+    algorithm_params : dict
+        アルゴリズムのパラメータ
+    downsample_factor : int
+        ダウンサンプリング係数
+    depth : int
+        map_overlapのdepth（Noneの場合は自動計算）
+    
+    Returns:
+    --------
+    統計量のタプル
+    """
+    # downsample_factorが指定されていない場合は自動決定
+    if downsample_factor is None:
+        downsample_factor = determine_optimal_downsample_factor(
+            gpu_arr.shape,
+            algorithm_name=algorithm_name
+        )
+
+    # ダウンサンプリング
+    downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
+    
+    # depthの調整
+    if depth is not None:
+        depth_small = max(1, depth // downsample_factor)
+    else:
+        depth_small = 1
+    
+    # ダウンサンプル版でアルゴリズムを実行（正規化なし）
+    params_small = algorithm_params.copy()
+    
+    # スケール系パラメータの調整が必要な場合
+    for key in ['scale', 'sigma', 'radius', 'kernel_size']:
+        if key in params_small and params_small[key] is not None:
+            if isinstance(params_small[key], list):
+                if key in ['radius', 'kernel_size']:
+                    params_small[key] = [max(1, int(s/downsample_factor)) for s in params_small[key]]
+                else:
+                    params_small[key] = [max(1, s/downsample_factor) for s in params_small[key]]
+            else:
+                if key in ['radius', 'kernel_size']:
+                    params_small[key] = max(1, int(params_small[key]/downsample_factor))
+                else:
+                    params_small[key] = max(1, params_small[key]/downsample_factor)
+    
+    result_small = downsampled.map_overlap(
+        algorithm_func,
+        depth=depth_small,
+        boundary='reflect',
+        dtype=cp.float32,
+        meta=cp.empty((0, 0), dtype=cp.float32),
+        **params_small
+    ).compute()
+    
+    # 統計量を計算
+    return stat_func(result_small)
+
+
+def apply_global_normalization(block: cp.ndarray, 
+                              norm_func: callable,
+                              stats: Tuple[Any, ...],
+                              nan_mask: cp.ndarray = None) -> cp.ndarray:
+    """
+    グローバル統計量を使って正規化を適用する共通関数
+    
+    Parameters:
+    -----------
+    block : cp.ndarray
+        処理するブロック
+    norm_func : callable
+        正規化関数。(block, stats, nan_mask)を受け取り、正規化されたブロックを返す
+    stats : tuple
+        グローバル統計量
+    nan_mask : cp.ndarray
+        NaNマスク（オプション）
+    
+    Returns:
+    --------
+    正規化されたブロック
+    """
+    if nan_mask is None:
+        nan_mask = cp.isnan(block)
+    
+    normalized = norm_func(block, stats, nan_mask)
+    
+    # ガンマ補正（0-1の範囲の場合のみ）
+    valid_normalized = normalized[~nan_mask]
+    if len(valid_normalized) > 0 and cp.min(valid_normalized) >= 0 and cp.max(valid_normalized) <= 1:
+        normalized = cp.power(normalized, Constants.DEFAULT_GAMMA)
+    
+    # NaN位置を復元
+    normalized = restore_nan(normalized, nan_mask)
+    
+    return normalized.astype(cp.float32)
+
+
+###############################################################################
+# 各アルゴリズム用の統計・正規化関数
+###############################################################################
+
+# RVI用
+def rvi_stat_func(data: cp.ndarray) -> Tuple[float]:
+    """RVI用の統計量計算（標準偏差）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        return (float(cp.std(valid_data)),)
+    return (1.0,)
+
+def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
+    """RVI用の正規化"""
+    std_global = stats[0]
+    if std_global > 0:
+        normalized = block / (3 * std_global)
+        return cp.clip(normalized, -1, 1)
+    return cp.zeros_like(block)
+
+# FrequencyEnhancement用
+def freq_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """周波数強調用の統計量計算（最小値・最大値）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
+    return (0.0, 1.0)
+
+def freq_norm_func(block: cp.ndarray, stats: Tuple[float, float], nan_mask: cp.ndarray) -> cp.ndarray:
+    """周波数強調用の正規化"""
+    min_val, max_val = stats
+    if max_val > min_val:
+        return (block - min_val) / (max_val - min_val)
+    return cp.full_like(block, 0.5)
+
+# NPREdges用
+def npr_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """NPRエッジ用の統計量計算（勾配のパーセンタイル）"""
+    # 簡易的に勾配を計算
+    dy, dx = cp.gradient(data)
+    gradient_mag = cp.sqrt(dx**2 + dy**2)
+    valid_grad = gradient_mag[~cp.isnan(gradient_mag)]
+    
+    if len(valid_grad) > 0:
+        return (float(cp.percentile(valid_grad, 70)), 
+                float(cp.percentile(valid_grad, 90)))
+    return (0.1, 0.3)
+
+# TPI/LRM用
+def tpi_lrm_stat_func(data: cp.ndarray) -> Tuple[float]:
+    """TPI/LRM用の統計量計算（最大絶対値）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        return (float(cp.maximum(cp.abs(cp.min(valid_data)), 
+                                cp.abs(cp.max(valid_data)))),)
+    return (1.0,)
+
+def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
+    """TPI/LRM用の正規化"""
+    max_abs = stats[0]
+    if max_abs > 0:
+        return cp.clip(block / max_abs, -1, 1)
+    return cp.zeros_like(block)
+
+# Visual Saliency用
+def visual_saliency_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """Visual Saliency用の統計量計算"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        return (float(cp.percentile(valid_data, 5)), 
+                float(cp.percentile(valid_data, 95)))
+    return (0.0, 1.0)
 
 ###############################################################################
 # 2.1. RVI (Ridge-Valley Index) アルゴリズム
@@ -119,26 +377,20 @@ def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
 
 def compute_rvi_efficient_block(block: cp.ndarray, *, 
                                radii: List[int] = [4, 16, 64], 
-                               weights: Optional[List[float]] = None,
-                               pixel_size: float = 1.0) -> cp.ndarray:
+                               weights: Optional[List[float]] = None) -> cp.ndarray:
     """効率的なRVI計算（メモリ最適化版）"""
     nan_mask = cp.isnan(block)
     
     if weights is None:
         weights = cp.array([1.0 / len(radii)] * len(radii), dtype=cp.float32)
     else:
-        weights = cp.array(weights, dtype=cp.float32)
+        if not isinstance(weights, cp.ndarray):
+            weights = cp.array(weights, dtype=cp.float32)
+        if len(weights) != len(radii):
+            raise ValueError(f"Length of weights ({len(weights)}) must match length of radii ({len(radii)})")
     
     # 結果をインプレースで累積（メモリ効率向上）
     rvi_combined = cp.zeros_like(block, dtype=cp.float32)
-    
-    # NaN処理の前処理
-    if nan_mask.any():
-        filled = cp.where(nan_mask, 0, block)
-        valid = (~nan_mask).astype(cp.float32)
-    else:
-        filled = block
-        valid = None
     
     for radius, weight in zip(radii, weights):
         if radius <= 1:
@@ -162,8 +414,7 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
 
 def multiscale_rvi_efficient(gpu_arr: da.Array, *, 
                             radii: List[int], 
-                            weights: Optional[List[float]] = None,
-                            show_progress: bool = True) -> da.Array:
+                            weights: Optional[List[float]] = None) -> da.Array:
     """効率的なマルチスケールRVI（Dask版）"""
     
     if not radii:
@@ -190,60 +441,34 @@ def multiscale_rvi_efficient(gpu_arr: da.Array, *,
 class RVIAlgorithm(DaskAlgorithm):
     """Ridge-Valley Indexアルゴリズム（効率的実装）"""
     
-    def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        # パラメータ取得
-        mode = params.get('mode', 'radius')  # 'radius' or 'sigma'
-        show_progress = params.get('show_progress', True)
+    def process(self, gpu_arr: da.Array, **params) -> da.Array:        
+        # 新しい効率的な半径ベース
+        radii = params.get('radii', None)
+        weights = params.get('weights', None)
         
-        if mode == 'sigma':
-            # 従来のsigmaベース（互換性のため残す）
-            sigmas = params.get('sigmas', [50])
-            agg = params.get('agg', 'mean')
-            rvi = multiscale_rvi(gpu_arr, sigmas=sigmas, agg=agg, show_progress=show_progress)
-        else:
-            # 新しい効率的な半径ベース
-            radii = params.get('radii', None)
-            weights = params.get('weights', None)
-            
-            # 自動決定
-            if radii is None:
-                pixel_size = params.get('pixel_size', 1.0)
-                radii = self._determine_optimal_radii(pixel_size)
-            
-            rvi = multiscale_rvi_efficient(gpu_arr, radii=radii, weights=weights, 
-                                         show_progress=show_progress)
+        # 自動決定
+        if radii is None:
+            pixel_size = params.get('pixel_size', 1.0)
+            radii = self._determine_optimal_radii(pixel_size)
+        max_radius = max(radii)
+        rvi = multiscale_rvi_efficient(gpu_arr, radii=radii, weights=weights)
         
-        # 正規化とガンマ補正
-        def normalize_rvi(block):
-            # NaNマスクを保存
-            nan_mask = cp.isnan(block)
-            
-            # 有効な値の範囲を取得
-            valid_block = block[~nan_mask]
-            if len(valid_block) > 0:
-                # 標準偏差でスケーリング
-                std = cp.std(valid_block)
-                if std > 0:
-                    normalized = block / (3 * std)  # ±3σの範囲に
-                    normalized = cp.clip(normalized, -1, 1)
-                else:
-                    normalized = cp.zeros_like(block)
-            else:
-                normalized = cp.zeros_like(block)
-            
-            # NaN位置を復元
-            normalized = restore_nan(normalized, nan_mask)
-            
-            return normalized.astype(cp.float32)
+        # グローバル統計を使用 統計量を計算
+        stats = compute_global_stats(
+            rvi,  # 正規化前のRVI結果
+            rvi_stat_func,
+            compute_rvi_efficient_block,
+            {'radii': radii, 'weights': weights},
+            params.get('downsample_factor', None),
+            depth=max_radius * 2 + 1
+        )
         
         # 正規化を適用
-        normalized_rvi = rvi.map_blocks(
-            normalize_rvi,
+        return rvi.map_blocks(
+            lambda block: apply_global_normalization(block, rvi_norm_func, stats),
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32)
         )
-        
-        return normalized_rvi
     
     def _determine_optimal_radii(self, pixel_size: float) -> List[int]:
         """ピクセルサイズに基づいて最適な半径を決定"""
@@ -263,9 +488,10 @@ class RVIAlgorithm(DaskAlgorithm):
         # 最大4つまでに制限
         if len(radii) > 4:
             # 対数的に分布するように選択
-            import numpy as np
-            indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
-            radii = [radii[i] for i in indices]
+            # CuPy配列をPythonリストに変換してからアクセス
+            indices = cp.logspace(0, cp.log10(len(radii)-1), 4).astype(int)
+            indices_list = indices.get()  # CuPy配列をホストメモリ（NumPy配列）に転送
+            radii = [radii[int(i)] for i in indices_list]
         
         return radii
     
@@ -296,7 +522,6 @@ def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str,
     result = None
     
     for i, sigma in enumerate(iterator):
-        # depth = int(4 * sigma)  # この行を削除
         # 大きなsigmaに対してdepthを制限
         depth = min(int(4 * sigma), Constants.MAX_DEPTH)  # 最大depth=200に制限
         
@@ -397,7 +622,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 if sigma > 1:
                     depth = int(4 * sigma)
                     smoothed = gpu_arr.map_overlap(
-                        lambda x: gaussian_filter(x, sigma=sigma, mode='nearest'),
+                        lambda x, *, sigma=sigma: gaussian_filter(x, sigma=sigma, mode='nearest'),
                         depth=depth,
                         boundary='reflect',
                         dtype=cp.float32,
@@ -570,7 +795,7 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         # 正規化なし
         result = combined_saliency
     
-    # ガンマ補正（正規化した場合のみ）
+    # ガンマ補正（0-1の範囲の場合のみ適用）
     if normalize:
         result = cp.power(result, Constants.DEFAULT_GAMMA)
     
@@ -584,83 +809,41 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         scales = params.get('scales', [2, 4, 8, 16])
-        pixel_size = params.get('pixel_size', 1.0)
         max_scale = max(scales)
-        use_global_stats = params.get('use_global_stats', True)  # デフォルトで有効
+
+        # 統計量を計算（新しい共通関数を使用）
+        stats = compute_global_stats(
+            gpu_arr,
+            visual_saliency_stat_func,
+            compute_visual_saliency_block,
+            {
+                'scales': scales,
+                'pixel_size': params.get('pixel_size', 1.0),
+                'normalize': False
+            },
+            downsample_factor=params.get('downsample_factor', None),
+            depth=int(max_scale * 8)
+        )
         
-        if use_global_stats:
-            # Step 1: 縮小版で統計量を計算
-            downsample_factor = params.get('downsample_factor', 20)  # 1/20にダウンサンプル
-            
-            # ダウンサンプリング（メモリ効率のため、スライスを使用）
-            downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
-            
-            # 縮小版で視覚的顕著性を計算（正規化なし）
-            saliency_small = downsampled.map_overlap(
-                compute_visual_saliency_block,
-                depth=max(1, int(max_scale * 8 // downsample_factor)),
-                boundary='reflect',
-                dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32),
-                scales=[s/downsample_factor for s in scales],  # スケールも調整
-                pixel_size=pixel_size * downsample_factor,
-                normalize=False  # 正規化なし
-            )
-            
-            # 統計量を計算（Daskの遅延実行を利用）
-            # NaN を除外した統計量を計算
-            def compute_stats(dask_array):
-                """Dask配列から統計量を計算"""
-                # Dask配列を計算してCuPy配列を取得
-                arr = dask_array.compute()
-                # CuPy配列から統計量を計算
-                valid_data = arr[~cp.isnan(arr)]
-                if len(valid_data) > 0:
-                    p5 = float(cp.percentile(valid_data, 5))
-                    p95 = float(cp.percentile(valid_data, 95))
-                    return p5, p95
-                else:
-                    return 0.0, 1.0
-            
-            # 統計量を計算
-            norm_min, norm_max = compute_stats(saliency_small)
-            
-            # デバッグ情報（オプション）
-            if params.get('verbose', False):
-                print(f"Visual Saliency global stats: min={norm_min:.3f}, max={norm_max:.3f}")
-            
-            # Step 2: フルサイズで計算（統計量を使用）
-            return gpu_arr.map_overlap(
-                compute_visual_saliency_block,
-                depth=int(max_scale * 8),
-                boundary='reflect',
-                dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32),
-                scales=scales,
-                pixel_size=pixel_size,
-                normalize=True,
-                norm_min=norm_min,
-                norm_max=norm_max
-            )
-        else:
-            # 従来の方法（互換性のため）
-            return gpu_arr.map_overlap(
-                compute_visual_saliency_block,
-                depth=int(max_scale * 8),
-                boundary='reflect',
-                dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32),
-                scales=scales,
-                pixel_size=pixel_size,
-                normalize=True
-            )
+        # フルサイズで処理
+        return gpu_arr.map_overlap(
+            compute_visual_saliency_block,
+            depth=int(max_scale * 8),
+            boundary='reflect',
+            dtype=cp.float32,
+            meta=cp.empty((0, 0), dtype=cp.float32),
+            scales=scales,
+            pixel_size=params.get('pixel_size', 1.0),
+            normalize=True,
+            norm_min=stats[0],
+            norm_max=stats[1]
+        )
     
     def get_default_params(self) -> dict:
         return {
             'scales': [2, 4, 8, 16],
             'pixel_size': 1.0,
-            'use_global_stats': True,      # グローバル統計を使用
-            'downsample_factor': 20,       # ダウンサンプル係数
+            'downsample_factor': None,       # ダウンサンプル係数
             'verbose': False               # デバッグ出力
         }
 
@@ -670,7 +853,9 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
 
 def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
                           threshold_low: float = 0.1, threshold_high: float = 0.3,
-                          pixel_size: float = 1.0) -> cp.ndarray:
+                          pixel_size: float = 1.0,
+                          grad_low: float = None,
+                          grad_high: float = None) -> cp.ndarray:
     """NPRスタイルの輪郭線抽出（Cannyエッジ検出の変形）"""
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
@@ -687,23 +872,27 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     gradient_mag = cp.sqrt(dx**2 + dy**2)
     gradient_dir = cp.arctan2(dy, dx)
     
-    # 勾配の統計情報を使用して適応的な閾値を計算
-    valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag
-    if len(valid_grad) > 0:
-        # パーセンタイルベースの閾値設定
-        low_percentile = 70  # 上位30%
-        high_percentile = 90  # 上位10%
-        
-        grad_low = cp.percentile(valid_grad, low_percentile)
-        grad_high = cp.percentile(valid_grad, high_percentile)
-        
-        # ユーザー指定の閾値でスケーリング
+    if grad_low is not None and grad_high is not None:
+        # グローバル統計量を使用
         actual_threshold_low = grad_low + (grad_high - grad_low) * threshold_low
         actual_threshold_high = grad_low + (grad_high - grad_low) * threshold_high
     else:
-        actual_threshold_low = threshold_low
-        actual_threshold_high = threshold_high
-    
+        # 勾配の統計情報を使用して適応的な閾値を計算
+        valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag
+        if len(valid_grad) > 0:
+            # パーセンタイルベースの閾値設定
+            low_percentile = 70  # 上位30%
+            high_percentile = 90  # 上位10%
+            local_grad_low = cp.percentile(valid_grad, low_percentile)
+            local_grad_high = cp.percentile(valid_grad, high_percentile)
+
+            # ユーザー指定の閾値でスケーリング
+            actual_threshold_low = local_grad_low + (local_grad_high - local_grad_low) * threshold_low
+            actual_threshold_high = local_grad_low + (local_grad_high - local_grad_low) * threshold_high
+        else:
+            actual_threshold_low = threshold_low
+            actual_threshold_high = threshold_high
+
     # 非最大値抑制（簡易版）
     # 勾配方向を8方向に量子化
     angle = gradient_dir * 180.0 / cp.pi
@@ -783,9 +972,16 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         edge_sigma = params.get('edge_sigma', 1.0)
-        threshold_low = params.get('threshold_low', 0.2)  # デフォルト値を調整
-        threshold_high = params.get('threshold_high', 0.5)  # デフォルト値を調整
-        pixel_size = params.get('pixel_size', 1.0)
+        
+        # 統計量を計算
+        stats = compute_global_stats(
+            gpu_arr,
+            npr_stat_func,
+            lambda block, **kwargs: block,
+            {},
+            downsample_factor=None,
+            depth=1
+        )
         
         return gpu_arr.map_overlap(
             compute_npr_edges_block,
@@ -794,9 +990,11 @@ class NPREdgesAlgorithm(DaskAlgorithm):
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             edge_sigma=edge_sigma,
-            threshold_low=threshold_low,
-            threshold_high=threshold_high,
-            pixel_size=pixel_size
+            threshold_low=params.get('threshold_low', 0.2),
+            threshold_high=params.get('threshold_high', 0.5),
+            pixel_size=params.get('pixel_size', 1.0),
+            grad_low=stats[0],
+            grad_high=stats[1]
         )
     
     def get_default_params(self) -> dict:
@@ -889,10 +1087,10 @@ class AtmosphericPerspectiveAlgorithm(DaskAlgorithm):
 ###############################################################################
 
 def compute_ambient_occlusion_block(block: cp.ndarray, *, 
-                                  num_samples: int = 16,
-                                  radius: float = 10.0,
-                                  intensity: float = 1.0,
-                                  pixel_size: float = 1.0) -> cp.ndarray:
+                                    num_samples: int = 16,
+                                    radius: float = 10.0,
+                                    intensity: float = 1.0,
+                                    pixel_size: float = 1.0) -> cp.ndarray:
     """スクリーン空間環境光遮蔽（SSAO）の地形版（高速ベクトル化版）"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
@@ -907,9 +1105,6 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     # 全サンプル点の座標を事前計算（ベクトル化）
     occlusion_total = cp.zeros((h, w), dtype=cp.float32)
     sample_count = cp.zeros((h, w), dtype=cp.float32)  # 有効なサンプル数をカウント
-    
-    # パディング値の決定
-    pad_value = Constants.NAN_FILL_VALUE_POSITIVE
     
     # バッチ処理で高速化
     for r_factor in r_factors:
@@ -1029,9 +1224,8 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
 ###############################################################################
 
 def compute_tpi_block(block: cp.ndarray, *, radius: int = 10,
-                     pixel_size: float = 1.0) -> cp.ndarray:
+                      std_global: float = None) -> cp.ndarray:
     """地形位置指数の計算（尾根・谷・斜面の分類）"""
-    
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
@@ -1055,12 +1249,10 @@ def compute_tpi_block(block: cp.ndarray, *, radius: int = 10,
     # TPIは中心と周囲の差
     tpi = block - mean_elev
     
-    # 標準化（-1から1の範囲に）
-    valid_tpi = tpi[~nan_mask] if nan_mask.any() else tpi
-    if len(valid_tpi) > 0:
-        max_abs = cp.maximum(cp.abs(cp.min(valid_tpi)), cp.abs(cp.max(valid_tpi)))
-        if max_abs > 0:
-            tpi = tpi / max_abs
+    # グローバル統計量で正規化
+    if std_global is not None:
+        if std_global > 0:
+            tpi = tpi / (3 * std_global)
     
     # ガンマ補正は行わない（正負の値を保持）
     # 結果は-1から+1の範囲
@@ -1076,21 +1268,30 @@ class TPIAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         radius = params.get('radius', 10)
-        pixel_size = params.get('pixel_size', 1.0)  # pixel_sizeを取得
+        
+        # 統計量を計算
+        stats = compute_global_stats(
+            gpu_arr,
+            lambda data: tpi_lrm_stat_func(compute_tpi_block(data, radius=radius, std_global=None)),
+            compute_tpi_block,
+            {'radius': radius, 'std_global': None},
+            downsample_factor=None,
+            depth=radius+1
+        )
+        
         return gpu_arr.map_overlap(
             compute_tpi_block,
             depth=radius+1,
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            radius=radius,  # 明示的に必要なパラメータのみ渡す
-            pixel_size=pixel_size  # 明示的に必要なパラメータのみ渡す
+            radius=radius,
+            std_global=stats[0]
         )
     
     def get_default_params(self) -> dict:
         return {
             'radius': 10,  # 解析半径（ピクセル）
-            'pixel_size': 1.0
         }
 
 ###############################################################################
@@ -1098,7 +1299,8 @@ class TPIAlgorithm(DaskAlgorithm):
 ###############################################################################
 
 def compute_lrm_block(block: cp.ndarray, *, kernel_size: int = 25,
-                     pixel_size: float = 1.0) -> cp.ndarray:
+                     pixel_size: float = 1.0,
+                     std_global: float = None) -> cp.ndarray:  # 追加
     """局所起伏モデルの計算（微地形の強調）"""
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
@@ -1110,12 +1312,10 @@ def compute_lrm_block(block: cp.ndarray, *, kernel_size: int = 25,
     # 微地形の抽出
     lrm = block - trend
     
-    # 正規化（標準偏差でスケーリング）
-    valid_lrm = lrm[~nan_mask] if nan_mask.any() else lrm
-    if len(valid_lrm) > 0:
-        std = cp.std(valid_lrm)
-        if std > 0:
-            lrm = lrm / (3 * std)  # ±3σの範囲に
+    if std_global is not None:
+        # グローバル統計量で正規化
+        if std_global > 0:
+            lrm = lrm / (3 * std_global)
     
     # 結果は-1から+1の範囲
     result = cp.clip(lrm, -1, 1)
@@ -1130,22 +1330,30 @@ class LRMAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         kernel_size = params.get('kernel_size', 25)
-        pixel_size = params.get('pixel_size', 1.0)
-        depth = int(kernel_size * 2)  # 十分なマージン
+        
+        # 統計量を計算
+        stats = compute_global_stats(
+            gpu_arr,
+            lambda data: tpi_lrm_stat_func(compute_lrm_block(data, kernel_size=kernel_size)),
+            compute_lrm_block,
+            {'kernel_size': kernel_size},
+            downsample_factor=None,
+            depth=int(kernel_size * 2)
+        )
+        
         return gpu_arr.map_overlap(
             compute_lrm_block,
-            depth=depth,
+            depth=int(kernel_size * 2),
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             kernel_size=kernel_size,
-            pixel_size=pixel_size
+            std_global=stats[0]
         )
     
     def get_default_params(self) -> dict:
         return {
             'kernel_size': 25,  # トレンド除去のカーネルサイズ
-            'pixel_size': 1.0
         }
 
 ###############################################################################
@@ -1195,13 +1403,13 @@ def compute_openness_vectorized(block: cp.ndarray, *,
             pad_top = max(0, -offset_y)
             pad_bottom = max(0, offset_y)
             
-            # パディング（NaN考慮）
+            # パディング
             if nan_mask.any():
                 padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                              mode='constant', constant_values=pad_value)
+                            mode='constant', constant_values=pad_value)
             else:
                 padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                              mode='edge')
+                            mode='edge')
             
             # 以下は変更なし
             # シフト（簡潔な記述）
@@ -1284,11 +1492,22 @@ def compute_slope_block(block: cp.ndarray, *, unit: str = 'degree',
     return slope.astype(cp.float32)
 
 class SlopeAlgorithm(DaskAlgorithm):
-    """勾配（傾斜）アルゴリズム"""
-    
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         unit = params.get('unit', 'degree')
         pixel_size = params.get('pixel_size', 1.0)
+        normalize = params.get('normalize', False)  # 正規化オプションを追加
+        
+        if normalize and unit == 'degree':
+            # グローバル統計を計算
+            stats = compute_global_stats(
+                gpu_arr,
+                lambda data: (float(cp.min(data[~cp.isnan(data)])), 
+                             float(cp.max(data[~cp.isnan(data)]))),
+                compute_slope_block,
+                {'unit': unit, 'pixel_size': pixel_size},
+                downsample_factor=None,
+                depth=1
+            )
         
         return gpu_arr.map_overlap(
             compute_slope_block,
@@ -1515,7 +1734,6 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         scales = params.get('scales', [1, 10, 50, 100])
         weights = params.get('weights', None)
-        use_global_stats = params.get('use_global_stats', True)
         
         if weights is None:
             # デフォルト：スケールに反比例する重み
@@ -1529,42 +1747,18 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         max_scale = max(scales)
         common_depth = min(int(4 * max_scale), Constants.MAX_DEPTH)
         
-        # Step 1: 縮小版で統計量を計算（グローバル統計量を使用する場合）
-        if use_global_stats:
-            downsample_factor = params.get('downsample_factor', 20)
-            downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
-            
-            # 縮小版でマルチスケール処理
-            results_small = []
+        # 縮小版で統計量を計算
+        downsample_factor = params.get('downsample_factor', None)
+        downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
+        
+        # 縮小版でマルチスケール処理
+        results_small = []
 
-            # 共通のdepthを計算（追加）
-            max_scale_small = max([max(1, s // downsample_factor) for s in scales])
-            common_depth_small = min(int(4 * max_scale_small), Constants.MAX_DEPTH)
+        # 共通のdepthを計算（追加）
+        max_scale_small = max([max(1, s // downsample_factor) for s in scales])
+        common_depth_small = min(int(4 * max_scale_small), Constants.MAX_DEPTH)
 
-            for i, scale in enumerate(scales):
-                scale_small = max(1, scale // downsample_factor)
-                # depth_small = min(int(4 * scale_small), Constants.MAX_DEPTH)  # この行を削除
-                
-                def compute_detail_small(block, *, scale):
-                    if scale > 1:
-                        smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
-                        detail = block - smoothed
-                        detail = restore_nan(detail, nan_mask)
-                    else:
-                        detail = block
-                    return detail
-                
-                detail_small = downsampled.map_overlap(
-                    compute_detail_small,
-                    depth=common_depth_small,  # 共通のdepthを使用
-                    boundary='reflect',
-                    dtype=cp.float32,
-                    meta=cp.empty((0, 0), dtype=cp.float32),
-                    scale=scale_small
-                )
-                results_small.append(detail_small)
-            
-            # 縮小版を合成
+        def create_weighted_combiner(weights):
             def weighted_combine_for_stats(*blocks):
                 nan_mask = cp.isnan(blocks[0])
                 result = cp.zeros_like(blocks[0])
@@ -1575,24 +1769,48 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                 
                 result[nan_mask] = cp.nan
                 return result
+            return weighted_combine_for_stats
+        
+        for i, scale in enumerate(scales):
+            scale_small = max(1, scale // downsample_factor)
             
-            combined_small = da.map_blocks(
-                weighted_combine_for_stats,
-                *results_small,
+            def compute_detail_small(block, *, scale):
+                if scale > 1:
+                    smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
+                    detail = block - smoothed
+                    detail = restore_nan(detail, nan_mask)
+                else:
+                    detail = block
+                return detail
+            
+            detail_small = downsampled.map_overlap(
+                compute_detail_small,
+                depth=common_depth_small,  # 共通のdepthを使用
+                boundary='reflect',
                 dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32)
-            ).compute()
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                scale=scale_small
+            )
+            results_small.append(detail_small)
             
-            # 統計量を計算
-            valid_data = combined_small[~cp.isnan(combined_small)]
-            if len(valid_data) > 0:
-                norm_min = float(cp.percentile(valid_data, 5))
-                norm_max = float(cp.percentile(valid_data, 95))
-            else:
-                norm_min, norm_max = 0.0, 1.0
-            
-            if params.get('verbose', False):
-                print(f"Multiscale Terrain global stats: min={norm_min:.3f}, max={norm_max:.3f}")
+        # ループ後に一度だけ合成
+        combined_small = da.map_blocks(
+            create_weighted_combiner(weights),
+            *results_small,
+            dtype=cp.float32,
+            meta=cp.empty((0, 0), dtype=cp.float32)
+        ).compute()
+
+        # 統計量を計算
+        valid_data = combined_small[~cp.isnan(combined_small)]
+        if len(valid_data) > 0:
+            norm_min = float(cp.percentile(valid_data, 5))
+            norm_max = float(cp.percentile(valid_data, 95))
+        else:
+            norm_min, norm_max = 0.0, 1.0
+        
+        if params.get('verbose', False):
+            print(f"Multiscale Terrain global stats: min={norm_min:.3f}, max={norm_max:.3f}")
         
         # Step 2: フルサイズで処理
         results = []
@@ -1617,58 +1835,43 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             results.append(detail)
         
         # 重み付き合成とグローバル正規化
-        if use_global_stats:
-            def weighted_combine_and_normalize(*blocks):
-                """グローバル統計量を使用して正規化"""
-                nan_mask = cp.isnan(blocks[0])
-                result = cp.zeros_like(blocks[0])
-                
-                for i, block in enumerate(blocks):
-                    valid = ~cp.isnan(block)
-                    result[valid] += block[valid] * weights[i]
-                
-                # グローバル統計量で正規化
-                if norm_max > norm_min:
-                    result = (result - norm_min) / (norm_max - norm_min)
-                    result = cp.clip(result, 0, 1)
-                else:
-                    result = cp.full_like(result, 0.5)
-                
-                # ガンマ補正
-                result = cp.power(result, Constants.DEFAULT_GAMMA)
-                
-                # NaN位置を復元
-                result[nan_mask] = cp.nan
-                
-                return result.astype(cp.float32)
+        def weighted_combine_and_normalize(*blocks):
+            """グローバル統計量を使用して正規化"""
+            nan_mask = cp.isnan(blocks[0])
+            result = cp.zeros_like(blocks[0])
             
-            combined = da.map_blocks(
-                weighted_combine_and_normalize,
-                *results,
-                dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32)
-            )
-        else:
-            # 従来の方法（互換性のため）
-            def weighted_combine_with_nan(*blocks):
-                # ... 既存の実装 ...
-                pass
+            for i, block in enumerate(blocks):
+                valid = ~cp.isnan(block)
+                result[valid] += block[valid] * weights[i]
             
-            combined = da.map_blocks(
-                weighted_combine_with_nan,
-                *results,
-                dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32)
-            )
+            # グローバル統計量で正規化
+            if norm_max > norm_min:
+                result = (result - norm_min) / (norm_max - norm_min)
+                result = cp.clip(result, 0, 1)
+            else:
+                result = cp.full_like(result, 0.5)
+            
+            # ガンマ補正
+            result = cp.power(result, Constants.DEFAULT_GAMMA)
+            
+            # NaN位置を復元
+            result[nan_mask] = cp.nan
+            
+            return result.astype(cp.float32)
         
+        combined = da.map_blocks(
+            weighted_combine_and_normalize,
+            *results,
+            dtype=cp.float32,
+            meta=cp.empty((0, 0), dtype=cp.float32)
+        )
         return combined
     
     def get_default_params(self) -> dict:
         return {
             'scales': [1, 10, 50, 100],
             'weights': None,
-            'use_global_stats': True,      # グローバル統計を使用
-            'downsample_factor': 20,       # ダウンサンプル係数
+            'downsample_factor': None,       # ダウンサンプル係数
             'verbose': False               # デバッグ出力
         }
 
@@ -1677,7 +1880,10 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
 ###############################################################################
 
 def enhance_frequency_block(block: cp.ndarray, *, target_frequency: float = 0.1,
-                          bandwidth: float = 0.05, enhancement: float = 2.0) -> cp.ndarray:
+                          bandwidth: float = 0.05, enhancement: float = 2.0,
+                          normalize: bool = True,  # 追加
+                          norm_min: float = None,   # 追加
+                          norm_max: float = None) -> cp.ndarray:  # 追加
     """特定周波数成分の強調"""
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
@@ -1708,18 +1914,17 @@ def enhance_frequency_block(block: cp.ndarray, *, target_frequency: float = 0.1,
     filtered_fft = fft * filter_mask
     enhanced = cp.real(cp.fft.ifft2(filtered_fft))
     
-    # 正規化
-    valid_enhanced = enhanced[~nan_mask]
-    if len(valid_enhanced) > 0:
-        min_val = cp.min(valid_enhanced)
-        max_val = cp.max(valid_enhanced)
-        if max_val > min_val:
-            enhanced = (enhanced - min_val) / (max_val - min_val)
+    if normalize and norm_min is not None and norm_max is not None:
+        # グローバル統計量で正規化
+        if norm_max > norm_min:
+            enhanced = (enhanced - norm_min) / (norm_max - norm_min)
         else:
             enhanced = cp.full_like(enhanced, 0.5)
-    
-    # ガンマ補正
-    result = cp.power(enhanced, Constants.DEFAULT_GAMMA)
+        # 正規化後もガンマ補正を適用
+        result = cp.power(enhanced, Constants.DEFAULT_GAMMA)
+    else:
+        # 正規化なしの場合はそのまま返す
+        result = enhanced
     
     # NaN処理
     result = restore_nan(result, nan_mask)
@@ -1730,20 +1935,33 @@ class FrequencyEnhancementAlgorithm(DaskAlgorithm):
     """周波数強調アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        target_frequency = params.get('target_frequency', 0.1)
-        bandwidth = params.get('bandwidth', 0.05)
-        enhancement = params.get('enhancement', 2.0)
+        # 統計量を計算
+        stats = compute_global_stats(
+            gpu_arr,
+            freq_stat_func,
+            enhance_frequency_block,
+            {
+                'target_frequency': params.get('target_frequency', 0.1),
+                'bandwidth': params.get('bandwidth', 0.05),
+                'enhancement': params.get('enhancement', 2.0),
+                'normalize': False
+            },
+            downsample_factor=None,
+            depth=32
+        )
         
-        # map_blocks を map_overlap に変更し、適切なdepthを設定
         return gpu_arr.map_overlap(
             enhance_frequency_block,
-            depth=32,  # FFT処理のための十分なオーバーラップ
-            boundary='reflect',  # 境界条件を追加
+            depth=32,
+            boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            target_frequency=target_frequency,
-            bandwidth=bandwidth,
-            enhancement=enhancement
+            target_frequency=params.get('target_frequency', 0.1),
+            bandwidth=params.get('bandwidth', 0.05),
+            enhancement=params.get('enhancement', 2.0),
+            normalize=True,
+            norm_min=stats[0],
+            norm_max=stats[1]
         )
     
     def get_default_params(self) -> dict:

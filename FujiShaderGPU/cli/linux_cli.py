@@ -61,9 +61,21 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         parser.add_argument(
             "--memory-fraction",
             type=float,
-            # default=0.8,  # この行を削除
             default=0.5,  # より保守的なデフォルト値に変更
             help="GPU メモリ使用率 (default: 0.5)"  # ヘルプテキストも更新
+        )
+
+        parser.add_argument(
+            "--pixel-size",
+            type=float,
+            default=1.0,
+            help="ピクセルサイズ（メートル単位, default: 1.0）"
+        )
+
+        parser.add_argument(
+            "--verbose",
+            action="store_true",
+            help="詳細なログ出力を有効化"
         )
         
         # マルチスケール処理
@@ -132,6 +144,12 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             "--multiscale",
             action="store_true",
             help="マルチスケールHillshadeを実行"
+        )
+
+        parser.add_argument(
+            "--sigmas",
+            type=str,
+            help="マルチスケールHillshadeのsigma値。カンマ区切り (例: 1,2,4,8)"
         )
         
         # Slope固有
@@ -389,6 +407,15 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         else:
             parsed_args.vs_scales_list = None
 
+        # sigmasのパース（Hillshade用）
+        if hasattr(parsed_args, 'sigmas') and parsed_args.sigmas and parsed_args.algorithm == 'hillshade':
+            try:
+                parsed_args.sigmas_list = [float(s.strip()) for s in parsed_args.sigmas.split(",")]
+            except ValueError:
+                self.parser.error("無効なsigmas形式です。カンマ区切りの数値を指定してください: 1,2,4,8")
+        else:
+            parsed_args.sigmas_list = None
+
         return parsed_args
     
     def _validate_platform_args(self, args: argparse.Namespace):
@@ -455,6 +482,10 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # 共通パラメータ
         if hasattr(args, 'intensity'):
             algo_params['intensity'] = args.intensity
+        if hasattr(args, 'pixel_size'):
+            algo_params['pixel_size'] = args.pixel_size
+        if hasattr(args, 'verbose'):
+            algo_params['verbose'] = args.verbose
 
         # Hillshade固有
         if args.algorithm == 'hillshade':
@@ -466,6 +497,8 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 algo_params['z_factor'] = args.z_factor
             if hasattr(args, 'multiscale'):
                 algo_params['multiscale'] = args.multiscale
+            if hasattr(args, 'sigmas_list') and args.sigmas_list:
+                algo_params['sigmas'] = args.sigmas_list
 
         # Slope固有
         elif args.algorithm == 'slope':
@@ -567,11 +600,27 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # RVI用ログ出力
         if args.algorithm == "rvi":
             if args.use_sigma_mode:
-                self.logger.info("モード: Sigma（従来方式）")
-                if params['sigma_list']:
-                    self.logger.info(f"Sigma値: {params['sigma_list']}")
+                # Sigmaモード
+                rvi_params = {
+                    'mode': 'sigma',
+                    'sigmas': params['sigma_list'],
+                    'radii': None,
+                    'weights': None,
+                    'auto_sigma': getattr(args, 'auto_sigma', False),
+                    'auto_radii': False,
+                    'agg': getattr(args, 'agg', 'mean'),
+                }
             else:
-                self.logger.info("モード: Radius（高速方式・自動決定）")
+                # Radiusモード（デフォルト）
+                rvi_params = {
+                    'mode': 'radius',
+                    'sigmas': None,
+                    'radii': args.radii_list,
+                    'weights': args.weights_list,
+                    'auto_sigma': False,
+                    'auto_radii': args.radii_list is None,
+                    'agg': getattr(args, 'agg', 'mean'),
+                }
         
         # 処理の実行
         try:
