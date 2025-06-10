@@ -43,7 +43,7 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 10)
     # 512の倍数に丸める（COGブロックサイズとの整合性）
     # return max(2048, min(8192, (base_chunk // 512) * 512))  # この行を削除
-    return max(4096, min(8192, (base_chunk // 512) * 512))  # 最小値を4096に増加
+    return max(4096, (base_chunk // 512) * 512)  # 最大値制限を削除
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     """Colab A100 (40 GB VRAM) 用の最適化されたクラスタを構築"""
