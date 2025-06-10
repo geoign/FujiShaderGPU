@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 import cupy as cp
 import dask.array as da
 import dask
-from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, convolve
+from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation
 from tqdm.auto import tqdm
 
 class Constants:
@@ -985,126 +985,103 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
 
 def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
                           threshold_low: float = 0.1, threshold_high: float = 0.3,
-                          pixel_size: float = 1.0,
-                          grad_low: float = None,
-                          grad_high: float = None) -> cp.ndarray:
-    """NPRスタイルの輪郭線抽出（改善版）"""
+                          pixel_size: float = 1.0) -> cp.ndarray:
+    """NPRスタイルの輪郭線抽出（改良版v2）"""
     nan_mask = cp.isnan(block)
     resolution_class = classify_resolution(pixel_size)
     
-    # 解像度に応じたスムージングの自動調整（改善版）
-    if resolution_class == 'ultra_high':
+    # 解像度に応じたスムージング
+    if resolution_class in ['ultra_high', 'very_high']:
         adaptive_sigma = 0.5
-    elif resolution_class == 'very_high':
-        adaptive_sigma = 0.8
-    elif resolution_class == 'high':
+    elif resolution_class in ['high', 'medium']:
         adaptive_sigma = 1.0
-    elif resolution_class == 'medium':
-        adaptive_sigma = 1.5
-    elif resolution_class == 'low':
-        # 10m解像度はここに該当 - より強いスムージング
-        adaptive_sigma = 2.0
-    elif resolution_class == 'very_low':
-        adaptive_sigma = 2.5
-    else:  # ultra_low
-        adaptive_sigma = 3.0
+    elif resolution_class == 'low':  # 10m
+        adaptive_sigma = 0.5  # スムージングを弱める
+    else:  # very_low, ultra_low
+        adaptive_sigma = 0.3
     
     # edge_sigmaが明示的に指定されている場合はそれを使用
     if edge_sigma != 1.0:
         adaptive_sigma = edge_sigma
     
-    # ノイズ除去
+    # ノイズ除去（最小限に）
     if nan_mask.any():
         filled = cp.where(nan_mask, cp.nanmean(block), block)
-        smoothed = gaussian_filter(filled, sigma=adaptive_sigma, mode='nearest')
+        if adaptive_sigma > 0.1:
+            smoothed = gaussian_filter(filled, sigma=adaptive_sigma, mode='nearest')
+        else:
+            smoothed = filled
     else:
-        smoothed = gaussian_filter(block, sigma=adaptive_sigma, mode='nearest')
+        if adaptive_sigma > 0.1:
+            smoothed = gaussian_filter(block, sigma=adaptive_sigma, mode='nearest')
+        else:
+            smoothed = block
     
-    # 勾配計算
-    dy, dx = cp.gradient(smoothed, pixel_size)
+    # 方法1: Sobelフィルタを使用した勾配計算（pixel_sizeに依存しない）
+    # Sobelカーネル
+    sobel_x = cp.array([[-1, 0, 1],
+                        [-2, 0, 2],
+                        [-1, 0, 1]], dtype=cp.float32) / 8.0
+    sobel_y = cp.array([[-1, -2, -1],
+                        [ 0,  0,  0],
+                        [ 1,  2,  1]], dtype=cp.float32) / 8.0
+    
+    # 畳み込みによる勾配計算
+    dx = convolve(smoothed, sobel_x, mode='nearest')
+    dy = convolve(smoothed, sobel_y, mode='nearest')
+    
+    # 勾配の大きさ（標高差として扱う）
     gradient_mag = cp.sqrt(dx**2 + dy**2)
     
-    # 解像度に応じた勾配スケーリング（改善版）
-    gradient_scale = get_gradient_scale_factor(pixel_size, 'npr_edges')
-    gradient_mag = gradient_mag * gradient_scale
+    # 方法2: 解像度適応型の勾配強調
+    if resolution_class in ['low', 'very_low', 'ultra_low']:
+        # 低解像度では局所的な標高差を直接計算
+        # 3x3近傍での最大標高差を計算
+        local_max = maximum_filter(smoothed, size=3, mode='nearest')
+        local_min = minimum_filter(smoothed, size=3, mode='nearest')
+        local_range = local_max - local_min
+        
+        # 勾配と局所範囲の組み合わせ
+        gradient_mag = cp.maximum(gradient_mag, local_range * 0.3)
     
     gradient_dir = cp.arctan2(dy, dx)
     
-    # 解像度に応じた閾値調整（改善版）
-    if resolution_class in ['low', 'very_low', 'ultra_low']:
-        # 低解像度では閾値を大幅に下げる
-        threshold_multiplier = 0.1
-    elif resolution_class == 'medium':
-        threshold_multiplier = 0.3
-    elif resolution_class == 'high':
-        threshold_multiplier = 0.5
-    else:  # ultra_high, very_high
-        threshold_multiplier = 1.0
-    
-    actual_threshold_low = threshold_low * threshold_multiplier
-    actual_threshold_high = threshold_high * threshold_multiplier
-    
-    if grad_low is not None and grad_high is not None:
-        # グローバル統計量を使用（改善版）
-        # 低解像度では統計量の範囲を広げる
+    # 適応的な閾値設定
+    valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag.ravel()
+    if len(valid_grad) > 0:
+        # 統計量に基づく閾値
+        grad_std = cp.std(valid_grad)
+        grad_mean = cp.mean(valid_grad)
+        
+        # 解像度に応じた閾値戦略
         if resolution_class in ['low', 'very_low', 'ultra_low']:
-            range_expansion = 2.0
+            # 低解像度：平均値を基準に
+            base_threshold = grad_mean
+            threshold_range = grad_std * 1.5
         else:
-            range_expansion = 1.0
-            
-        grad_range = (grad_high - grad_low) * range_expansion
-        actual_threshold_low = grad_low + grad_range * actual_threshold_low
-        actual_threshold_high = grad_low + grad_range * actual_threshold_high
+            # 高解像度：パーセンタイルベース
+            base_threshold = cp.percentile(valid_grad, 50)
+            threshold_range = cp.percentile(valid_grad, 90) - base_threshold
+        
+        # ユーザー指定の閾値で調整
+        actual_threshold_low = base_threshold + threshold_range * threshold_low * 0.5
+        actual_threshold_high = base_threshold + threshold_range * threshold_high
+        
+        # 最小閾値を保証（完全に白い画像を防ぐ）
+        min_threshold = grad_mean * 0.1
+        actual_threshold_low = cp.maximum(actual_threshold_low, min_threshold)
+        actual_threshold_high = cp.maximum(actual_threshold_high, min_threshold * 2)
     else:
-        # ローカル統計量を使用
-        valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag
-        if len(valid_grad) > 0:
-            # 解像度に応じてパーセンタイルを調整
-            if resolution_class in ['low', 'very_low', 'ultra_low']:
-                low_percentile = 50   # より多くのエッジを検出
-                high_percentile = 80
-            else:
-                low_percentile = 70
-                high_percentile = 90
-                
-            local_grad_low = cp.percentile(valid_grad, low_percentile)
-            local_grad_high = cp.percentile(valid_grad, high_percentile)
-            
-            actual_threshold_low = local_grad_low + (local_grad_high - local_grad_low) * actual_threshold_low
-            actual_threshold_high = local_grad_low + (local_grad_high - local_grad_low) * actual_threshold_high
-        else:
-            actual_threshold_low = threshold_low * threshold_multiplier
-            actual_threshold_high = threshold_high * threshold_multiplier
+        actual_threshold_low = 0.1
+        actual_threshold_high = 0.3
     
-    if grad_low is not None and grad_high is not None:
-        # グローバル統計量を使用
-        actual_threshold_low = grad_low + (grad_high - grad_low) * threshold_low
-        actual_threshold_high = grad_low + (grad_high - grad_low) * threshold_high
-    else:
-        # 勾配の統計情報を使用して適応的な閾値を計算
-        valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag
-        if len(valid_grad) > 0:
-            # パーセンタイルベースの閾値設定
-            low_percentile = 70  # 上位30%
-            high_percentile = 90  # 上位10%
-            local_grad_low = cp.percentile(valid_grad, low_percentile)
-            local_grad_high = cp.percentile(valid_grad, high_percentile)
-
-            # ユーザー指定の閾値でスケーリング
-            actual_threshold_low = local_grad_low + (local_grad_high - local_grad_low) * threshold_low
-            actual_threshold_high = local_grad_low + (local_grad_high - local_grad_low) * threshold_high
-        else:
-            actual_threshold_low = threshold_low
-            actual_threshold_high = threshold_high
-
     # 非最大値抑制（簡易版）
-    # 勾配方向を8方向に量子化
     angle = gradient_dir * 180.0 / cp.pi
     angle[angle < 0] += 180
     
-    # 8方向でのシフトによる非最大値抑制
     nms = gradient_mag.copy()
     
+    # 8方向での非最大値抑制（元のコードと同じ）
     # 0度と180度方向
     shifted_pos = cp.roll(gradient_mag, 1, axis=1)
     shifted_neg = cp.roll(gradient_mag, -1, axis=1)
@@ -1129,7 +1106,7 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     mask = ((angle >= 112.5) & (angle < 157.5))
     nms = cp.where(mask & ((gradient_mag < shifted_pos) | (gradient_mag < shifted_neg)), 0, nms)
     
-    # ダブルスレッショルド（適応的閾値を使用）
+    # ダブルスレッショルド
     strong = nms > actual_threshold_high
     weak = (nms > actual_threshold_low) & (nms <= actual_threshold_high)
     
@@ -1138,9 +1115,8 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     edges[strong] = 1.0
     edges[weak] = 0.5
     
-    # ヒステリシス処理（簡易版）- 弱いエッジを強いエッジに接続
-    for _ in range(2):  # 2回繰り返して接続を強化
-        # 修正: maximum.reduceの代わりに順次maximumを使用
+    # ヒステリシス処理（接続性の改善）
+    for _ in range(3):  # 3回に増やして接続を強化
         dilated = cp.maximum(
             cp.maximum(
                 cp.roll(edges, 1, axis=0),
@@ -1152,16 +1128,28 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
             )
         )
         
+        # 対角方向も追加
+        dilated = cp.maximum(dilated, cp.roll(cp.roll(edges, 1, axis=0), 1, axis=1))
+        dilated = cp.maximum(dilated, cp.roll(cp.roll(edges, -1, axis=0), -1, axis=1))
+        
         edges = cp.where(weak & (dilated > 0.5), 1.0, edges)
     
-    # エッジ強度を調整（完全な黒線を避ける）
-    edges = edges * 0.8  # エッジの最大強度を0.8に
+    # 後処理：解像度に応じたエッジの太さ調整
+    if resolution_class in ['low', 'very_low', 'ultra_low']:
+        # 低解像度ではエッジを少し太くする
+        structure = cp.ones((3, 3))
+        edges_binary = edges > 0.5
+        edges_dilated = binary_dilation(edges_binary, structure=structure).astype(cp.float32)
+        edges = cp.where(edges_dilated, cp.maximum(edges, 0.8), edges)
+    
+    # エッジ強度を調整
+    edges = edges * 0.8
     
     # 輪郭線を反転（黒線で描画）
     result = 1.0 - edges
     
     # コントラスト調整（エッジをより見やすく）
-    result = cp.clip(result, 0.2, 1.0)  # 最小値を0.2に設定
+    result = cp.clip(result, 0.2, 1.0)
     
     # ガンマ補正
     result = cp.power(result, Constants.DEFAULT_GAMMA)
@@ -1172,48 +1160,23 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     return result.astype(cp.float32)
 
 class NPREdgesAlgorithm(DaskAlgorithm):
-    """NPR輪郭線アルゴリズム"""
+    """NPR輪郭線アルゴリズム（改良版）"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        edge_sigma = params.get('edge_sigma', None)
+        edge_sigma = params.get('edge_sigma', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
-        resolution_class = classify_resolution(pixel_size)
+        threshold_low = params.get('threshold_low', 0.1)
+        threshold_high = params.get('threshold_high', 0.3)
         
-        # edge_sigmaが指定されていない場合は自動計算
-        if edge_sigma is None:
-            if resolution_class == 'high':
-                edge_sigma = max(0.5, min(2.0, 1.0 / pixel_size))
-            elif resolution_class == 'medium':
-                edge_sigma = max(0.8, min(1.5, 2.0 / pixel_size))
-            elif resolution_class == 'low':
-                edge_sigma = max(0.3, min(1.0, 5.0 / pixel_size))
-            else:
-                edge_sigma = max(0.2, min(0.5, 10.0 / pixel_size))
+        # depthを3に増やす（Sobelフィルタと膨張処理のため）
+        depth = 3
         
-        # 解像度に応じて閾値も調整（改善版）
-        threshold_low = params.get('threshold_low', 0.2)
-        threshold_high = params.get('threshold_high', 0.5)
-        
-        if resolution_class in ['low', 'very_low']:
-            threshold_low = threshold_low * 0.3
-            threshold_high = threshold_high * 0.5
-        elif resolution_class == 'medium':
-            threshold_low = threshold_low * 0.7
-            threshold_high = threshold_high * 0.8
-        
-        # 統計量を計算
-        stats = compute_global_stats(
-            gpu_arr,
-            npr_stat_func,
-            lambda block, **kwargs: block,
-            {},
-            downsample_factor=None,
-            depth=1
-        )
+        if edge_sigma != 1.0:
+            depth = max(depth, int(edge_sigma * 4 + 2))
         
         return gpu_arr.map_overlap(
             compute_npr_edges_block,
-            depth=int(edge_sigma * 4 + 2),
+            depth=depth,
             boundary='reflect',
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
@@ -1221,15 +1184,13 @@ class NPREdgesAlgorithm(DaskAlgorithm):
             threshold_low=threshold_low,
             threshold_high=threshold_high,
             pixel_size=pixel_size,
-            grad_low=stats[0],
-            grad_high=stats[1]
         )
     
     def get_default_params(self) -> dict:
         return {
             'edge_sigma': 1.0,
-            'threshold_low': 0.2,   # 0.1から0.2に変更
-            'threshold_high': 0.5,  # 0.3から0.5に変更
+            'threshold_low': 0.1,
+            'threshold_high': 0.3,
             'pixel_size': 1.0
         }
 
