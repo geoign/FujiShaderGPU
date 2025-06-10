@@ -700,6 +700,10 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
+    # scalesを実世界距離に基づいて調整
+    if pixel_size > 5.0:  # 低解像度の場合
+        scales = [max(1, int(s * 0.5)) for s in scales]  # スケールを半分に
+
     # 基本の勾配を最初に計算（すべてのスケールで使用）
     # 修正: NaN処理を追加
     dy_orig, dx_orig, _ = handle_nan_for_gradient(block, scale=1.0, pixel_size=pixel_size)
@@ -973,6 +977,12 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         edge_sigma = params.get('edge_sigma', 1.0)
+        pixel_size = params.get('pixel_size', 1.0)
+        
+        # pixel_sizeに応じてedge_sigmaを自動調整
+        if edge_sigma == 1.0:  # デフォルト値の場合のみ自動調整
+            # 実世界で約1-2mのスムージングを目標とする
+            edge_sigma = max(0.5, min(2.0, 1.5 / pixel_size))
         
         # 統計量を計算
         stats = compute_global_stats(
