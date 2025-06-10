@@ -243,6 +243,7 @@ fujishadergpu DEM.tif AOC.tif --algo ambient_occlusion
 - Mac is not supported because there is no nVidia GPU on Mac.
 
 ## ChangeLog
+- 2025/06/10 0.2.0 I think the newly built dask-cuda pipeline is fully operational. (Hopefully)
 - 2025/06/09 0.1.4 Fixed problems. dask-based algorithms were implemented.<br>Original "tile" based algorithms were moved to backup.
 - 2025/06/08 0.1.4 Broke the repository by an accident T_T.
 - 2025/06/07 0.1.0 Initial upload. Only RVI support.
