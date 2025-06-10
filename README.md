@@ -162,36 +162,57 @@ fujishadergpu DEM.tif FEH.tif --algo frequency_enhancement
 ```bash
 fujishadergpu DEM.tif CVT.tif --algo curvature
 ```
-- Fringes of the topography.
-- 地形の輪郭。
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --curvature_type | mean | mean or gaussian or planform or profile |
+- Fringes of the topography. Check out the output image in 1:1.
+- 地形の輪郭。出力画像は等倍で確認すること。
 
 ### Visual Saliency 視覚的顕著性
 ![Sample image](images/VSL.jpg)
 ```bash
 fujishadergpu DEM.tif VSL.tif --algo visual_saliency
 ```
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --scales | 2,4,8,16 | The default values are good. |
+- A simplified implementation of the Itti-Koch model.
+- Itti-Kochモデルによる視覚的顕著性の簡略実装。
 
 ### NPR Edges (Canny) NPR輪郭検出
 ![Sample image](images/NPR.jpg)
 ```bash
 fujishadergpu DEM.tif NPR.tif --algo npr_edges
 ```
-- Fringes of the topography.
-- 地形の輪郭。
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --edge_sigma | 1.0 | Try by yourself. |
+| --threshold_high | 0.3 | Try by yourself. |
+| --threshold_low | 0.1 | Try by yourself. |
+- Fringes of the topography. Check out the output image in 1:1.
+- 地形の輪郭。出力画像は等倍で確認すること。
 
 ### Atmospheric Perspective 空気遠近法
 ![Sample image](images/APS.jpg)
 ```bash
 fujishadergpu DEM.tif APS.tif --algo atmospheric_perspective
 ```
-- Blurring the distant low-relief terrain.
-- 視覚的に遠くに位置する低地がぼやけ…るのか？
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --depth_scale | 1000 | Try by yourself. |
+| --haze_strength | 0.7 | Try by yourself. |
+- The elevation to the depth (The summit is blurred).
+- 標高を深度として表現（山頂がぼやける）
 
 ### Ambient Occlusion アンビエントオクルージョン
 ![Sample image](images/AOC.jpg)
 ```bash
 fujishadergpu DEM.tif AOC.tif --algo ambient_occlusion
 ```
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --num_samples | 16 | Reduce to speed up. |
+| --radius | 10 | Search radius in pixels. I would use 10-100. |
 - Simulation of the ambient shadows. Popular in 3D modeling.
 - 環境陰影のシミュレーション。3Dモデリングでよく使われる。
 
