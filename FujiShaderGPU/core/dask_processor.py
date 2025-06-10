@@ -885,12 +885,18 @@ def run_pipeline(
     finally:
         # より確実なクリーンアップ
         try:
-            client.close(timeout=10)
-            cluster.close(timeout=10)
-        except:
-            # 強制的にシャットダウン
-            client.shutdown()
-            
+            # clientを先に閉じて、完全に終了するまで待つ
+            client.close()
+            client.shutdown()  # 全てのワーカーとスケジューラーを確実に終了
+        except Exception as e:
+            logger.debug(f"Client shutdown warning (can be ignored): {e}")
+        
+        try:
+            # clusterの終了（既に終了している可能性があるので例外を無視）
+            cluster.close()
+        except Exception as e:
+            logger.debug(f"Cluster close warning (can be ignored): {e}")
+        
         # Daskワーカープロセスの確実な終了を待つ
         import time
-        time.sleep(2)
+        time.sleep(1)  # 2秒から1秒に短縮

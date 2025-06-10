@@ -1744,6 +1744,14 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         scales = params.get('scales', [1, 10, 50, 100])
         weights = params.get('weights', None)
         
+        downsample_factor = params.get('downsample_factor', None)
+        if downsample_factor is None:
+            # 自動決定
+            downsample_factor = determine_optimal_downsample_factor(
+                gpu_arr.shape,
+                algorithm_name='multiscale_terrain'
+            )
+            
         if weights is None:
             # デフォルト：スケールに反比例する重み
             weights = [1.0 / s for s in scales]
@@ -2050,6 +2058,9 @@ class CurvatureAlgorithm(DaskAlgorithm):
         curvature_type = params.get('curvature_type', 'mean')
         pixel_size = params.get('pixel_size', 1.0)
         
+        if pixel_size is None:
+            pixel_size = 1.0
+
         return gpu_arr.map_overlap(
             compute_curvature_block,
             depth=2,
