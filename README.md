@@ -112,22 +112,37 @@ fujishadergpu DEM.tif OPN.tif --algo openness
 ```bash
 fujishadergpu DEM.tif SPC.tif --algo specular
 ```
-- Simulation of specular surface based on the terrain roughness.<br>An original algorithm.
-- 地形の荒々しさを反映した金属光沢陰影。<br>独自アルゴリズム
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --light_azimuth | 315 | Leave it to default (None or 315). |
+| --light_altitude | 45 | Leave it to default (None or 45). |
+| --roughness_scale | 50 | Local stdev of the heights. i.e. kernel scale. <br> It is 50 by default and it is good. |
+| --shininess | 20 | It is 20 by default and is good. |
+- Simulation of specular surface based on the terrain roughness.<br>An original algorithm by myself.
+- 地形の荒々しさを反映した金属光沢陰影。<br>自身による独自アルゴリズム。
 
 ### Atmospheric Scattering 大気散乱光陰影
 ![Sample image](images/ASC.jpg)
 ```bash
 fujishadergpu DEM.tif ASC.tif --algo atmospheric_scattering
 ```
-- Simulation of the shading by atmospheric scattering.
-- 大気散乱光による陰影効果。
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --scattering_strength | 0.5 | It is 0.5 by default and is good. |
+- Simulation of the shading by atmospheric scattering (Rayleigh scattering).
+- 大気散乱光(レイリー散乱)による陰影効果。
 
 ### Multiscale Terrain マルチスケール地形
 ![Sample image](images/MST.jpg)
 ```bash
 fujishadergpu DEM.tif MST.tif --algo multiscale_terrain
 ```
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --scales | 2,8,32,128 | The default values are okay. |
+| --weights |  | Leave it None so that is automatically calculated. |
+- Multiscale Terrain
+- マルチスケール地形
 
 ### Frequency Enhancement 波長強調
 ![Sample image](images/FEH.jpg)
@@ -136,8 +151,9 @@ fujishadergpu DEM.tif FEH.tif --algo frequency_enhancement
 ```
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
-| --target_frequency | (Low frequency) 0.05 ~ 0.3 (High frequency) | Enhance large-scale terrains -> Set 0.05<br>Enhance fine-scale terrains -> Set 0.2~0.3 |
-| --bandwidth | 0.02 ~ 0.2 | Window to enhance the terrain with certain frequency. |
+| --target_frequency | 0.1 | Enhance large-scale terrains -> Set 0.05 <br>Enhance fine-scale terrains -> Set 0.2~0.3 |
+| --bandwidth | 0.05 | Window to enhance the terrain with certain frequency. <br>0.05 is a good value. |
+| --enhancement | 2.0 | Setting it to a very large number is fun. |
 - Not for noob. Set appropriate parameters to get a good result.
 - 上級者向け。適切なパラメータを指定しないとよい結果は得られない。
 
