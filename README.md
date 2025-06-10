@@ -33,7 +33,18 @@ fujishader DEM.tif RVI.tif --algo rvi
 ```
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
-| --radius | TBD | TBD    |
+| --mode | radius | Here is the example for radius mode. |
+| --radii | 4,16,64,256 | The array of radius in pixels.<br>4,16,64,256 works good for most cases.<br>You may add 1024, 4096 too. |
+| --weigts |  | Leave it None (auto) is the best. |
+| --auto_radii |  | Automatically set radii. It is the default. |
+
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --mode | sigma | Here is the example for sigma mode. |
+| --sigmas | 5,20,50,200 | The array of sigma in pixels.<br>Setting >200 will slow down the process. |
+| --weigts |  | Leave it None (auto) is the best. |
+| --auto_sigma |  | Automatically set sigma. I do not recommend it. |
+
 - Highlights the ridges and shadows the valley.<br>Note that it is different implementation from the original for speed and effeciency.
 - 尾根を白くし谷を暗くする。<br>オリジナルとは異なる簡易的高速実装。
 
