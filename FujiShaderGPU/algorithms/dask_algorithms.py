@@ -79,10 +79,6 @@ def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0,
     else:
         filled = block
     
-    # pixel_sizeがNoneの場合のチェックを追加
-    if pixel_size is None:
-        pixel_size = 1.0
-    
     dy, dx = cp.gradient(filled * scale, pixel_size, edge_order=2)
     return dy, dx, nan_mask
     
@@ -1201,7 +1197,7 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         radius = params.get('radius', 10.0)
         intensity = params.get('intensity', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
-        
+
         # 修正: radiusをピクセル単位として扱うので、pixel_sizeで除算しない
         # ユーザーが指定するradiusは既にピクセル単位
         return gpu_arr.map_overlap(
@@ -1373,10 +1369,6 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     """開度の計算（最適化版）"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
-
-    # pixel_sizeがNoneの場合のチェックを追加
-    if pixel_size is None:
-        pixel_size = 1.0
     
     # 方向ベクトルの事前計算
     angles = cp.linspace(0, 2 * cp.pi, num_directions, endpoint=False)
@@ -1765,7 +1757,6 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         common_depth = min(int(4 * max_scale), Constants.MAX_DEPTH)
         
         # 縮小版で統計量を計算
-        downsample_factor = params.get('downsample_factor', None)
         downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
         
         # 縮小版でマルチスケール処理
@@ -2057,9 +2048,6 @@ class CurvatureAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         curvature_type = params.get('curvature_type', 'mean')
         pixel_size = params.get('pixel_size', 1.0)
-        
-        if pixel_size is None:
-            pixel_size = 1.0
 
         return gpu_arr.map_overlap(
             compute_curvature_block,

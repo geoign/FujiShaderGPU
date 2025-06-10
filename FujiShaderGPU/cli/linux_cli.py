@@ -3,7 +3,8 @@ FujiShaderGPU/cli/linux_cli.py
 Linux環境用CLI - Dask-CUDA処理の実装
 """
 from typing import List, Optional
-import argparse
+import argparse, rasterio
+import numpy as np
 from .base import BaseCLI
 
 class LinuxCLI(BaseCLI):
@@ -453,6 +454,55 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # パラメータの準備
         params = self.get_common_params(args)
         
+        # pixel_sizeの自動取得（指定されていない場合）
+        if not hasattr(args, 'pixel_size') or args.pixel_size is None:
+            with rasterio.open(params['input_path']) as src:
+                # CRSをチェック
+                if src.crs and src.crs.is_geographic:
+                    # 地理座標系（緯度経度）の場合
+                    # データの中心緯度を取得
+                    bounds = src.bounds
+                    center_lat = (bounds.bottom + bounds.top) / 2
+                    
+                    # 緯度1度あたりの距離（メートル）
+                    # 地球の半径を使用した近似計算
+                    lat_rad = np.radians(center_lat)
+                    meters_per_degree_lat = 111132.92 - 559.82 * np.cos(2 * lat_rad) + \
+                                        1.175 * np.cos(4 * lat_rad) - 0.0023 * np.cos(6 * lat_rad)
+                    meters_per_degree_lon = 111412.84 * np.cos(lat_rad) - \
+                                        93.5 * np.cos(3 * lat_rad) + 0.118 * np.cos(5 * lat_rad)
+                    
+                    # ピクセルサイズを度からメートルに変換
+                    pixel_size_x_deg = abs(src.transform[0])
+                    pixel_size_y_deg = abs(src.transform[4])
+                    
+                    pixel_size_x_m = pixel_size_x_deg * meters_per_degree_lon
+                    pixel_size_y_m = pixel_size_y_deg * meters_per_degree_lat
+                    
+                    # 平均値を使用（通常はほぼ同じ値）
+                    args.pixel_size = (pixel_size_x_m + pixel_size_y_m) / 2
+                    
+                    self.logger.info(f"地理座標系を検出: 中心緯度 {center_lat:.2f}°")
+                    self.logger.info(f"ピクセルサイズ: {pixel_size_x_deg:.6f}° x {pixel_size_y_deg:.6f}°")
+                    self.logger.info(f"メートル換算: {args.pixel_size:.2f}m")
+                    
+                else:
+                    # 投影座標系の場合（すでにメートル単位など）
+                    pixel_size_x = abs(src.transform[0])
+                    pixel_size_y = abs(src.transform[4])
+                    
+                    # 単位を確認（CRSがある場合）
+                    if src.crs:
+                        units = src.crs.linear_units
+                        if units and units.lower() != 'metre' and units.lower() != 'meter':
+                            self.logger.warning(f"座標系の単位が'{units}'です。メートル単位として扱います。")
+                    
+                    args.pixel_size = pixel_size_x
+                    self.logger.info(f"投影座標系: ピクセルサイズ {args.pixel_size:.2f}m")
+        else:
+            # ユーザーが明示的に指定した場合
+            self.logger.info(f"ユーザー指定のピクセルサイズ: {args.pixel_size}m")
+
         # ログ出力
         self.logger.info(f"=== Dask-CUDA地形解析 ===")
         self.logger.info(f"入力: {args.input}")
