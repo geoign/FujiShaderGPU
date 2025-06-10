@@ -667,15 +667,6 @@ def run_pipeline(
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
         
-        # 地理座標系の大きなデータの場合はチャンクサイズを大幅に調整
-        if dem.shape[0] > 30000 or dem.shape[1] > 30000:
-            logger.info("Very large geographic dataset detected, using minimal chunk size")
-            # chunk = 512  # より小さなチャンクサイズ  # この行を削除
-            chunk = 2048  # より大きなチャンクサイズに変更
-            # データを再チャンク
-            dem = dem.chunk({"y": chunk, "x": chunk})
-            logger.info(f"Rechunked to {chunk}x{chunk}")
-        
         # 6‑2) CuPy 配列へ変換（改善：メタデータ指定）
         gpu_arr: da.Array = dem.data.map_blocks(
             cp.asarray, 
@@ -900,4 +891,4 @@ def run_pipeline(
         # Daskワーカープロセスの確実な終了を待つ
         import time
         time.sleep(2)
-        
+
