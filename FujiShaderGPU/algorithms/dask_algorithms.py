@@ -78,6 +78,11 @@ def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0,
         filled = cp.where(nan_mask, cp.nanmean(block), block)
     else:
         filled = block
+    
+    # pixel_sizeがNoneの場合のチェックを追加
+    if pixel_size is None:
+        pixel_size = 1.0
+    
     dy, dx = cp.gradient(filled * scale, pixel_size, edge_order=2)
     return dy, dx, nan_mask
     

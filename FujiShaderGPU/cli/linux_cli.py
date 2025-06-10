@@ -66,6 +66,13 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         )
 
         parser.add_argument(
+            "--pixel_size",
+            type=float,
+            default=1.0,
+            help="ピクセルサイズ（メートル単位, default: 1.0）"
+        )
+
+        parser.add_argument(
             "--verbose",
             action="store_true",
             help="詳細なログ出力を有効化"
