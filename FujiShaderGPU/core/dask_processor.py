@@ -899,4 +899,5 @@ def run_pipeline(
         
         # Daskワーカープロセスの確実な終了を待つ
         import time
-        time.sleep(1)  # 2秒から1秒に短縮
+        time.sleep(2)
+        

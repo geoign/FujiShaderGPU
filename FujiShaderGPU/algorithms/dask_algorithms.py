@@ -1544,7 +1544,7 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
     
     # ラフネスの計算（局所的な標高の分散）
-    kernel_size = int(roughness_scale)
+    kernel_size = max(3, int(roughness_scale))
     
     # NaN対応のラフネス計算
     if nan_mask.any():
@@ -1640,8 +1640,8 @@ class SpecularAlgorithm(DaskAlgorithm):
     
     def get_default_params(self) -> dict:
         return {
-            'roughness_scale': 20.0,  # 50.0から20.0に変更
-            'shininess': 10.0,        # 20.0から10.0に変更
+            'roughness_scale': 20.0,
+            'shininess': 10.0,
             'light_azimuth': Constants.DEFAULT_AZIMUTH,
             'light_altitude': Constants.DEFAULT_ALTITUDE,
             'pixel_size': 1.0
@@ -1783,12 +1783,10 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             scale_small = max(1, scale // downsample_factor)
             
             def compute_detail_small(block, *, scale):
-                if scale > 1:
-                    smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
-                    detail = block - smoothed
-                    detail = restore_nan(detail, nan_mask)
-                else:
-                    detail = block
+                # scale=1でも最小限のスムージングを適用
+                smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=max(scale, 0.5), mode='nearest')
+                detail = block - smoothed
+                detail = restore_nan(detail, nan_mask)
                 return detail
             
             detail_small = downsampled.map_overlap(
@@ -1824,12 +1822,10 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         results = []
         for scale in scales:
             def compute_detail_with_smooth(block, *, scale):
-                if scale > 1:
-                    smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=scale, mode='nearest')
-                    detail = block - smoothed
-                    detail = restore_nan(detail, nan_mask)
-                else:
-                    detail = block
+                # scale=1でも最小限のスムージングを適用
+                smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=max(scale, 0.5), mode='nearest')
+                detail = block - smoothed
+                detail = restore_nan(detail, nan_mask)
                 return detail
             
             detail = gpu_arr.map_overlap(
