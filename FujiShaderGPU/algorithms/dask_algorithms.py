@@ -18,6 +18,20 @@ class Constants:
     MAX_DEPTH = 200
     NAN_FILL_VALUE_POSITIVE = -1e6
     NAN_FILL_VALUE_NEGATIVE = 1e6
+
+def classify_resolution(pixel_size: float) -> str:
+    """
+    解像度を分類
+    Returns: 'high', 'medium', 'low', 'very_low'
+    """
+    if pixel_size <= 1.0:
+        return 'high'
+    elif pixel_size <= 5.0:
+        return 'medium'
+    elif pixel_size <= 30.0:
+        return 'low'
+    else:
+        return 'very_low'
     
 ###############################################################################
 # アルゴリズム基底クラスと共通インターフェース
@@ -339,11 +353,19 @@ def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
 
 # Visual Saliency用
 def visual_saliency_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """Visual Saliency用の統計量計算"""
+    """Visual Saliency用の統計量計算（解像度適応型）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        return (float(cp.percentile(valid_data, 5)), 
-                float(cp.percentile(valid_data, 95)))
+        # 統計量をより適切に計算
+        low_p = float(cp.percentile(valid_data, 10))
+        high_p = float(cp.percentile(valid_data, 90))
+        
+        # 範囲が狭すぎる場合は拡張
+        if (high_p - low_p) < cp.std(valid_data) * 0.5:
+            low_p = float(cp.percentile(valid_data, 5))
+            high_p = float(cp.percentile(valid_data, 95))
+            
+        return (low_p, high_p)
     return (0.0, 1.0)
 
 ###############################################################################
@@ -718,15 +740,15 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     
     # 解像度に基づいてスケールを完全に再計算
     if scales == [2, 4, 8, 16]:  # デフォルト値の場合のみ
-        if pixel_size <= 1.0:
-            # 高解像度：デフォルトのまま
-            pass
-        elif pixel_size <= 5.0:
-            # 中解像度
+        resolution_class = classify_resolution(pixel_size)
+        if resolution_class == 'high':
+            scales = [2, 4, 8, 16]
+        elif resolution_class == 'medium':
             scales = [1, 2, 4, 8]
-        else:
-            # 低解像度（10m以上）
-            scales = [1, 1.5, 2, 3]
+        elif resolution_class == 'low':
+            scales = [0.5, 1, 2, 3]
+        else:  # very_low
+            scales = [0.3, 0.5, 1, 1.5]
     
     # 基本の勾配を最初に計算
     dy_orig, dx_orig, _ = handle_nan_for_gradient(block, scale=1.0, pixel_size=pixel_size)
@@ -770,11 +792,17 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         else:
             gradient_mag = gradient_mag_base
         
-        # 低解像度では勾配の重みを増やす
-        if pixel_size > 5.0:
-            feature = contrast * 0.3 + gradient_mag * 0.7
-        else:
+        
+        # 解像度に応じた特徴の組み合わせ（改善版）
+        resolution_class = classify_resolution(pixel_size)
+        if resolution_class == 'high':
             feature = contrast * 0.5 + gradient_mag * 0.5
+        elif resolution_class == 'medium':
+            feature = contrast * 0.4 + gradient_mag * 0.6
+        elif resolution_class == 'low':
+            feature = contrast * 0.3 + gradient_mag * 0.7
+        else:  # very_low
+            feature = contrast * 0.2 + gradient_mag * 0.8
             
         feature = cp.where(cp.isnan(feature), 0, feature)
         saliency_maps.append(feature)
@@ -891,12 +919,18 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
                           grad_low: float = None,
                           grad_high: float = None) -> cp.ndarray:
     """NPRスタイルの輪郭線抽出（Cannyエッジ検出の変形）"""
-    # NaNマスクを保存
     nan_mask = cp.isnan(block)
+    resolution_class = classify_resolution(pixel_size)
     
-    # 解像度に応じたスムージングの自動調整
-    # 実世界で0.5〜1mのスムージングを目標
-    adaptive_sigma = max(0.3, min(2.0, 0.75 / pixel_size))
+    # 解像度に応じたスムージングの自動調整（改善版）
+    if resolution_class == 'high':
+        adaptive_sigma = max(0.5, min(2.0, 1.0 / pixel_size))
+    elif resolution_class == 'medium':
+        adaptive_sigma = max(0.8, min(1.5, 2.0 / pixel_size))
+    elif resolution_class == 'low':
+        adaptive_sigma = max(0.3, min(1.0, 5.0 / pixel_size))
+    else:  # very_low
+        adaptive_sigma = max(0.2, min(0.5, 10.0 / pixel_size))
     
     # ノイズ除去（NaN考慮）
     if nan_mask.any():
@@ -905,16 +939,21 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     else:
         smoothed = gaussian_filter(block, sigma=adaptive_sigma, mode='nearest')
     
-    # Sobelフィルタによる勾配計算
-    # 解像度に応じて勾配を正規化
+    # 勾配計算部分を修正
     dy, dx = cp.gradient(smoothed, pixel_size)
     gradient_mag = cp.sqrt(dx**2 + dy**2)
     
-    # 低解像度では勾配が小さくなるため、スケーリング
-    if pixel_size > 2.0:
-        gradient_scale = pixel_size / 2.0
-        gradient_mag = gradient_mag * gradient_scale
-    
+    # 解像度に応じた勾配スケーリング（改善版）
+    if resolution_class == 'medium':
+        gradient_scale = pixel_size / 1.0
+        gradient_mag = gradient_mag * gradient_scale * 1.5
+    elif resolution_class == 'low':
+        gradient_scale = cp.sqrt(pixel_size / 1.0)
+        gradient_mag = gradient_mag * gradient_scale * 2.0
+    elif resolution_class == 'very_low':
+        gradient_scale = cp.sqrt(pixel_size / 1.0)
+        gradient_mag = gradient_mag * gradient_scale * 3.0
+
     gradient_dir = cp.arctan2(dy, dx)
     
     if grad_low is not None and grad_high is not None:
@@ -1016,21 +1055,31 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     """NPR輪郭線アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        edge_sigma = params.get('edge_sigma', None)  # Noneをデフォルトに
+        edge_sigma = params.get('edge_sigma', None)
         pixel_size = params.get('pixel_size', 1.0)
+        resolution_class = classify_resolution(pixel_size)
         
         # edge_sigmaが指定されていない場合は自動計算
         if edge_sigma is None:
-            edge_sigma = max(0.3, min(2.0, 0.75 / pixel_size))
+            if resolution_class == 'high':
+                edge_sigma = max(0.5, min(2.0, 1.0 / pixel_size))
+            elif resolution_class == 'medium':
+                edge_sigma = max(0.8, min(1.5, 2.0 / pixel_size))
+            elif resolution_class == 'low':
+                edge_sigma = max(0.3, min(1.0, 5.0 / pixel_size))
+            else:
+                edge_sigma = max(0.2, min(0.5, 10.0 / pixel_size))
         
-        # 解像度に応じて閾値も調整
+        # 解像度に応じて閾値も調整（改善版）
         threshold_low = params.get('threshold_low', 0.2)
         threshold_high = params.get('threshold_high', 0.5)
         
-        if pixel_size > 5.0:  # 低解像度の場合
-            # 閾値を下げてより多くのエッジを検出
-            threshold_low = threshold_low * 0.5
-            threshold_high = threshold_high * 0.7
+        if resolution_class in ['low', 'very_low']:
+            threshold_low = threshold_low * 0.3
+            threshold_high = threshold_high * 0.5
+        elif resolution_class == 'medium':
+            threshold_low = threshold_low * 0.7
+            threshold_high = threshold_high * 0.8
         
         # 統計量を計算
         stats = compute_global_stats(
