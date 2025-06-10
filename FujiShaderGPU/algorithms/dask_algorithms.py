@@ -288,11 +288,11 @@ def compute_global_stats(gpu_arr: da.Array,
     # 統計量を計算
     stats = stat_func(result_small)
     
-    # result_smallはCuPy配列なので、メモリを明示的に解放
-    del result_small
-    
     # CuPyのメモリプールをクリア
+    result_small = None  # 参照を切る
     cp.get_default_memory_pool().free_all_blocks()
+    cp.get_default_pinned_memory_pool().free_all_blocks()
+    cp.cuda.Stream.null.synchronize()  # GPU処理の完了を待つ
     
     # Pythonのガベージコレクションも実行
     import gc

@@ -75,10 +75,6 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             # Colab環境用の追加設定
             death_timeout="60s" if is_colab else "30s",
             interface="lo" if is_colab else None,
-            # メモリ管理の追加設定
-            memory_target_fraction=0.75,
-            memory_spill_fraction=0.85,
-            memory_pause_fraction=0.90,
         )
         client = Client(cluster)
         logger.info(f"Dask dashboard: {client.dashboard_link}")
@@ -792,6 +788,7 @@ def run_pipeline(
         # 進捗表示付きで計算を実行
         if show_progress:
             logger.info("Processing data chunks...")
+            
             # 分散環境用の進捗表示
             from dask.distributed import as_completed, progress
             
