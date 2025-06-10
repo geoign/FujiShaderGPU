@@ -53,6 +53,7 @@ fujishadergpu DEM.tif RVI.tif --algo rvi
 ```bash
 fujishadergpu DEM.tif HLS.tif --algo hillshade
 ```
+| Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
 | --azimuth | 315 | Leave it default (None or 315). |
 | --altitude | 45 | Leave it default (None or 45). |
@@ -67,6 +68,7 @@ fujishadergpu DEM.tif HLS.tif --algo hillshade
 ```bash
 fujishadergpu DEM.tif SLP.tif --algo slope
 ```
+| Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
 | --unit | degree | The unit of the output slope map. <br>degree or percent or radians |
 - Slope angles. Needless to say.
@@ -77,6 +79,7 @@ fujishadergpu DEM.tif SLP.tif --algo slope
 ```bash
 fujishadergpu DEM.tif TPI.tif --algo tpi
 ```
+| Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
 | --radius | 10 | Radius in pixels. I would use 10-100. |
 - Relative height against the surrounding pixels.
@@ -89,7 +92,7 @@ fujishadergpu DEM.tif LRM.tif --algo lrm
 ```
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
-| --kernel_size | 50 | Remove fine terrain: 5-15<br>Remove medium-sized terrain: 20-50<br>Remove large-scaled terrain: 50~100 |
+| --kernel_size | 50 | Remove fine terrain: 5-15<br>Remove medium-sized terrain: 20-50<br>Remove large-scaled terrain: 50-100 |
 - Not for noob. Set appropriate parameters to get a good result.
 - 上級者向け。適切なパラメータを指定しないとよい結果は得られない。
 
@@ -98,6 +101,11 @@ fujishadergpu DEM.tif LRM.tif --algo lrm
 ```bash
 fujishadergpu DEM.tif OPN.tif --algo openness
 ```
+| Optional Parameters | Example | Description |
+| :-------- | :------- | :-------- |
+| --openness_type | positive | positive or negative |
+| --num_directions | 16 | Reduce to spped up. |
+| --max_distance | 50 | Max search distance in pixels. |
 
 ### Specular/Metallic shade 金属光沢
 ![Sample image](images/SPC.jpg)
