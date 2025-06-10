@@ -29,7 +29,7 @@ Colab Notebook Last Updated on: 2025/06/09.
 ### Ridge Valley Index (RVI) 尾根谷度
 ![Sample image](images/RVI.jpg)
 ```bash
-fujishader DEM.tif RVI.tif --algo rvi
+fujishadergpu DEM.tif RVI.tif --algo rvi
 ```
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
@@ -41,7 +41,7 @@ fujishader DEM.tif RVI.tif --algo rvi
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
 | --mode | sigma | Here is the example for sigma mode. |
-| --sigmas | 5,20,50,200 | The array of sigma in pixels.<br>Setting >200 will slow down the process. |
+| --sigmas | 4,16,64,256 | The array of sigma in pixels.<br>Setting to a large number will slow down the process. |
 | --weigts |  | Leave it None (auto) is the best. |
 | --auto_sigma |  | Automatically set sigma. I do not recommend it. |
 
@@ -51,31 +51,41 @@ fujishader DEM.tif RVI.tif --algo rvi
 ### Hillshade 疑似陰影
 ![Sample image](images/HLS.jpg)
 ```bash
-fujishader DEM.tif HLS.tif --algo hillshade
+fujishadergpu DEM.tif HLS.tif --algo hillshade
 ```
-- Needless to say.
-- 説明不要。
+| :-------- | :------- | :-------- |
+| --azimuth | 315 | Leave it default (None or 315). |
+| --altitude | 45 | Leave it default (None or 45). |
+| --z_factor | 1.0 | Set around 0.005 if you want to shade LatLon Grid. |
+| --multiscale | False | False by default. Set --sigmas if True. |
+| --sigmas | 4,16,64,256 | Only work when --multiscale is True. |
+- The hillshade effect. Needless to say.
+- オーソドックスな陰影効果。説明不要。
 
 ### Slope 傾斜量
 ![Sample image](images/SLP.jpg)
 ```bash
-fujishader DEM.tif SLP.tif --algo slope
+fujishadergpu DEM.tif SLP.tif --algo slope
 ```
-- Needless to say.
-- 説明不要。
+| :-------- | :------- | :-------- |
+| --unit | degree | The unit of the output slope map. <br>degree or percent or radians |
+- Slope angles. Needless to say.
+- オーソドックスな傾斜量図。説明不要。
 
 ### Topographic Position Index (TPI)
 ![Sample image](images/TPI.jpg)
 ```bash
-fujishader DEM.tif TPI.tif --algo tpi
+fujishadergpu DEM.tif TPI.tif --algo tpi
 ```
+| :-------- | :------- | :-------- |
+| --radius | 10 | Radius in pixels. I would use 10-100. |
 - Relative height against the surrounding pixels.
-- 相対標高。
+- 周辺ピクセルに対する相対標高。
 
 ### Local Relief Model (LRM)
 ![Sample image](images/LRM.jpg)
 ```bash
-fujishader DEM.tif LRM.tif --algo lrm
+fujishadergpu DEM.tif LRM.tif --algo lrm
 ```
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
@@ -86,13 +96,13 @@ fujishader DEM.tif LRM.tif --algo lrm
 ### Openness 地形開度
 ![Sample image](images/OPN.jpg)
 ```bash
-fujishader DEM.tif OPN.tif --algo openness
+fujishadergpu DEM.tif OPN.tif --algo openness
 ```
 
 ### Specular/Metallic shade 金属光沢
 ![Sample image](images/SPC.jpg)
 ```bash
-fujishader DEM.tif SPC.tif --algo specular
+fujishadergpu DEM.tif SPC.tif --algo specular
 ```
 - Simulation of specular surface based on the terrain roughness.<br>An original algorithm.
 - 地形の荒々しさを反映した金属光沢陰影。<br>独自アルゴリズム
@@ -100,7 +110,7 @@ fujishader DEM.tif SPC.tif --algo specular
 ### Atmospheric Scattering 大気散乱光陰影
 ![Sample image](images/ASC.jpg)
 ```bash
-fujishader DEM.tif ASC.tif --algo atmospheric_scattering
+fujishadergpu DEM.tif ASC.tif --algo atmospheric_scattering
 ```
 - Simulation of the shading by atmospheric scattering.
 - 大気散乱光による陰影効果。
@@ -108,13 +118,13 @@ fujishader DEM.tif ASC.tif --algo atmospheric_scattering
 ### Multiscale Terrain マルチスケール地形
 ![Sample image](images/MST.jpg)
 ```bash
-fujishader DEM.tif MST.tif --algo multiscale_terrain
+fujishadergpu DEM.tif MST.tif --algo multiscale_terrain
 ```
 
 ### Frequency Enhancement 波長強調
 ![Sample image](images/FEH.jpg)
 ```bash
-fujishader DEM.tif FEH.tif --algo frequency_enhancement
+fujishadergpu DEM.tif FEH.tif --algo frequency_enhancement
 ```
 | Optional Parameters | Example | Description |
 | :-------- | :------- | :-------- |
@@ -126,7 +136,7 @@ fujishader DEM.tif FEH.tif --algo frequency_enhancement
 ### Curvature 地形曲率
 ![Sample image](images/CVT.jpg)
 ```bash
-fujishader DEM.tif CVT.tif --algo curvature
+fujishadergpu DEM.tif CVT.tif --algo curvature
 ```
 - Fringes of the topography.
 - 地形の輪郭。
@@ -134,13 +144,13 @@ fujishader DEM.tif CVT.tif --algo curvature
 ### Visual Saliency 視覚的顕著性
 ![Sample image](images/VSL.jpg)
 ```bash
-fujishader DEM.tif VSL.tif --algo visual_saliency
+fujishadergpu DEM.tif VSL.tif --algo visual_saliency
 ```
 
 ### NPR Edges (Canny) NPR輪郭検出
 ![Sample image](images/NPR.jpg)
 ```bash
-fujishader DEM.tif NPR.tif --algo npr_edges
+fujishadergpu DEM.tif NPR.tif --algo npr_edges
 ```
 - Fringes of the topography.
 - 地形の輪郭。
@@ -148,7 +158,7 @@ fujishader DEM.tif NPR.tif --algo npr_edges
 ### Atmospheric Perspective 空気遠近法
 ![Sample image](images/APS.jpg)
 ```bash
-fujishader DEM.tif APS.tif --algo atmospheric_perspective
+fujishadergpu DEM.tif APS.tif --algo atmospheric_perspective
 ```
 - Blurring the distant low-relief terrain.
 - 視覚的に遠くに位置する低地がぼやけ…るのか？
@@ -156,7 +166,7 @@ fujishader DEM.tif APS.tif --algo atmospheric_perspective
 ### Ambient Occlusion アンビエントオクルージョン
 ![Sample image](images/AOC.jpg)
 ```bash
-fujishader DEM.tif AOC.tif --algo ambient_occlusion
+fujishadergpu DEM.tif AOC.tif --algo ambient_occlusion
 ```
 - Simulation of the ambient shadows. Popular in 3D modeling.
 - 環境陰影のシミュレーション。3Dモデリングでよく使われる。
