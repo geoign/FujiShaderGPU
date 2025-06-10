@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Union
 from osgeo import gdal
 import cupy as cp
-import numpy as np
 import dask.array as da
 from dask_cuda import LocalCUDACluster
 from distributed import Client
@@ -46,7 +45,6 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     return max(4096, (base_chunk // 512) * 512)  # 最大値制限を削除
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
-    """Colab A100 (40 GB VRAM) 用の最適化されたクラスタを構築"""
     try:
         # Google Colab環境の検出
         import sys
@@ -77,6 +75,10 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             # Colab環境用の追加設定
             death_timeout="60s" if is_colab else "30s",
             interface="lo" if is_colab else None,
+            # メモリ管理の追加設定
+            memory_target_fraction=0.75,
+            memory_spill_fraction=0.85,
+            memory_pause_fraction=0.90,
         )
         client = Client(cluster)
         logger.info(f"Dask dashboard: {client.dashboard_link}")
@@ -467,9 +469,14 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 )
                                 chunk_files.append(chunk_file)
                                 
-                                # メモリ解放
+                                # メモリ解放（改善）
                                 del chunk_data, chunk_da
                                 chunk_idx += 1
+                                # CuPyメモリプールもクリア（追加）
+                                if i % 10 == 0:  # 10チャンクごとに
+                                    cp.get_default_memory_pool().free_all_blocks()
+                                    import gc
+                                    gc.collect()
                                 
                                 # 進捗更新
                                 pbar.update(1)
@@ -874,6 +881,12 @@ def run_pipeline(
         logger.error(f"Pipeline failed: {e}")
         raise
     finally:
+        # CuPyメモリプールの明示的なクリア（追加）
+        mempool = cp.get_default_memory_pool()
+        pinned_mempool = cp.get_default_pinned_memory_pool()
+        mempool.free_all_blocks()
+        pinned_mempool.free_all_blocks()
+
         # より確実なクリーンアップ
         try:
             # clientを先に閉じて、完全に終了するまで待つ
