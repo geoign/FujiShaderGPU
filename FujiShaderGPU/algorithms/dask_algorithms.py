@@ -19,19 +19,60 @@ class Constants:
     NAN_FILL_VALUE_POSITIVE = -1e6
     NAN_FILL_VALUE_NEGATIVE = 1e6
 
+# 1. より詳細な解像度分類関数（既存のclassify_resolutionを置き換え）
 def classify_resolution(pixel_size: float) -> str:
     """
-    解像度を分類
-    Returns: 'high', 'medium', 'low', 'very_low'
+    解像度を分類（より詳細な分類）
+    Returns: 'ultra_high', 'very_high', 'high', 'medium', 'low', 'very_low', 'ultra_low'
     """
-    if pixel_size <= 1.0:
+    if pixel_size <= 0.5:
+        return 'ultra_high'
+    elif pixel_size <= 1.0:
+        return 'very_high'
+    elif pixel_size <= 2.5:
         return 'high'
     elif pixel_size <= 5.0:
         return 'medium'
-    elif pixel_size <= 30.0:
+    elif pixel_size <= 15.0:
         return 'low'
-    else:
+    elif pixel_size <= 30.0:
         return 'very_low'
+    else:
+        return 'ultra_low'
+
+# 2. 解像度に応じた勾配スケーリング係数を計算する関数（新規追加）
+def get_gradient_scale_factor(pixel_size: float, algorithm: str = 'default') -> float:
+    """
+    解像度に応じた勾配スケーリング係数を返す
+    低解像度ほど大きな係数を返し、勾配を補正する
+    """
+    if algorithm == 'npr_edges':
+        # NPRエッジ用の係数（より積極的なスケーリング）
+        if pixel_size <= 1.0:
+            return 1.0
+        elif pixel_size <= 5.0:
+            return 1.5
+        elif pixel_size <= 10.0:
+            return 2.5
+        elif pixel_size <= 30.0:
+            return 4.0
+        else:
+            return 6.0
+    elif algorithm == 'visual_saliency':
+        # Visual Saliency用の係数（より控えめなスケーリング）
+        if pixel_size <= 1.0:
+            return 1.0
+        elif pixel_size <= 5.0:
+            return 1.2
+        elif pixel_size <= 10.0:
+            return 1.5
+        elif pixel_size <= 30.0:
+            return 2.0
+        else:
+            return 2.5
+    else:
+        # デフォルトの係数
+        return cp.sqrt(max(1.0, pixel_size))
     
 ###############################################################################
 # アルゴリズム基底クラスと共通インターフェース
@@ -734,37 +775,43 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
                                 normalize: bool = True,
                                 norm_min: float = None,
                                 norm_max: float = None) -> cp.ndarray:
-    """視覚的顕著性の計算（Itti-Kochモデルの簡略版）"""
-    # NaNマスクを保存
+    """視覚的顕著性の計算（改善版）"""
     nan_mask = cp.isnan(block)
+    resolution_class = classify_resolution(pixel_size)
     
-    # 解像度に基づいてスケールを完全に再計算
+    # 解像度に基づいてスケールを完全に再計算（改善版）
     if scales == [2, 4, 8, 16]:  # デフォルト値の場合のみ
-        resolution_class = classify_resolution(pixel_size)
-        if resolution_class == 'high':
+        if resolution_class == 'ultra_high':
             scales = [2, 4, 8, 16]
+        elif resolution_class == 'very_high':
+            scales = [2, 4, 8, 12]
+        elif resolution_class == 'high':
+            scales = [1.5, 3, 6, 10]
         elif resolution_class == 'medium':
             scales = [1, 2, 4, 8]
         elif resolution_class == 'low':
-            scales = [0.5, 1, 2, 3]
-        else:  # very_low
-            scales = [0.3, 0.5, 1, 1.5]
+            # 10m解像度はここに該当
+            scales = [0.5, 1, 2, 4]
+        elif resolution_class == 'very_low':
+            scales = [0.3, 0.6, 1.2, 2.4]
+        else:  # ultra_low
+            scales = [0.2, 0.4, 0.8, 1.6]
     
     # 基本の勾配を最初に計算
     dy_orig, dx_orig, _ = handle_nan_for_gradient(block, scale=1.0, pixel_size=pixel_size)
     gradient_mag_base = cp.sqrt(dx_orig**2 + dy_orig**2)
     
-    # 低解像度での勾配強調
-    if pixel_size > 5.0:
-        gradient_mag_base = gradient_mag_base * (pixel_size / 5.0)
+    # 解像度に応じた勾配スケーリング（改善版）
+    gradient_scale = get_gradient_scale_factor(pixel_size, 'visual_saliency')
+    gradient_mag_base = gradient_mag_base * gradient_scale
     
     gradient_mag_base = cp.where(cp.isnan(gradient_mag_base), 0, gradient_mag_base)
     
-    # 以下、マルチスケール処理は同じだが、特徴の組み合わせ方を調整
+    # マルチスケール処理
     saliency_maps = []
     
     for scale in scales:
-        # 局所的なコントラスト（Center-Surround差分）
+        # 局所的なコントラスト
         center_sigma = scale
         surround_sigma = scale * 2
         
@@ -775,8 +822,8 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
             center = gaussian_filter(block, sigma=center_sigma, mode='nearest')
             surround = gaussian_filter(block, sigma=surround_sigma, mode='nearest')
         
-        # 差分の絶対値
-        contrast = cp.abs(center - surround)
+        # 差分の絶対値（改善版：スケールで正規化）
+        contrast = cp.abs(center - surround) / (scale + 1.0)
         
         # 勾配の強度
         if scale > 1:
@@ -792,23 +839,46 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         else:
             gradient_mag = gradient_mag_base
         
-        
         # 解像度に応じた特徴の組み合わせ（改善版）
-        resolution_class = classify_resolution(pixel_size)
-        if resolution_class == 'high':
+        if resolution_class in ['ultra_high', 'very_high']:
+            feature = contrast * 0.6 + gradient_mag * 0.4
+        elif resolution_class in ['high', 'medium']:
             feature = contrast * 0.5 + gradient_mag * 0.5
-        elif resolution_class == 'medium':
-            feature = contrast * 0.4 + gradient_mag * 0.6
         elif resolution_class == 'low':
-            feature = contrast * 0.3 + gradient_mag * 0.7
-        else:  # very_low
-            feature = contrast * 0.2 + gradient_mag * 0.8
+            # 10m解像度 - コントラストの重みを増やす
+            feature = contrast * 0.7 + gradient_mag * 0.3
+        else:  # very_low, ultra_low
+            feature = contrast * 0.8 + gradient_mag * 0.2
             
         feature = cp.where(cp.isnan(feature), 0, feature)
         saliency_maps.append(feature)
     
-    # スケール間での正規化と統合
+    # スケール間での正規化と統合（改善版）
     combined_saliency = cp.zeros_like(block)
+    
+    # 各マップを正規化して統合
+    for i, smap in enumerate(saliency_maps):
+        if nan_mask.any():
+            valid_smap = smap[~nan_mask]
+        else:
+            valid_smap = smap.ravel()
+            
+        if len(valid_smap) > 0:
+            # ロバストな正規化（外れ値に強い）
+            p5 = cp.percentile(valid_smap, 5)
+            p95 = cp.percentile(valid_smap, 95)
+            if p95 > p5:
+                normalized = (smap - p5) / (p95 - p5)
+                normalized = cp.clip(normalized, 0, 1)
+                # スケールに応じた重み付け
+                scale_weight = 1.0 / (i + 1)
+                combined_saliency += normalized * scale_weight
+            else:
+                combined_saliency += 0.5
+    
+    # 重みの合計で正規化
+    weight_sum = sum(1.0 / (i + 1) for i in range(len(saliency_maps)))
+    combined_saliency /= weight_sum
     valid_count = 0
     
     for smap in saliency_maps:
@@ -918,43 +988,93 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
                           pixel_size: float = 1.0,
                           grad_low: float = None,
                           grad_high: float = None) -> cp.ndarray:
-    """NPRスタイルの輪郭線抽出（Cannyエッジ検出の変形）"""
+    """NPRスタイルの輪郭線抽出（改善版）"""
     nan_mask = cp.isnan(block)
     resolution_class = classify_resolution(pixel_size)
     
     # 解像度に応じたスムージングの自動調整（改善版）
-    if resolution_class == 'high':
-        adaptive_sigma = max(0.5, min(2.0, 1.0 / pixel_size))
+    if resolution_class == 'ultra_high':
+        adaptive_sigma = 0.5
+    elif resolution_class == 'very_high':
+        adaptive_sigma = 0.8
+    elif resolution_class == 'high':
+        adaptive_sigma = 1.0
     elif resolution_class == 'medium':
-        adaptive_sigma = max(0.8, min(1.5, 2.0 / pixel_size))
+        adaptive_sigma = 1.5
     elif resolution_class == 'low':
-        adaptive_sigma = max(0.3, min(1.0, 5.0 / pixel_size))
-    else:  # very_low
-        adaptive_sigma = max(0.2, min(0.5, 10.0 / pixel_size))
+        # 10m解像度はここに該当 - より強いスムージング
+        adaptive_sigma = 2.0
+    elif resolution_class == 'very_low':
+        adaptive_sigma = 2.5
+    else:  # ultra_low
+        adaptive_sigma = 3.0
     
-    # ノイズ除去（NaN考慮）
+    # edge_sigmaが明示的に指定されている場合はそれを使用
+    if edge_sigma != 1.0:
+        adaptive_sigma = edge_sigma
+    
+    # ノイズ除去
     if nan_mask.any():
         filled = cp.where(nan_mask, cp.nanmean(block), block)
         smoothed = gaussian_filter(filled, sigma=adaptive_sigma, mode='nearest')
     else:
         smoothed = gaussian_filter(block, sigma=adaptive_sigma, mode='nearest')
     
-    # 勾配計算部分を修正
+    # 勾配計算
     dy, dx = cp.gradient(smoothed, pixel_size)
     gradient_mag = cp.sqrt(dx**2 + dy**2)
     
     # 解像度に応じた勾配スケーリング（改善版）
-    if resolution_class == 'medium':
-        gradient_scale = pixel_size / 1.0
-        gradient_mag = gradient_mag * gradient_scale * 1.5
-    elif resolution_class == 'low':
-        gradient_scale = cp.sqrt(pixel_size / 1.0)
-        gradient_mag = gradient_mag * gradient_scale * 2.0
-    elif resolution_class == 'very_low':
-        gradient_scale = cp.sqrt(pixel_size / 1.0)
-        gradient_mag = gradient_mag * gradient_scale * 3.0
-
+    gradient_scale = get_gradient_scale_factor(pixel_size, 'npr_edges')
+    gradient_mag = gradient_mag * gradient_scale
+    
     gradient_dir = cp.arctan2(dy, dx)
+    
+    # 解像度に応じた閾値調整（改善版）
+    if resolution_class in ['low', 'very_low', 'ultra_low']:
+        # 低解像度では閾値を大幅に下げる
+        threshold_multiplier = 0.1
+    elif resolution_class == 'medium':
+        threshold_multiplier = 0.3
+    elif resolution_class == 'high':
+        threshold_multiplier = 0.5
+    else:  # ultra_high, very_high
+        threshold_multiplier = 1.0
+    
+    actual_threshold_low = threshold_low * threshold_multiplier
+    actual_threshold_high = threshold_high * threshold_multiplier
+    
+    if grad_low is not None and grad_high is not None:
+        # グローバル統計量を使用（改善版）
+        # 低解像度では統計量の範囲を広げる
+        if resolution_class in ['low', 'very_low', 'ultra_low']:
+            range_expansion = 2.0
+        else:
+            range_expansion = 1.0
+            
+        grad_range = (grad_high - grad_low) * range_expansion
+        actual_threshold_low = grad_low + grad_range * actual_threshold_low
+        actual_threshold_high = grad_low + grad_range * actual_threshold_high
+    else:
+        # ローカル統計量を使用
+        valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag
+        if len(valid_grad) > 0:
+            # 解像度に応じてパーセンタイルを調整
+            if resolution_class in ['low', 'very_low', 'ultra_low']:
+                low_percentile = 50   # より多くのエッジを検出
+                high_percentile = 80
+            else:
+                low_percentile = 70
+                high_percentile = 90
+                
+            local_grad_low = cp.percentile(valid_grad, low_percentile)
+            local_grad_high = cp.percentile(valid_grad, high_percentile)
+            
+            actual_threshold_low = local_grad_low + (local_grad_high - local_grad_low) * actual_threshold_low
+            actual_threshold_high = local_grad_low + (local_grad_high - local_grad_low) * actual_threshold_high
+        else:
+            actual_threshold_low = threshold_low * threshold_multiplier
+            actual_threshold_high = threshold_high * threshold_multiplier
     
     if grad_low is not None and grad_high is not None:
         # グローバル統計量を使用
