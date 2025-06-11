@@ -682,20 +682,9 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 algo_params['haze_strength'] = args.haze_strength
 
         # Fractal Anomaly固有
-        #elif args.algorithm == 'fractal_anomaly':
-        #    if hasattr(args, 'fractal_radii_list') and args.fractal_radii_list:
-        #        algo_params['radii'] = args.fractal_radii_list
-
         elif args.algorithm == 'fractal_anomaly':
-            self.logger.info(f"DEBUG: Entering fractal_anomaly block")
-            self.logger.info(f"DEBUG: algo_params before = {algo_params}")
             if hasattr(args, 'fractal_radii_list') and args.fractal_radii_list:
                 algo_params['radii'] = args.fractal_radii_list
-                self.logger.info(f"DEBUG: Set algo_params['radii'] = {args.fractal_radii_list}")
-                self.logger.info(f"DEBUG: algo_params after = {algo_params}")
-            else:
-                self.logger.info("DEBUG: fractal_radii_list not set")
-        self.logger.info(f"DEBUG: algo_params after all elif blocks = {algo_params}")
 
         # RVI用ログ出力
         if args.algorithm == "rvi":
@@ -749,12 +738,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             else:
                 # RVI以外のアルゴリズム
                 rvi_params = {}
-            
-            # デバッグ：run_pipeline呼び出し直前
-            self.logger.info(f"DEBUG: About to call run_pipeline")
-            self.logger.info(f"DEBUG: algorithm = {args.algorithm}")
-            self.logger.info(f"DEBUG: algo_params = {algo_params}")
-            self.logger.info(f"DEBUG: rvi_params = {rvi_params}")
 
             run_pipeline(
                 src_cog=params['input_path'],
