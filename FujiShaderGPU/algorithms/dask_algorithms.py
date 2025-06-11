@@ -889,7 +889,13 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         del contrast
         del gradient_mag
         
-        # 正規化せずに累積（グローバル統計で後で正規化するため）
+        # 各スケールの値の範囲を揃える（より控えめな正規化）
+        # コントラストは log(scale + e) で除算済みなので、追加の正規化は軽めに
+        if scale > 1:
+            scale_normalization = 1.0 + cp.log(scale) * 0.2  # より控えめな係数
+            feature = feature / scale_normalization
+        
+        # 重み付けして累積
         scale_weight = 1.0 / len(scales)
         combined_saliency += feature * scale_weight
         
@@ -2316,149 +2322,111 @@ class CurvatureAlgorithm(DaskAlgorithm):
 # 2.15. Fractal Anomaly (フラクタル異常検出) アルゴリズム
 ###############################################################################
 
-def compute_roughness_multiscale(block: cp.ndarray, radii: List[int]) -> cp.ndarray:
-    """複数スケールでの局所的な標準偏差（roughness）を計算"""
+def compute_roughness_multiscale(block: cp.ndarray, radii: List[int], window_mult: int = 3) -> cp.ndarray:
+    """参考実装に準拠した複数スケールでの局所的な標準偏差（roughness）を計算"""
     nan_mask = cp.isnan(block)
     sigmas = []
     
     for r in radii:
-        if r <= 1:
-            # 小さな半径の場合はガウシアンフィルタ
-            sigma = 1.0
-            mean_elev, _ = handle_nan_with_gaussian(block, sigma=sigma, mode='nearest')
-            # 分散計算のために二乗の平均も必要
-            block_sq = block ** 2
-            mean_sq, _ = handle_nan_with_gaussian(block_sq, sigma=sigma, mode='nearest')
-        else:
-            # 大きな半径の場合はuniform filter
-            kernel_size = 2 * r + 1
-            mean_elev, _ = handle_nan_with_uniform(block, size=kernel_size, mode='reflect')
-            # 分散計算
-            block_sq = block ** 2
-            mean_sq, _ = handle_nan_with_uniform(block_sq, size=kernel_size, mode='reflect')
+        # 参考実装と同じwindow_size計算
+        window_size = r * window_mult
         
-        # 標準偏差 = sqrt(E[X^2] - E[X]^2)
-        variance = mean_sq - mean_elev ** 2
+        # NaNを0で埋める（uniform_filterのため）
+        if nan_mask.any():
+            filled = cp.where(nan_mask, 0, block)
+            valid = (~nan_mask).astype(cp.float32)
+            
+            # 局所平均
+            sum_values = uniform_filter(filled * valid, size=window_size, mode='constant', cval=0.0)
+            sum_weights = uniform_filter(valid, size=window_size, mode='constant', cval=0.0)
+            local_mean = cp.where(sum_weights > 0, sum_values / sum_weights, 0)
+            
+            # 局所平均二乗
+            sum_sq_values = uniform_filter((filled ** 2) * valid, size=window_size, mode='constant', cval=0.0)
+            local_mean_sq = cp.where(sum_weights > 0, sum_sq_values / sum_weights, 0)
+        else:
+            # 局所平均
+            local_mean = uniform_filter(block, size=window_size, mode='constant', cval=0.0)
+            # 局所平均二乗
+            local_mean_sq = uniform_filter(block ** 2, size=window_size, mode='constant', cval=0.0)
+        
+        # 分散 = E[X²] - E[X]²
+        variance = local_mean_sq - local_mean ** 2
+        
+        # 標準偏差
         sigma = cp.sqrt(cp.maximum(variance, 0.0))
         sigmas.append(sigma)
     
     # shape (H, W, n_scales)にスタック
     return cp.stack(sigmas, axis=-1)
 
+
 def compute_fractal_dimension_block(block: cp.ndarray, *, 
                                   radii: List[int] = [2, 4, 8, 16, 32],
                                   normalize: bool = True,
-                                  p5_global: float = None,
-                                  p95_global: float = None) -> cp.ndarray:
-    """改良版：マルチスケール差分によるフラクタル異常検出"""
+                                  mean_global: float = None,
+                                  std_global: float = None) -> cp.ndarray:
+    """参考実装に準拠したフラクタル次元計算"""
     nan_mask = cp.isnan(block)
     
-    # 1. 局所的なフラクタル次元を計算（小さいスケール）
-    local_radii = radii[:3]  # 最初の3つ（小さいスケール）
-    local_sigmas = compute_roughness_multiscale(block, local_radii)
+    # 1. マルチスケールroughness計算（window_mult=3はデフォルト）
+    sigmas = compute_roughness_multiscale(block, radii, window_mult=3)
     
-    # log-log回帰（局所）
-    log_local_radii = cp.log(cp.asarray(local_radii, dtype=cp.float32))
-    log_local_sigmas = cp.log(local_sigmas + 1e-10)
+    # 2. log-log回帰（参考実装と同じ方法）
+    log_scales = cp.log(cp.asarray(radii, dtype=cp.float32))
+    n_scales = len(radii)
     
-    # 局所的なHurst指数
-    mean_log_r_local = cp.mean(log_local_radii)
-    mean_log_r2_local = cp.mean(log_local_radii ** 2)
-    mean_log_sigma_local = cp.mean(log_local_sigmas, axis=2)
-    log_radii_broadcast_local = log_local_radii.reshape(1, 1, -1)
-    mean_log_r_log_sigma_local = cp.mean(log_local_sigmas * log_radii_broadcast_local, axis=2)
+    # log(sigmas)を計算
+    log_sigmas = cp.log(sigmas + 1e-10)
     
-    denominator_local = mean_log_r2_local - mean_log_r_local ** 2
-    if cp.abs(denominator_local) > 1e-10:
-        H_local = (mean_log_r_log_sigma_local - mean_log_r_local * mean_log_sigma_local) / denominator_local
-    else:
-        H_local = cp.zeros_like(mean_log_sigma_local)
+    # 回帰係数の計算（参考実装と同じ）
+    mean_log_scale = cp.mean(log_scales)
+    mean_log_sigma = cp.mean(log_sigmas, axis=2)
     
-    D_local = 3.0 - H_local
+    # log_scalesをブロードキャスト
+    log_scales_broadcast = log_scales.reshape(1, 1, -1)
     
-    # 2. 広域的なフラクタル次元を計算（大きいスケール）
-    if len(radii) > 3:
-        global_radii = radii[2:]  # 後半の大きいスケール
-        global_sigmas = compute_roughness_multiscale(block, global_radii)
-        
-        # log-log回帰（広域）
-        log_global_radii = cp.log(cp.asarray(global_radii, dtype=cp.float32))
-        log_global_sigmas = cp.log(global_sigmas + 1e-10)
-        
-        # 広域的なHurst指数
-        mean_log_r_global = cp.mean(log_global_radii)
-        mean_log_r2_global = cp.mean(log_global_radii ** 2)
-        mean_log_sigma_global = cp.mean(log_global_sigmas, axis=2)
-        log_radii_broadcast_global = log_global_radii.reshape(1, 1, -1)
-        mean_log_r_log_sigma_global = cp.mean(log_global_sigmas * log_radii_broadcast_global, axis=2)
-        
-        denominator_global = mean_log_r2_global - mean_log_r_global ** 2
-        if cp.abs(denominator_global) > 1e-10:
-            H_global = (mean_log_r_log_sigma_global - mean_log_r_global * mean_log_sigma_global) / denominator_global
-        else:
-            H_global = cp.zeros_like(mean_log_sigma_global)
-        
-        D_global = 3.0 - H_global
-        
-        # 3. フラクタル次元の差分（異常性の指標）
-        # 局所的に複雑だが広域的に単純 → 正の値（異常に複雑な局所構造）
-        # 局所的に単純だが広域的に複雑 → 負の値（異常に平滑な局所構造）
-        anomaly = D_local - D_global
-        
-        # 4. 追加の特徴：フラクタル次元の変動性
-        # 全スケールでの標準偏差の変動係数
-        all_sigmas = compute_roughness_multiscale(block, radii)
-        mean_sigma = cp.mean(all_sigmas, axis=2)
-        std_sigma = cp.std(all_sigmas, axis=2)
-        cv_sigma = cp.where(mean_sigma > 0, std_sigma / mean_sigma, 0)
-        
-        # 変動係数が高い領域も異常として扱う
-        cv_normalized = cp.tanh(cv_sigma * 2)  # 0-1の範囲に正規化
-        
-        # 差分と変動性を組み合わせ
-        result = anomaly * 0.7 + cv_normalized * cp.sign(anomaly) * 0.3
-        
-    else:
-        # スケールが少ない場合は従来の方法
-        result = D_local - 2.5  # 2.5を基準値として使用
+    # 共分散と分散
+    cov = cp.mean(log_sigmas * log_scales_broadcast, axis=2) - mean_log_sigma * mean_log_scale
+    var_log_scale = cp.mean(log_scales ** 2) - mean_log_scale ** 2
     
-    if normalize and p5_global is not None and p95_global is not None:
-        # パーセンタイルベースの正規化
-        if p95_global > p5_global:
-            # より広い範囲で正規化（感度を上げる）
-            scale = 2.0 / (p95_global - p5_global)
-            center = (p5_global + p95_global) / 2
-            normalized = (result - center) * scale
+    # Hurst指数
+    H = cov / (var_log_scale + 1e-10)
+    
+    # フラクタル次元
+    D = 3.0 - H
+    
+    # 3. 正規化処理
+    if normalize and mean_global is not None and std_global is not None:
+        # Z-score計算
+        if std_global > 1e-6:
+            Z = (D - mean_global) / std_global
             
-            # シグモイド関数でソフトクリッピング
-            result = cp.tanh(normalized * 0.8)  # 0.8で感度調整
+            # [-3, 3]にクリップして[-1, 1]に正規化
+            Z = cp.clip(Z, -3.0, 3.0) / 3.0
             
-            # ガンマ補正（コントラスト強調）
-            sign = cp.sign(result)
-            result = sign * cp.power(cp.abs(result), 0.7)  # より強いコントラスト
+            # ガンママッピング（参考実装と同じ）
+            sign = cp.sign(Z)
+            result = sign * cp.power(cp.abs(Z), 1.0 / Constants.DEFAULT_GAMMA)
         else:
-            result = cp.zeros_like(result)
+            result = cp.zeros_like(D)
+    else:
+        result = D
     
     # NaN処理
     result = restore_nan(result, nan_mask)
     
     return result.astype(cp.float32)
 
+
 def fractal_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """改良版：フラクタル異常の統計量計算"""
+    """フラクタル次元Dの平均と標準偏差を計算"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        # より広い範囲を使用（5-95パーセンタイル）
-        p5 = float(cp.percentile(valid_data, 5))
-        p95 = float(cp.percentile(valid_data, 95))
-        
-        # デバッグ情報
-        median = float(cp.median(valid_data))
-        std = float(cp.std(valid_data))
-        print(f"  Statistics: median={median:.4f}, std={std:.4f}, p5={p5:.4f}, p95={p95:.4f}")
-        
-        return (p5, p95)
-    return (-0.1, 0.1)  # デフォルト値
+        mean_D = float(cp.mean(valid_data))
+        std_D = float(cp.std(valid_data))
+        return (mean_D, std_D)
+    return (2.5, 0.5)  # デフォルト値
 
 class FractalAnomalyAlgorithm(DaskAlgorithm):
     """フラクタル異常検出アルゴリズム
@@ -2477,15 +2445,16 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         if radii is None:
             radii = self._determine_optimal_radii(pixel_size)
         
-        # 少なくとも4つ以上のスケールを確保
-        if len(radii) < 4:
-            radii = [r for r in [1, 2, 4, 8, 16, 32, 64] if r <= max(radii) * 2][:6]
+        # 最低5つのスケールを確保（参考実装のデフォルトと同じ）
+        if len(radii) < 5:
+            radii = [2, 4, 8, 16, 32]
         
         max_radius = max(radii)
-        depth = max_radius * 2 + 1
+        # window_mult=3を考慮したdepth
+        depth = max_radius * 3 + 1
         
-        # グローバル統計量を計算
-        print("🔍 Computing global fractal anomaly statistics...")
+        # グローバル統計量を計算（平均と標準偏差）
+        print("🔍 Computing global fractal dimension statistics...")
         stats = compute_global_stats(
             gpu_arr,
             fractal_stat_func,
@@ -2496,8 +2465,8 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             algorithm_name='fractal_anomaly'
         )
         
-        p5_global, p95_global = stats
-        print(f"📊 Fractal anomaly range: [{p5_global:.4f}, {p95_global:.4f}]")
+        mean_D, std_D = stats
+        print(f"📊 Fractal dimension: μ={mean_D:.3f}, σ={std_D:.3f}")
         
         # 大規模データの場合、定期的にGCを実行
         if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
@@ -2513,8 +2482,8 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             meta=cp.empty((0, 0), dtype=cp.float32),
             radii=radii,
             normalize=True,
-            p5_global=p5_global,    # p10_global → p5_global
-            p95_global=p95_global   # p90_global → p95_global
+            mean_global=mean_D,
+            std_global=std_D
         )
     
     def _determine_optimal_radii(self, pixel_size: float) -> List[int]:
