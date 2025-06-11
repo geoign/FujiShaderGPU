@@ -834,10 +834,10 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     
     gradient_mag_base = cp.where(cp.isnan(gradient_mag_base), 0, gradient_mag_base)
     
-    # マルチスケール処理
-    saliency_maps = []
+    # マルチスケール処理（メモリ効率改善版）
+    combined_saliency = cp.zeros_like(block)
     
-    for scale in scales:
+    for i, scale in enumerate(scales):
         # 局所的なコントラスト
         center_sigma = scale
         surround_sigma = scale * 2
@@ -852,6 +852,10 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         # 差分の絶対値
         contrast = cp.abs(center - surround) / (cp.log(scale + cp.e))
         
+        # 中間変数を早期解放
+        del center
+        del surround
+        
         # 勾配の強度
         if scale > 1:
             # sigmaを対数的にスケール（線形ではなく）
@@ -865,6 +869,8 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
                 gradient_mag = cp.where(smoothed_weights > 0, smoothed_values / smoothed_weights, 0)
             else:
                 gradient_mag = gaussian_filter(gradient_mag_base, sigma=sigma_for_gradient, mode='nearest')
+        else:
+            gradient_mag = gradient_mag_base
         
         # 解像度に応じた特徴の組み合わせ（改善版）
         if resolution_class in ['ultra_high', 'very_high']:
@@ -878,63 +884,39 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
             feature = contrast * 0.8 + gradient_mag * 0.2
             
         feature = cp.where(cp.isnan(feature), 0, feature)
-        saliency_maps.append(feature)
-    
-    # スケール間での正規化と統合（改善版）
-    combined_saliency = cp.zeros_like(block)
-    
-    # 各マップを正規化して統合
-    for i, smap in enumerate(saliency_maps):
-        if nan_mask.any():
-            valid_smap = smap[~nan_mask]
-        else:
-            valid_smap = smap.ravel()
-            
-        if len(valid_smap) > 0:
-            # ロバストな正規化（外れ値に強い）
-            p5 = cp.percentile(valid_smap, 5)
-            p95 = cp.percentile(valid_smap, 95)
-            if p95 > p5:
-                normalized = (smap - p5) / (p95 - p5)
-                normalized = cp.clip(normalized, 0, 1)
-                # スケールに応じた重み付け
-                scale_weight = 1.0 / len(saliency_maps)  # 1.0 / (i + 1) から変更
-                combined_saliency += smap * scale_weight
-            else:
-                combined_saliency += 0.5
-    
-    # 重みの合計で正規化
-    weight_sum = sum(1.0 / (i + 1) for i in range(len(saliency_maps)))
-    combined_saliency /= weight_sum
-    valid_count = 0
-    
-    for smap in saliency_maps:
-        # 各マップを正規化
-        if nan_mask.any():
-            valid_smap = smap[~nan_mask]
-        else:
-            valid_smap = smap.ravel()
-            
-        if len(valid_smap) > 0:
-            min_val = cp.min(valid_smap)
-            max_val = cp.max(valid_smap)
-            if max_val > min_val:
-                normalized = (smap - min_val) / (max_val - min_val)
-                combined_saliency += normalized
-                valid_count += 1
-    
-    # スケール間での正規化と統合（改善版）
-    combined_saliency = cp.zeros_like(block)
-    
-    # 各マップを統合（正規化はnormalizeフラグで制御）
-    for i, smap in enumerate(saliency_maps):
-        # 均等な重み付けに変更（大きなスケールも適切に反映）
-        scale_weight = 1.0 / len(saliency_maps)
-        combined_saliency += smap * scale_weight
         
-    # 重みの合計で正規化
-    weight_sum = sum(1.0 / (i + 1) for i in range(len(saliency_maps)))
-    combined_saliency /= weight_sum
+        # 中間変数を解放
+        del contrast
+        del gradient_mag
+        
+        # 各マップを正規化して統合（インプレースで累積）
+        if nan_mask.any():
+            valid_feature = feature[~nan_mask]
+        else:
+            valid_feature = feature.ravel()
+            
+        if len(valid_feature) > 0:
+            # ロバストな正規化（外れ値に強い）
+            p5 = float(cp.percentile(valid_feature, 5))
+            p95 = float(cp.percentile(valid_feature, 95))
+            if p95 > p5:
+                normalized = (feature - p5) / (p95 - p5)
+                normalized = cp.clip(normalized, 0, 1)
+            else:
+                normalized = cp.full_like(feature, 0.5)
+        else:
+            normalized = cp.full_like(feature, 0.5)
+        
+        # 均等な重み付けで累積
+        scale_weight = 1.0 / len(scales)
+        combined_saliency += normalized * scale_weight
+        
+        # 不要になった変数を削除
+        del feature
+        del normalized
+    
+    # 勾配ベースも解放
+    del gradient_mag_base
     
     # 正規化処理を条件分岐に変更
     if normalize:
@@ -949,8 +931,8 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
             # 従来のローカル正規化（互換性のため残す）
             valid_result = combined_saliency[~nan_mask] if nan_mask.any() else combined_saliency.ravel()
             if len(valid_result) > 0:
-                min_val = cp.min(valid_result)
-                max_val = cp.max(valid_result)
+                min_val = float(cp.min(valid_result))
+                max_val = float(cp.max(valid_result))
                 if max_val > min_val:
                     result = (combined_saliency - min_val) / (max_val - min_val)
                 else:
@@ -2423,15 +2405,26 @@ def compute_fractal_dimension_block(block: cp.ndarray, *,
     D = 3.0 - H
     
     if normalize and mu_global is not None and sigma_global is not None:
-        # グローバル統計量でZ-score計算
-        Z = (D - mu_global) / (sigma_global + 1e-10)
+        # パーセンタイルベースの正規化に変更
+        p10, p90 = mu_global, sigma_global  # 実際はp10, p90が渡される
         
-        # -3から3の範囲にクリップして-1から1に正規化
-        Z = cp.clip(Z, -3.0, 3.0) / 3.0
-        
-        # ガンママッピング
-        sign = cp.sign(Z)
-        result = sign * (cp.abs(Z) ** Constants.DEFAULT_GAMMA)
+        # フラクタル次元を-1から1の範囲に正規化
+        # p10以下は異常に平滑（負の値）、p90以上は異常に複雑（正の値）
+        if p90 > p10:
+            # 中央値をゼロにマップ
+            median = (p10 + p90) / 2
+            
+            # 非線形マッピング（シグモイド的な変換）
+            normalized = (D - median) / ((p90 - p10) / 4)  # 4で割ることで範囲を調整
+            
+            # tanh関数で-1から1に滑らかにマップ
+            result = cp.tanh(normalized)
+            
+            # ガンマ補正（絶対値に対して適用）
+            sign = cp.sign(result)
+            result = sign * (cp.abs(result) ** Constants.DEFAULT_GAMMA)
+        else:
+            result = cp.zeros_like(D)
     else:
         # 正規化なし（統計計算用）
         result = D
@@ -2442,29 +2435,21 @@ def compute_fractal_dimension_block(block: cp.ndarray, *,
     return result.astype(cp.float32)
 
 def fractal_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """フラクタル次元の統計量計算（平均と標準偏差）"""
+    """フラクタル次元の統計量計算（パーセンタイルベース）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        # ロバスト統計（外れ値の影響を減らす）
-        # 中央値周辺のデータのみ使用
-        median = cp.median(valid_data)
-        mad = cp.median(cp.abs(valid_data - median))  # Median Absolute Deviation
+        # パーセンタイルベースの統計量（より安定）
+        p10 = float(cp.percentile(valid_data, 10))
+        p90 = float(cp.percentile(valid_data, 90))
         
-        # 3MAD以内のデータのみ使用
-        mask = cp.abs(valid_data - median) < 3 * mad
-        filtered_data = valid_data[mask]
+        # 中央値と四分位範囲も計算
+        median = float(cp.median(valid_data))
+        q1 = float(cp.percentile(valid_data, 25))
+        q3 = float(cp.percentile(valid_data, 75))
         
-        if len(filtered_data) > 0:
-            # CuPy配列から明示的にPython floatに変換
-            mean_val = cp.mean(filtered_data).item()
-            std_val = cp.std(filtered_data).item()
-            return (mean_val, std_val)
-        else:
-            # CuPy配列から明示的にPython floatに変換
-            mean_val = cp.mean(valid_data).item()
-            std_val = cp.std(valid_data).item()
-            return (mean_val, std_val)
-    return (2.0, 0.5)  # デフォルト値（フラクタル次元2.0が平坦な表面）
+        # より広い範囲を使用（10-90パーセンタイル）
+        return (p10, p90)
+    return (2.2, 2.8)  # 自然地形の典型的な範囲
 
 class FractalAnomalyAlgorithm(DaskAlgorithm):
     """フラクタル異常検出アルゴリズム
@@ -2524,28 +2509,27 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         resolution_class = classify_resolution(pixel_size)
         
         if resolution_class == 'ultra_high':
-            # 0.5m以下
-            base_radii = [2, 4, 8, 16, 32, 64]
+            # 0.5m以下 - より広い範囲に拡張
+            base_radii = [2, 4, 8, 16, 32, 64, 128]
         elif resolution_class == 'very_high':
-            # 1m
-            base_radii = [2, 4, 8, 16, 32]
+            # 1m - より広い範囲に拡張
+            base_radii = [2, 4, 8, 16, 32, 64]
         elif resolution_class == 'high':
             # 2.5m
-            base_radii = [2, 4, 8, 16, 24]
+            base_radii = [2, 4, 8, 16, 32, 48]
         elif resolution_class == 'medium':
             # 5m
-            base_radii = [2, 4, 8, 12]
+            base_radii = [2, 4, 8, 16, 24, 32]
         elif resolution_class == 'low':
-            # 10-15m
-            base_radii = [1, 2, 4, 8]
+            # 10-15m - 大幅に拡張
+            base_radii = [2, 4, 8, 16, 32, 48]
         else:
             # 30m以上
-            base_radii = [1, 2, 3, 4]
+            base_radii = [1, 2, 4, 8, 16, 24]
         
-        # メモリ制約を考慮して最大5つまでに制限
-        if len(base_radii) > 5:
-            # 対数的に分布するように選択
-            indices = cp.linspace(0, len(base_radii)-1, 5).astype(int).get()
+        # メモリ制約を考慮して最大6つまでに制限（5→6に増加）
+        if len(base_radii) > 6:
+            indices = cp.linspace(0, len(base_radii)-1, 6).astype(int).get()
             base_radii = [base_radii[int(i)] for i in indices]
         
         return base_radii

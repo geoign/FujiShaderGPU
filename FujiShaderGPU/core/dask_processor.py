@@ -435,10 +435,6 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 y_slice = slice(y_start, y_end)
                                 x_slice = slice(x_start, x_end)
                                 
-                                # デバッグ情報
-                                logger.debug(f"Chunk {i},{j}: data shape={chunk_data.shape}, "
-                                        f"y_slice={y_start}:{y_end}, x_slice={x_start}:{x_end}")
-                                
                                 # チャンクをDataArrayとして作成
                                 chunk_da = xr.DataArray(
                                     chunk_data,
@@ -680,11 +676,6 @@ def run_pipeline(
         # アルゴリズム固有のデフォルトパラメータを取得
         default_params = algo.get_default_params()
 
-        # デバッグ：パラメータの内容を確認
-        if algorithm == 'fractal_anomaly':
-            logger.info(f"DEBUG: default_params = {default_params}")
-            logger.info(f"DEBUG: algo_params = {algo_params}")
-
         # パラメータの準備
         params = {
             **default_params,
@@ -692,10 +683,6 @@ def run_pipeline(
             'show_progress': show_progress,
             'agg': agg
         }
-
-        # デバッグ：統合後のパラメータを確認
-        if algorithm == 'fractal_anomaly':
-            logger.info(f"DEBUG: merged params = {params}")
         
         # 6‑2.5) 自動決定（RVIアルゴリズムの場合）
         if algorithm == "rvi":
