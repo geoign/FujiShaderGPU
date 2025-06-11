@@ -407,14 +407,15 @@ def visual_saliency_stat_func(data: cp.ndarray) -> Tuple[float, float]:
     """Visual Saliency用の統計量計算（解像度適応型）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        # 統計量をより適切に計算
-        low_p = float(cp.percentile(valid_data, 10))
-        high_p = float(cp.percentile(valid_data, 90))
+        # より狭い範囲でコントラストを強調
+        # 低い値を切り捨てて、特徴的な部分を強調
+        low_p = float(cp.percentile(valid_data, 25))   # 5→25に変更
+        high_p = float(cp.percentile(valid_data, 85))  # 95→85に変更
         
-        # 範囲が狭すぎる場合は拡張
-        if (high_p - low_p) < cp.std(valid_data) * 0.5:
-            low_p = float(cp.percentile(valid_data, 5))
-            high_p = float(cp.percentile(valid_data, 95))
+        # 範囲が狭すぎる場合でも、あまり広げすぎない
+        if (high_p - low_p) < cp.std(valid_data) * 0.3:
+            low_p = float(cp.percentile(valid_data, 15))   # 5→15
+            high_p = float(cp.percentile(valid_data, 90))  # 95→90
             
         return (low_p, high_p)
     return (0.0, 1.0)
@@ -897,8 +898,8 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
                 normalized = (smap - p5) / (p95 - p5)
                 normalized = cp.clip(normalized, 0, 1)
                 # スケールに応じた重み付け
-                scale_weight = 1.0 / (i + 1)
-                combined_saliency += normalized * scale_weight
+                scale_weight = 1.0 / len(saliency_maps)  # 1.0 / (i + 1) から変更
+                combined_saliency += smap * scale_weight
             else:
                 combined_saliency += 0.5
     
