@@ -849,22 +849,22 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
             center = gaussian_filter(block, sigma=center_sigma, mode='nearest')
             surround = gaussian_filter(block, sigma=surround_sigma, mode='nearest')
         
-        # 差分の絶対値（改善版：スケールで正規化）
-        contrast = cp.abs(center - surround) / (scale + 1.0)
+        # 差分の絶対値
+        contrast = cp.abs(center - surround) / (cp.log(scale + cp.e))
         
         # 勾配の強度
         if scale > 1:
+            # sigmaを対数的にスケール（線形ではなく）
+            sigma_for_gradient = cp.log(scale + 1)
             if nan_mask.any():
                 filled_grad = cp.where(nan_mask, 0, gradient_mag_base)
                 valid = (~nan_mask).astype(cp.float32)
                 
-                smoothed_values = gaussian_filter(filled_grad * valid, sigma=scale/2, mode='nearest')
-                smoothed_weights = gaussian_filter(valid, sigma=scale/2, mode='nearest')
+                smoothed_values = gaussian_filter(filled_grad * valid, sigma=sigma_for_gradient, mode='nearest')
+                smoothed_weights = gaussian_filter(valid, sigma=sigma_for_gradient, mode='nearest')
                 gradient_mag = cp.where(smoothed_weights > 0, smoothed_values / smoothed_weights, 0)
             else:
-                gradient_mag = gaussian_filter(gradient_mag_base, sigma=scale/2, mode='nearest')
-        else:
-            gradient_mag = gradient_mag_base
+                gradient_mag = gaussian_filter(gradient_mag_base, sigma=sigma_for_gradient, mode='nearest')
         
         # 解像度に応じた特徴の組み合わせ（改善版）
         if resolution_class in ['ultra_high', 'very_high']:
@@ -928,9 +928,10 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     
     # 各マップを統合（正規化はnormalizeフラグで制御）
     for i, smap in enumerate(saliency_maps):
-        scale_weight = 1.0 / (i + 1)
+        # 均等な重み付けに変更（大きなスケールも適切に反映）
+        scale_weight = 1.0 / len(saliency_maps)
         combined_saliency += smap * scale_weight
-    
+        
     # 重みの合計で正規化
     weight_sum = sum(1.0 / (i + 1) for i in range(len(saliency_maps)))
     combined_saliency /= weight_sum
