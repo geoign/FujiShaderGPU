@@ -487,6 +487,10 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         """Dask-CUDA処理を実行"""
         # パラメータの準備
         params = self.get_common_params(args)
+
+        if args.algorithm == 'fractal_anomaly':
+            self.logger.info(f"fractal_radii属性: {getattr(args, 'fractal_radii', 'なし')}")
+            self.logger.info(f"fractal_radii_list属性: {getattr(args, 'fractal_radii_list', 'なし')}")
         
         # pixel_sizeの自動取得（指定されていない場合）
         if not hasattr(args, 'pixel_size') or args.pixel_size is None:
