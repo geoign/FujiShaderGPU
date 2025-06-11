@@ -922,46 +922,45 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
                 combined_saliency += normalized
                 valid_count += 1
     
-     # スケール間での正規化と統合（改善版）
+    # スケール間での正規化と統合（改善版）
     combined_saliency = cp.zeros_like(block)
     
-    if normalize:
-        # 本番処理時：各マップを正規化して統合
-        for i, smap in enumerate(saliency_maps):
-            if nan_mask.any():
-                valid_smap = smap[~nan_mask]
-            else:
-                valid_smap = smap.ravel()
-                
-            if len(valid_smap) > 0:
-                # ロバストな正規化（外れ値に強い）
-                p5 = cp.percentile(valid_smap, 5)
-                p95 = cp.percentile(valid_smap, 95)
-                if p95 > p5:
-                    normalized = (smap - p5) / (p95 - p5)
-                    normalized = cp.clip(normalized, 0, 1)
-                    # スケールに応じた重み付け
-                    scale_weight = 1.0 / (i + 1)
-                    combined_saliency += normalized * scale_weight
-                else:
-                    combined_saliency += 0.5
-        
-        # 重みの合計で正規化
-        weight_sum = sum(1.0 / (i + 1) for i in range(len(saliency_maps)))
-        combined_saliency /= weight_sum
-    else:
-        # 統計量計算時：正規化せずに単純に重み付き平均
-        for i, smap in enumerate(saliency_maps):
-            scale_weight = 1.0 / (i + 1)
-            combined_saliency += smap * scale_weight
-        
-        # 重みの合計で正規化
-        weight_sum = sum(1.0 / (i + 1) for i in range(len(saliency_maps)))
-        combined_saliency /= weight_sum
+    # 各マップを統合（正規化はnormalizeフラグで制御）
+    for i, smap in enumerate(saliency_maps):
+        scale_weight = 1.0 / (i + 1)
+        combined_saliency += smap * scale_weight
     
-    # ガンマ補正（0-1の範囲の場合のみ適用）
+    # 重みの合計で正規化
+    weight_sum = sum(1.0 / (i + 1) for i in range(len(saliency_maps)))
+    combined_saliency /= weight_sum
+    
+    # 正規化処理を条件分岐に変更
     if normalize:
+        if norm_min is not None and norm_max is not None:
+            # 提供された統計量で正規化
+            if norm_max > norm_min:
+                result = (combined_saliency - norm_min) / (norm_max - norm_min)
+                result = cp.clip(result, 0, 1)
+            else:
+                result = cp.full_like(block, 0.5)
+        else:
+            # 従来のローカル正規化（互換性のため残す）
+            valid_result = combined_saliency[~nan_mask] if nan_mask.any() else combined_saliency.ravel()
+            if len(valid_result) > 0:
+                min_val = cp.min(valid_result)
+                max_val = cp.max(valid_result)
+                if max_val > min_val:
+                    result = (combined_saliency - min_val) / (max_val - min_val)
+                else:
+                    result = cp.full_like(combined_saliency, 0.5)
+            else:
+                result = cp.full_like(combined_saliency, 0.5)
+        
+        # ガンマ補正（正規化された場合のみ）
         result = cp.power(result, Constants.DEFAULT_GAMMA)
+    else:
+        # 正規化なし
+        result = combined_saliency
     
     # NaN処理
     result = restore_nan(result, nan_mask)
