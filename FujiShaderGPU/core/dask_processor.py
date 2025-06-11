@@ -679,7 +679,12 @@ def run_pipeline(
         
         # アルゴリズム固有のデフォルトパラメータを取得
         default_params = algo.get_default_params()
-        
+
+        # デバッグ：パラメータの内容を確認
+        if algorithm == 'fractal_anomaly':
+            logger.info(f"DEBUG: default_params = {default_params}")
+            logger.info(f"DEBUG: algo_params = {algo_params}")
+
         # パラメータの準備
         params = {
             **default_params,
@@ -687,6 +692,10 @@ def run_pipeline(
             'show_progress': show_progress,
             'agg': agg
         }
+
+        # デバッグ：統合後のパラメータを確認
+        if algorithm == 'fractal_anomaly':
+            logger.info(f"DEBUG: merged params = {params}")
         
         # 6‑2.5) 自動決定（RVIアルゴリズムの場合）
         if algorithm == "rvi":
