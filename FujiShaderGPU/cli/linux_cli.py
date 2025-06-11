@@ -488,10 +488,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # パラメータの準備
         params = self.get_common_params(args)
 
-        if args.algorithm == 'fractal_anomaly':
-            self.logger.info(f"fractal_radii属性: {getattr(args, 'fractal_radii', 'なし')}")
-            self.logger.info(f"fractal_radii_list属性: {getattr(args, 'fractal_radii_list', 'なし')}")
-        
         # pixel_sizeの自動取得（指定されていない場合）
         if not hasattr(args, 'pixel_size') or args.pixel_size is None:
             with rasterio.open(params['input_path']) as src:
@@ -689,6 +685,11 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         elif args.algorithm == 'fractal_anomaly':
             if hasattr(args, 'fractal_radii_list') and args.fractal_radii_list:
                 algo_params['radii'] = args.fractal_radii_list
+
+        if args.algorithm == 'fractal_anomaly':
+            self.logger.info(f"fractal_radii属性: {getattr(args, 'fractal_radii', 'なし')}")
+            self.logger.info(f"fractal_radii_list属性: {getattr(args, 'fractal_radii_list', 'なし')}")
+        
 
         # RVI用ログ出力
         if args.algorithm == "rvi":
