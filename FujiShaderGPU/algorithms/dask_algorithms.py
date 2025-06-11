@@ -889,31 +889,12 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         del contrast
         del gradient_mag
         
-        # 各マップを正規化して統合（インプレースで累積）
-        if nan_mask.any():
-            valid_feature = feature[~nan_mask]
-        else:
-            valid_feature = feature.ravel()
-            
-        if len(valid_feature) > 0:
-            # ロバストな正規化（外れ値に強い）
-            p5 = float(cp.percentile(valid_feature, 5))
-            p95 = float(cp.percentile(valid_feature, 95))
-            if p95 > p5:
-                normalized = (feature - p5) / (p95 - p5)
-                normalized = cp.clip(normalized, 0, 1)
-            else:
-                normalized = cp.full_like(feature, 0.5)
-        else:
-            normalized = cp.full_like(feature, 0.5)
-        
-        # 均等な重み付けで累積
+        # 正規化せずに累積（グローバル統計で後で正規化するため）
         scale_weight = 1.0 / len(scales)
-        combined_saliency += normalized * scale_weight
+        combined_saliency += feature * scale_weight
         
         # 不要になった変数を削除
         del feature
-        del normalized
     
     # 勾配ベースも解放
     del gradient_mag_base
