@@ -38,7 +38,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
     rvi, hillshade, slope, tpi, lrm, openness, specular,
     atmospheric_scattering, multiscale_terrain, frequency_enhancement,
     curvature, visual_saliency, npr_edges, atmospheric_perspective,
-    ambient_occlusion
+    ambient_occlusion, fractal_anomaly
     """
     
     def get_supported_algorithms(self) -> List[str]:
@@ -47,7 +47,8 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             "rvi", "hillshade", "slope", "tpi", "lrm", "openness",
             "specular", "atmospheric_scattering", "multiscale_terrain",
             "frequency_enhancement", "curvature", "visual_saliency",
-            "npr_edges", "atmospheric_perspective", "ambient_occlusion"
+            "npr_edges", "atmospheric_perspective", "ambient_occlusion",
+            "fractal_anomaly"
         ]
     
     def _add_platform_specific_args(self, parser: argparse.ArgumentParser):
@@ -350,6 +351,26 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             default=16,
             help="AO計算のサンプル数 (default: 16)"
         )
+
+        # Fractal Anomaly固有（新規追加）
+        parser.add_argument(
+            "--fractal-radii",
+            type=str,
+            help="フラクタル異常検出の計算半径。カンマ区切り (例: 2,4,8,16,32)"
+        )
+
+        parser.add_argument(
+            "--auto-fractal-radii",
+            action="store_true",
+            default=True,
+            help="フラクタル半径を解像度から自動決定 (default: True)"
+        )
+
+        parser.add_argument(
+            "--no-auto-fractal-radii",
+            action="store_true",
+            help="フラクタル半径の自動決定を無効化"
+        )
         
         # 汎用強度パラメータ
         parser.add_argument(
@@ -417,6 +438,15 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         else:
             parsed_args.sigmas_list = None
 
+        # fractal_radiiのパース（fractal_anomaly用）
+        if hasattr(parsed_args, 'fractal_radii') and parsed_args.fractal_radii:
+            try:
+                parsed_args.fractal_radii_list = [int(r.strip()) for r in parsed_args.fractal_radii.split(",")]
+            except ValueError:
+                self.parser.error("無効なfractal-radii形式です。カンマ区切りの整数を指定してください: 2,4,8,16,32")
+        else:
+            parsed_args.fractal_radii_list = None
+
         return parsed_args
     
     def _validate_platform_args(self, args: argparse.Namespace):
@@ -431,6 +461,10 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         # use_global_statsフラグの処理
         if hasattr(args, 'use_global_stats') and hasattr(args, 'no_global_stats'):
             args.use_global_stats = args.use_global_stats and not args.no_global_stats
+
+        # auto_fractal_radiiフラグの処理
+        if hasattr(args, 'auto_fractal_radii') and hasattr(args, 'no_auto_fractal_radii'):
+            args.auto_fractal_radii = args.auto_fractal_radii and not args.no_auto_fractal_radii
         
         # RVIでradii/sigmaが未指定かつ自動決定も無効の場合エラー
         if args.algorithm == "rvi":
@@ -646,6 +680,11 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 algo_params['depth_scale'] = args.depth_scale
             if hasattr(args, 'haze_strength'):
                 algo_params['haze_strength'] = args.haze_strength
+
+        # Fractal Anomaly固有
+        elif args.algorithm == 'fractal_anomaly':
+            if hasattr(args, 'fractal_radii_list') and args.fractal_radii_list:
+                algo_params['radii'] = args.fractal_radii_list
 
         # RVI用ログ出力
         if args.algorithm == "rvi":

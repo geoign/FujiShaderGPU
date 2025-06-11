@@ -2343,6 +2343,213 @@ class CurvatureAlgorithm(DaskAlgorithm):
         }
 
 ###############################################################################
+# 2.15. Fractal Anomaly (フラクタル異常検出) アルゴリズム
+###############################################################################
+
+def compute_roughness_multiscale(block: cp.ndarray, radii: List[int]) -> cp.ndarray:
+    """複数スケールでの局所的な標準偏差（roughness）を計算"""
+    nan_mask = cp.isnan(block)
+    sigmas = []
+    
+    for r in radii:
+        if r <= 1:
+            # 小さな半径の場合はガウシアンフィルタ
+            sigma = 1.0
+            mean_elev, _ = handle_nan_with_gaussian(block, sigma=sigma, mode='nearest')
+            # 分散計算のために二乗の平均も必要
+            block_sq = block ** 2
+            mean_sq, _ = handle_nan_with_gaussian(block_sq, sigma=sigma, mode='nearest')
+        else:
+            # 大きな半径の場合はuniform filter
+            kernel_size = 2 * r + 1
+            mean_elev, _ = handle_nan_with_uniform(block, size=kernel_size, mode='reflect')
+            # 分散計算
+            block_sq = block ** 2
+            mean_sq, _ = handle_nan_with_uniform(block_sq, size=kernel_size, mode='reflect')
+        
+        # 標準偏差 = sqrt(E[X^2] - E[X]^2)
+        variance = mean_sq - mean_elev ** 2
+        sigma = cp.sqrt(cp.maximum(variance, 0.0))
+        sigmas.append(sigma)
+    
+    # shape (H, W, n_scales)にスタック
+    return cp.stack(sigmas, axis=-1)
+
+def compute_fractal_dimension_block(block: cp.ndarray, *, 
+                                  radii: List[int] = [2, 4, 8, 16, 32],
+                                  normalize: bool = True,
+                                  mu_global: float = None,
+                                  sigma_global: float = None) -> cp.ndarray:
+    """ブロックごとのフラクタル次元計算"""
+    nan_mask = cp.isnan(block)
+    
+    # 複数スケールでroughnessを計算
+    sigmas = compute_roughness_multiscale(block, radii)
+    
+    # log-log回帰の準備
+    log_radii = cp.log(cp.asarray(radii, dtype=cp.float32))
+    n_scales = len(radii)
+    
+    # 各ピクセルでlog-log回帰
+    # log(sigma) = H * log(radius) + intercept の形で回帰
+    log_sigmas = cp.log(sigmas + 1e-10)  # 数値安定性のため小さな値を追加
+    
+    # 回帰係数の計算（ベクトル化）
+    mean_log_r = cp.mean(log_radii)
+    mean_log_r2 = cp.mean(log_radii ** 2)
+    
+    # 各ピクセルでの平均
+    mean_log_sigma = cp.mean(log_sigmas, axis=2)
+    
+    # 共分散の計算
+    log_radii_broadcast = log_radii.reshape(1, 1, -1)
+    mean_log_r_log_sigma = cp.mean(log_sigmas * log_radii_broadcast, axis=2)
+    
+    # 傾き（Hurst指数）
+    denominator = mean_log_r2 - mean_log_r ** 2
+    if cp.abs(denominator) > 1e-10:  # cp.absを使用
+        H = (mean_log_r_log_sigma - mean_log_r * mean_log_sigma) / denominator
+    else:
+        H = cp.zeros_like(mean_log_sigma)
+    
+    # フラクタル次元（2D表面の場合）
+    D = 3.0 - H
+    
+    if normalize and mu_global is not None and sigma_global is not None:
+        # グローバル統計量でZ-score計算
+        Z = (D - mu_global) / (sigma_global + 1e-10)
+        
+        # -3から3の範囲にクリップして-1から1に正規化
+        Z = cp.clip(Z, -3.0, 3.0) / 3.0
+        
+        # ガンママッピング
+        sign = cp.sign(Z)
+        result = sign * (cp.abs(Z) ** Constants.DEFAULT_GAMMA)
+    else:
+        # 正規化なし（統計計算用）
+        result = D
+    
+    # NaN処理
+    result = restore_nan(result, nan_mask)
+    
+    return result.astype(cp.float32)
+
+def fractal_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """フラクタル次元の統計量計算（平均と標準偏差）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        # ロバスト統計（外れ値の影響を減らす）
+        # 中央値周辺のデータのみ使用
+        median = cp.median(valid_data)
+        mad = cp.median(cp.abs(valid_data - median))  # Median Absolute Deviation
+        
+        # 3MAD以内のデータのみ使用
+        mask = cp.abs(valid_data - median) < 3 * mad
+        filtered_data = valid_data[mask]
+        
+        if len(filtered_data) > 0:
+            # CuPy配列から明示的にPython floatに変換
+            mean_val = cp.mean(filtered_data).item()
+            std_val = cp.std(filtered_data).item()
+            return (mean_val, std_val)
+        else:
+            # CuPy配列から明示的にPython floatに変換
+            mean_val = cp.mean(valid_data).item()
+            std_val = cp.std(valid_data).item()
+            return (mean_val, std_val)
+    return (2.0, 0.5)  # デフォルト値（フラクタル次元2.0が平坦な表面）
+
+class FractalAnomalyAlgorithm(DaskAlgorithm):
+    """フラクタル異常検出アルゴリズム
+    
+    地形のフラクタル次元を計算し、統計的に異常な領域を検出します。
+    - 正の値（明るい）: フラクタル次元が高い = 異常に複雑な地形
+    - 負の値（暗い）: フラクタル次元が低い = 異常に平滑な地形
+    - 0付近（中間色）: 典型的な地形パターン
+    """
+    
+    def process(self, gpu_arr: da.Array, **params) -> da.Array:
+        radii = params.get('radii', None)
+        pixel_size = params.get('pixel_size', 1.0)
+        
+        # 半径の自動決定
+        if radii is None:
+            radii = self._determine_optimal_radii(pixel_size)
+        
+        max_radius = max(radii)
+        depth = max_radius * 2 + 1
+        
+        # グローバル統計量を計算
+        print("🔍 Computing global fractal statistics...")
+        stats = compute_global_stats(
+            gpu_arr,
+            fractal_stat_func,
+            compute_fractal_dimension_block,
+            {'radii': radii, 'normalize': False},
+            downsample_factor=params.get('downsample_factor', None),
+            depth=depth,
+            algorithm_name='fractal_anomaly'
+        )
+        
+        mu_global, sigma_global = stats
+        print(f"📊 Fractal dimension: μ={mu_global:.3f}, σ={sigma_global:.3f}")
+        
+        # 大規模データの場合、定期的にGCを実行
+        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+            import gc
+            gc.collect()
+        
+        # フルサイズで処理（正規化あり）
+        return gpu_arr.map_overlap(
+            compute_fractal_dimension_block,
+            depth=depth,
+            boundary='reflect',
+            dtype=cp.float32,
+            meta=cp.empty((0, 0), dtype=cp.float32),
+            radii=radii,
+            normalize=True,
+            mu_global=mu_global,
+            sigma_global=sigma_global
+        )
+    
+    def _determine_optimal_radii(self, pixel_size: float) -> List[int]:
+        """解像度に基づいて最適な半径を決定"""
+        resolution_class = classify_resolution(pixel_size)
+        
+        if resolution_class == 'ultra_high':
+            # 0.5m以下
+            base_radii = [2, 4, 8, 16, 32, 64]
+        elif resolution_class == 'very_high':
+            # 1m
+            base_radii = [2, 4, 8, 16, 32]
+        elif resolution_class == 'high':
+            # 2.5m
+            base_radii = [2, 4, 8, 16, 24]
+        elif resolution_class == 'medium':
+            # 5m
+            base_radii = [2, 4, 8, 12]
+        elif resolution_class == 'low':
+            # 10-15m
+            base_radii = [1, 2, 4, 8]
+        else:
+            # 30m以上
+            base_radii = [1, 2, 3, 4]
+        
+        # メモリ制約を考慮して最大5つまでに制限
+        if len(base_radii) > 5:
+            # 対数的に分布するように選択
+            indices = cp.linspace(0, len(base_radii)-1, 5).astype(int).get()
+            base_radii = [base_radii[int(i)] for i in indices]
+        
+        return base_radii
+    
+    def get_default_params(self) -> dict:
+        return {
+            'radii': None,  # Noneの場合は自動決定
+            'pixel_size': 1.0,
+            'downsample_factor': None,  # 統計計算時のダウンサンプル係数
+        }
+###############################################################################
 # 2.13. アルゴリズムレジストリ
 ###############################################################################
 
@@ -2362,6 +2569,7 @@ ALGORITHMS = {
     'tpi': TPIAlgorithm(),
     'lrm': LRMAlgorithm(),
     'openness': OpennessAlgorithm(),
+    'fractal_anomaly': FractalAnomalyAlgorithm(),
 }
 
 # 新しいアルゴリズムの追加例:
