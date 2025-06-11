@@ -780,6 +780,11 @@ def run_pipeline(
             except:
                 params['pixel_size'] = 1.0
                 logger.warning("Could not determine pixel size, using 1.0")
+
+        # 追加：fractal_anomaly用のradii処理
+        if algorithm == "fractal_anomaly" and radii is not None:
+            params['radii'] = radii
+            logger.info(f"Setting radii for fractal_anomaly: {radii}")
         
         # 6-3) アルゴリズム実行（run_pipeline内）
         logger.info(f"Computing {algorithm} with parameters: {params}")
