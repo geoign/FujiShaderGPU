@@ -481,6 +481,10 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
         
         # 中間結果のメモリを明示的に解放（追加）
         del mean_elev
+
+        # 大規模処理時の追加メモリクリーンアップ
+        if block.nbytes > 100 * 1024 * 1024:  # 100MB以上のブロック
+            cp.get_default_memory_pool().free_all_blocks()
     
     # NaN処理
     rvi_combined = restore_nan(rvi_combined, nan_mask)

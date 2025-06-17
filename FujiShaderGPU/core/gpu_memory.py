@@ -10,10 +10,22 @@ _thread_local = threading.local()
 def get_gpu_context():
     """スレッドローカルなGPUメモリプールを取得（改良版）"""
     if not hasattr(_thread_local, 'mempool'):
+        try:
+            import rmm
+            cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+        except ImportError:
+            pass
+
         _thread_local.mempool = cp.get_default_memory_pool()
         _thread_local.pinned_mempool = cp.get_default_pinned_memory_pool()
-        # より攻撃的なメモリプール設定
-        _thread_local.mempool.set_limit(size=None)  # メモリ制限解除
+
+        # 無制限ではなく VRAM の 90 % を上限にしてリークを抑制
+        try:
+            import GPUtil
+            gpu = GPUtil.getGPUs()[0]
+            _thread_local.mempool.set_limit(size=int(gpu.memoryTotal * 0.9 * 1024**2))
+        except Exception:
+            pass
     return _thread_local.mempool, _thread_local.pinned_mempool
 
 @contextlib.contextmanager

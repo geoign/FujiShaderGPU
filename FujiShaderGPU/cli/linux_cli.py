@@ -3,7 +3,7 @@ FujiShaderGPU/cli/linux_cli.py
 Linux環境用CLI - Dask-CUDA処理の実装
 """
 from typing import List, Optional
-import argparse, rasterio
+import os, argparse, rasterio
 import numpy as np
 from .base import BaseCLI
 
@@ -485,6 +485,10 @@ Cloud-Optimized GeoTIFF として書き出します。"""
 
     def execute(self, args: argparse.Namespace):
         """Dask-CUDA処理を実行"""
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"]="0.7"
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.6"
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"]="0.8"
+
         # パラメータの準備
         params = self.get_common_params(args)
 

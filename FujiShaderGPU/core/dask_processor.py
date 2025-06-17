@@ -63,8 +63,11 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         else:
             gpu_memory_gb = 40  # デフォルトA100想定
         
-        # rmm_sizeの計算（この行が重要！）
-        rmm_size = int(gpu_memory_gb * memory_fraction * 0.5)  # さらに保守的に
+        # RMMプールサイズを動的に調整
+        if gpu_memory_gb >= 40:  # A100
+            rmm_size = min(int(gpu_memory_gb * 0.3), 20)  # 最大20GB
+        else:
+            rmm_size = min(int(gpu_memory_gb * 0.25), 10)  # 最大10GB
         
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
@@ -75,8 +78,29 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             # Colab環境用の追加設定
             death_timeout="60s" if is_colab else "30s",
             interface="lo" if is_colab else None,
+            scheduler_memory_limit='10GB',  # スケジューラのメモリ制限
+            worker_memory_terminate=0.95,   # 95%でワーカーを終了
         )
         client = Client(cluster)
+        try:
+            import rmm, cupy as cp
+            rmm.reinitialize(
+                pool_allocator=True,
+                managed_memory=False,
+                initial_pool_size=f"{rmm_size}GB",
+            )
+            cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+
+            def _enable_rmm_on_worker():
+                import rmm, cupy as _cp
+                rmm.reinitialize(pool_allocator=True, managed_memory=False)
+                _cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+            client.run(_enable_rmm_on_worker)
+
+            logger.info("CuPy allocator switched to RMM – GPU memory is now managed by Dask")
+        except ImportError:
+            logger.warning("rmm not found – falling back to default CuPy allocator")
+
         logger.info(f"Dask dashboard: {client.dashboard_link}")
         return cluster, client
     except Exception as e:
@@ -461,14 +485,25 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 )
                                 chunk_files.append(chunk_file)
                                 
-                                # メモリ解放（改善）
+                                # メモリ解放
                                 del chunk_data, chunk_da
                                 chunk_idx += 1
-                                # CuPyメモリプールもクリア（追加）
-                                if i % 10 == 0:  # 10チャンクごとに
-                                    cp.get_default_memory_pool().free_all_blocks()
+
+                                # より積極的なメモリ解放（毎チャンク後）
+                                cp.get_default_memory_pool().free_all_blocks()
+                                cp.get_default_pinned_memory_pool().free_all_blocks()
+                                
+                                # 5チャンクごとに完全なガベージコレクション
+                                if chunk_idx % 5 == 0:
                                     import gc
                                     gc.collect()
+                                    # Daskワーカーのメモリも解放
+                                    from distributed.worker import get_worker
+                                    try:
+                                        worker = get_worker()
+                                        worker.memory_manager.memory_pause_fraction = 0.7  # より早めにpause
+                                    except:
+                                        pass
                                 
                                 # 進捗更新
                                 pbar.update(1)
@@ -790,19 +825,35 @@ def run_pipeline(
         if show_progress:
             logger.info("Processing data chunks...")
             
-            # 分散環境用の進捗表示
-            from dask.distributed import as_completed, progress
+            # 大規模データ対応：チャンクごとに計算して即座にメモリ解放
+            from dask.distributed import progress
+            from dask import delayed
             
-            # persistを実行してFutureを取得
-            result_future = client.persist(result_cpu)
+            # データサイズに基づいて処理方法を決定
+            total_gb = result_cpu.nbytes / (1024**3)
             
-            # 進捗表示（分散環境対応）
-            progress(result_future, interval='1s')
-            
-            # 結果を取得
-            result_cpu = result_future
+            if total_gb > 20:  # 20GB以上の場合は特別な処理
+                logger.info(f"Large dataset ({total_gb:.1f} GB), using memory-efficient processing")
+                
+                # チャンクごとに計算してすぐにメモリを解放
+                result_cpu = result_cpu.persist(scheduler='threads')  # ローカルスレッドで処理
+                
+                # 定期的なメモリクリーンアップを追加
+                import gc
+                gc.collect()
+                cp.get_default_memory_pool().free_all_blocks()
+            else:
+                # 通常サイズの場合は従来の処理
+                result_future = client.persist(result_cpu)
+                progress(result_future, interval='1s')
+                result_cpu = result_future
         else:
-            result_cpu = result_cpu.persist()
+            # 進捗表示なしでも同様の処理
+            total_gb = result_cpu.nbytes / (1024**3)
+            if total_gb > 20:
+                result_cpu = result_cpu.persist(scheduler='threads')
+            else:
+                result_cpu = result_cpu.persist()
     
         # 6‑5) xarray ラップ（改善：座標構築の簡略化）
         if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
