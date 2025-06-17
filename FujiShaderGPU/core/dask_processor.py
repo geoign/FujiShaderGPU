@@ -78,8 +78,11 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             # Colab環境用の追加設定
             death_timeout="60s" if is_colab else "30s",
             interface="lo" if is_colab else None,
-            scheduler_memory_limit='10GB',  # スケジューラのメモリ制限
-            worker_memory_terminate=0.95,   # 95%でワーカーを終了
+            # 大規模データ用の追加設定
+            memory_limit='auto',  # ワーカーのCPUメモリ制限
+            rmm_maximum_pool_size=None,  # RMMプールの最大サイズ（無制限）
+            enable_cudf_spill=True,  # GPU→CPUメモリへのスピル有効化
+            local_directory='/tmp',  # スピル用ディレクトリ
         )
         client = Client(cluster)
         try:
