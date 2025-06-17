@@ -3,7 +3,7 @@ FujiShaderGPU/cli/linux_cli.py
 Linux環境用CLI - Dask-CUDA処理の実装
 """
 from typing import List, Optional
-import os, argparse, rasterio
+import os, argparse, rasterio, GPUtil
 import numpy as np
 from .base import BaseCLI
 
@@ -488,6 +488,16 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"]="0.7"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.6"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"]="0.8"
+        # 追加: RMM環境変数
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            gpu_memory_gb = gpus[0].memoryTotal / 1024
+        else:
+            gpu_memory_gb = 40  # デフォルトA100想定
+        if gpu_memory_gb >= 40:
+            os.environ["RMM_ALLOCATOR"]="pool"
+            os.environ["RMM_POOL_SIZE"]="35GB"  # A100の場合
+            os.environ["RMM_MAXIMUM_POOL_SIZE"]="38GB"  # VRAMの95%程度
 
         # パラメータの準備
         params = self.get_common_params(args)

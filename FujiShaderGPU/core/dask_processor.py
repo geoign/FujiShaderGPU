@@ -41,8 +41,11 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
     base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 10)
     # 512の倍数に丸める（COGブロックサイズとの整合性）
-    # return max(2048, min(8192, (base_chunk // 512) * 512))  # この行を削除
-    return max(4096, (base_chunk // 512) * 512)  # 最大値制限を削除
+    # 修正: 大規模データの場合はチャンクサイズを制限
+    if gpu_memory_gb >= 40:  # A100
+        return min(4096, (base_chunk // 512) * 512)  # 最大4096に制限
+    else:
+        return min(2048, (base_chunk // 512) * 512)  # その他は2048に制限
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     try:
@@ -65,9 +68,10 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
-            rmm_size = min(int(gpu_memory_gb * 0.3), 20)  # 最大20GB
+            # 修正: 最大値を増やし、より多くのメモリを使用可能にする
+            rmm_size = min(int(gpu_memory_gb * 0.5), 35)  # 0.3→0.5、20GB→35GB
         else:
-            rmm_size = min(int(gpu_memory_gb * 0.25), 10)  # 最大10GB
+            rmm_size = min(int(gpu_memory_gb * 0.4), 20)  # 0.25→0.4、上限も引き上げ
         
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
@@ -80,7 +84,7 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             interface="lo" if is_colab else None,
             # 大規模データ用の追加設定
             memory_limit='auto',  # ワーカーのCPUメモリ制限
-            rmm_maximum_pool_size=None,  # RMMプールの最大サイズ（無制限）
+            rmm_maximum_pool_size=f"{int(gpu_memory_gb * 0.8)}GB",  # RMMプールの最大サイズ（無制限）
             enable_cudf_spill=True,  # GPU→CPUメモリへのスピル有効化
             local_directory='/tmp',  # スピル用ディレクトリ
         )
@@ -117,7 +121,7 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
                 
                 if rmm_cupy_allocator:
                     _cp.cuda.set_allocator(rmm_cupy_allocator)
-                    
+
             client.run(_enable_rmm_on_worker)
 
             logger.info("CuPy allocator switched to RMM – GPU memory is now managed by Dask")
@@ -437,6 +441,15 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
     if total_gb > 10:  # 10GB以上の場合はチャンク処理
         logger.info(f"Large dataset ({total_gb:.1f} GB), using chunked writing")
         
+        # メモリ制限を考慮してチャンクサイズを動的に調整
+        available_memory = cp.get_default_memory_pool().free_bytes() / (1024**3)
+        if available_memory < 10:  # 利用可能メモリが10GB未満
+            # より積極的なメモリ解放
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+            import gc
+            gc.collect()
+            
         # 一時ディレクトリ作成
         with tempfile.TemporaryDirectory() as tmpdir:
             # チャンクごとに処理
@@ -673,13 +686,13 @@ def run_pipeline(
     src_cog: str,
     dst_cog: str,
     algorithm: str = "rvi",
-    sigmas: Optional[List[float]] = None,  # 従来の互換性のため残す
-    radii: Optional[List[int]] = None,     # 新しいパラメータ
+    sigmas: Optional[List[float]] = None,
+    radii: Optional[List[int]] = None,
     agg: str = "mean",
     chunk: Optional[int] = None,
     show_progress: bool = True,
-    auto_sigma: bool = False,  # 従来の互換性
-    auto_radii: bool = True,   # 新しいパラメータ
+    auto_sigma: bool = False,
+    auto_radii: bool = True,
     **algo_params
 ):
     """改善されたメインパイプライン"""
@@ -704,8 +717,18 @@ def run_pipeline(
     try:
         # チャンクサイズの自動決定
         if chunk is None:
-            chunk = get_optimal_chunk_size()
-            logger.info(f"Auto-selected chunk size: {chunk}x{chunk}")
+            # データサイズを先に確認
+            with rasterio.open(src_cog) as src:
+                total_pixels = src.width * src.height
+                total_gb = (total_pixels * 4) / (1024**3)  # float32として計算
+                
+            # 巨大データの場合はより小さなチャンクを使用
+            if total_gb > 50:  # 50GB以上
+                chunk = 2048
+                logger.info(f"Large dataset ({total_gb:.1f} GB), using smaller chunk size: {chunk}")
+            else:
+                chunk = get_optimal_chunk_size()
+                logger.info(f"Auto-selected chunk size: {chunk}x{chunk}")
         
         # 6‑1) DEM 遅延ロード
         with warnings.catch_warnings():

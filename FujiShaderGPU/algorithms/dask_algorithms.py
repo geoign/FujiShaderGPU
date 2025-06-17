@@ -465,25 +465,28 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
             raise ValueError(f"Length of weights ({len(weights)}) must match length of radii ({len(radii)})")
     
     # 結果をインプレースで累積（メモリ効率向上）
-    rvi_combined = cp.zeros_like(block, dtype=cp.float32)
+    rvi_combined = None
     
-    for radius, weight in zip(radii, weights):
+    for i, (radius, weight) in enumerate(zip(radii, weights)):
         if radius <= 1:
-            # 小さな半径の場合
             mean_elev, _ = handle_nan_with_gaussian(block, sigma=1.0, mode='nearest')
         else:
-            # 大きな半径の場合
             kernel_size = 2 * radius + 1
             mean_elev, _ = handle_nan_with_uniform(block, size=kernel_size, mode='reflect')
         
-        # インプレース演算でメモリ効率向上
-        rvi_combined += weight * (block - mean_elev)
+        # 差分を計算
+        diff = weight * (block - mean_elev)
         
-        # 中間結果のメモリを明示的に解放（追加）
-        del mean_elev
-
-        # 大規模処理時の追加メモリクリーンアップ
-        if block.nbytes > 100 * 1024 * 1024:  # 100MB以上のブロック
+        if rvi_combined is None:
+            rvi_combined = diff
+        else:
+            rvi_combined += diff
+        
+        # メモリを即座に解放
+        del mean_elev, diff
+        
+        # 大きなブロックの場合は毎回メモリクリーンアップ
+        if block.nbytes > 50 * 1024 * 1024:  # 50MB以上
             cp.get_default_memory_pool().free_all_blocks()
     
     # NaN処理
