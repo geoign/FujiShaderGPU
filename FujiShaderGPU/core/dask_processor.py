@@ -108,7 +108,16 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             def _enable_rmm_on_worker():
                 import rmm, cupy as _cp
                 rmm.reinitialize(pool_allocator=True, managed_memory=False)
-                _cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+                
+                # 新しいRMM APIに対応
+                try:
+                    from rmm.allocators.cupy import rmm_cupy_allocator
+                except ImportError:
+                    rmm_cupy_allocator = getattr(rmm, "rmm_cupy_allocator", None)
+                
+                if rmm_cupy_allocator:
+                    _cp.cuda.set_allocator(rmm_cupy_allocator)
+                    
             client.run(_enable_rmm_on_worker)
 
             logger.info("CuPy allocator switched to RMM – GPU memory is now managed by Dask")
