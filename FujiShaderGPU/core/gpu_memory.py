@@ -12,7 +12,12 @@ def get_gpu_context():
     if not hasattr(_thread_local, 'mempool'):
         try:
             import rmm
-            cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+            try:
+                from rmm.allocators.cupy import rmm_cupy_allocator
+            except ImportError:
+                rmm_cupy_allocator = getattr(rmm, "rmm_cupy_allocator", None)
+            if rmm_cupy_allocator:
+                cp.cuda.set_allocator(rmm_cupy_allocator)
         except ImportError:
             pass
 

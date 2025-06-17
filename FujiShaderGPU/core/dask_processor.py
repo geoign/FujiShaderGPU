@@ -89,7 +89,18 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
                 managed_memory=False,
                 initial_pool_size=f"{rmm_size}GB",
             )
-            cp.cuda.set_allocator(rmm.rmm_cupy_allocator)
+            # --- RMM ≥22.12 では allocator の import パスが変更 ---
+            try:
+                from rmm.allocators.cupy import rmm_cupy_allocator
+            except ImportError:                    # 旧バージョン fallback
+                rmm_cupy_allocator = getattr(rmm, "rmm_cupy_allocator", None)
+            if rmm_cupy_allocator is None:
+                raise RuntimeError(
+                    "RMM のバージョンが古いかインストールが不完全です。"
+                    "  'pip install --extra-index-url https://pypi.nvidia.com rmm-cu12==25.06.*' "
+                    "で再インストールしてください。"
+                )
+            cp.cuda.set_allocator(rmm_cupy_allocator)
 
             def _enable_rmm_on_worker():
                 import rmm, cupy as _cp
