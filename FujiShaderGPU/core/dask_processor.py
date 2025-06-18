@@ -80,9 +80,9 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
             # 利用可能メモリの50%程度を確保（安全マージンを持たせる）
-            rmm_size = int(available_gb * 0.7)  # 80%まで使用可能に
+            rmm_size = min(int(available_gb * 0.7), 20)  # 最大20GBに制限
         else:
-            rmm_size = int(available_gb * 0.6)  # 70%まで使用可能に
+            rmm_size = min(int(available_gb * 0.6), 12)  # より保守的に
         
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
