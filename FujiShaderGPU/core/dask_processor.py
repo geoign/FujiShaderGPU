@@ -16,12 +16,11 @@ from osgeo import gdal
 import cupy as cp
 import dask.array as da
 from dask_cuda import LocalCUDACluster
-from dask import delayed
+from dask import config as dask_config
 from dask.callbacks import Callback
 from dask.diagnostics import ProgressBar
 from dask.distributed import progress
-from distributed import Client, get_client, wait
-from distributed.worker import get_worker
+from distributed import Client, get_client
 import xarray as xr
 import rioxarray as rxr
 from tqdm.auto import tqdm
@@ -78,6 +77,9 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         else:
             rmm_size = min(int(gpu_memory_gb * 0.3), 18)  # 0.4→0.3、20GB→18GB
         
+        # Worker の terminate 閾値は Config で与える
+        dask_config.set({"distributed.worker.memory.terminate": "95%"})
+
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
             jit_unspill=True,
@@ -90,11 +92,12 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             rmm_maximum_pool_size=f"{int(gpu_memory_gb * 0.7)}GB",
             enable_cudf_spill=True,
             local_directory='/tmp',
-            memory_target_fraction=0.60,     # より早めにスピル開始
-            memory_spill_fraction=0.70,      # スピル閾値を下げる
-            memory_pause_fraction=0.80,      # pause閾値は維持
-            memory_terminate_fraction=0.95,  # terminate閾値は維持
+            memory_target_fraction=0.60,
+            memory_spill_fraction=0.70,
+            memory_pause_fraction=0.80,
+            # memory_terminate_fraction は渡さない
         )
+
         client = Client(cluster)
         try:
             import rmm, cupy as cp
