@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     """GPU メモリサイズに基づいて最適なチャンクサイズを計算"""
     # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
-    base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 20)
+    base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 15)
     # 512の倍数に丸める（COGブロックサイズとの整合性）
     if gpu_memory_gb >= 40:  # A100
         return min(16384, (base_chunk // 512) * 512)  # 最大8192に拡大
@@ -80,18 +80,18 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
             # 利用可能メモリの50%程度を確保（安全マージンを持たせる）
-            rmm_size = int(available_gb * 0.8)  # 80%まで使用可能に
+            rmm_size = int(available_gb * 0.7)  # 80%まで使用可能に
         else:
-            rmm_size = int(available_gb * 0.7)  # 70%まで使用可能に
+            rmm_size = int(available_gb * 0.6)  # 70%まで使用可能に
         
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
         dask_config.set({
             # ■ メモリしきい値
-            "distributed.worker.memory.target":     0.80,  # 80 % で spill 開始
-            "distributed.worker.memory.spill":      0.85,  # 85 % でディスク spill
-            "distributed.worker.memory.pause":      0.90,  # 90 % でタスク一時停止
-            "distributed.worker.memory.terminate":  0.98,  # 98 % でワーカ kill
+            "distributed.worker.memory.target":     0.70,  # 70 % で spill 開始
+            "distributed.worker.memory.spill":      0.75,  # 75 % でディスク spill
+            "distributed.worker.memory.pause":      0.85,  # 85 % でタスク一時停止
+            "distributed.worker.memory.terminate":  0.95,  # 95 % でワーカ kill
 
             # ■ イベントループ警告を 15 s まで黙らせる
             "distributed.admin.tick.limit": "15s",
