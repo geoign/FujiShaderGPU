@@ -44,12 +44,12 @@ logger = logging.getLogger(__name__)
 def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     """GPU メモリサイズに基づいて最適なチャンクサイズを計算"""
     # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
-    base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 10)
+    base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 20)
     # 512の倍数に丸める（COGブロックサイズとの整合性）
     if gpu_memory_gb >= 40:  # A100
-        return min(8192, (base_chunk // 512) * 512)  # 最大8192に拡大
+        return min(16384, (base_chunk // 512) * 512)  # 最大8192に拡大
     else:
-        return min(4096, (base_chunk // 512) * 512)  # その他は4096に拡大
+        return min(8192, (base_chunk // 512) * 512)  # その他は4096に拡大
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     try:
@@ -80,18 +80,18 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
             # 利用可能メモリの50%程度を確保（安全マージンを持たせる）
-            rmm_size = min(int(available_gb * 0.5), 20)  # 最大20GBに制限
+            rmm_size = int(available_gb * 0.8)  # 80%まで使用可能に
         else:
-            rmm_size = min(int(available_gb * 0.4), 12)  # より保守的に
+            rmm_size = int(available_gb * 0.7)  # 70%まで使用可能に
         
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
         dask_config.set({
             # ■ メモリしきい値
-            "distributed.worker.memory.target":     0.60,  # 60 % で spill 開始
-            "distributed.worker.memory.spill":      0.70,  # 70 % でディスク spill
-            "distributed.worker.memory.pause":      0.80,  # 80 % でタスク一時停止
-            "distributed.worker.memory.terminate":  0.95,  # 95 % でワーカ kill
+            "distributed.worker.memory.target":     0.80,  # 80 % で spill 開始
+            "distributed.worker.memory.spill":      0.85,  # 85 % でディスク spill
+            "distributed.worker.memory.pause":      0.90,  # 90 % でタスク一時停止
+            "distributed.worker.memory.terminate":  0.98,  # 98 % でワーカ kill
 
             # ■ イベントループ警告を 15 s まで黙らせる
             "distributed.admin.tick.limit": "15s",
@@ -101,21 +101,16 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         logging.getLogger("distributed.core").setLevel(logging.WARNING)
 
         cluster = LocalCUDACluster(
-            device_memory_limit=str(memory_fraction),
+            device_memory_limit="0.95",  # 95%まで使用可能に
             jit_unspill=True,
             rmm_pool_size=f"{rmm_size}GB",
             threads_per_worker=1,
             silence_logs=logging.WARNING,
             death_timeout="60s" if is_colab else "30s",
             interface="lo" if is_colab else None,
-            memory_limit='auto',
-            rmm_maximum_pool_size=f"{int(rmm_size * 1.5)}GB",
+            rmm_maximum_pool_size=f"{int(rmm_size * 1.2)}GB",  # より控えめに
             enable_cudf_spill=True,
             local_directory='/tmp',
-            memory_target_fraction=0.60,
-            memory_spill_fraction=0.70,
-            memory_pause_fraction=0.80,
-            # memory_terminate_fraction は渡さない
         )
 
         client = Client(cluster)
@@ -459,8 +454,26 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
     # データサイズをチェック
     total_gb = data.nbytes / (1024**3)
     
-    if total_gb > 10:  # 10GB以上の場合はチャンク処理
+    if total_gb > 50:  # 50GB以上の場合のみチャンク処理（閾値を上げる）
         logger.info(f"Large dataset ({total_gb:.1f} GB), using chunked writing")
+
+        # ストリーミング書き込みを試みる
+        try:
+            # Zarr経由での直接書き込み
+            logger.info("Attempting direct streaming write...")
+            with rasterio.Env(GDAL_CACHEMAX=4096):
+                data.rio.to_raster(
+                    dst,
+                    driver="COG" if use_cog_driver else "GTiff",
+                    windowed=True,  # ウィンドウ処理を有効化
+                    tiled=True,
+                    blockxsize=1024,
+                    blockysize=1024,
+                    **cog_options
+                )
+            return
+        except Exception as e:
+            logger.warning(f"Direct streaming failed: {e}, falling back to chunked write")
         
         # メモリ制限を考慮してチャンクサイズを動的に調整
         available_memory = cp.get_default_memory_pool().free_bytes() / (1024**3)
@@ -977,8 +990,15 @@ def run_pipeline(
 
         # より確実なクリーンアップ
         try:
-            # 全ワーカーでGCを実行
-            client.run(lambda: __import__('gc').collect())
+            # ワーカーのメモリを強制的にクリア
+            def clear_worker_memory():
+                import gc
+                import cupy as cp
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+                gc.collect()
+                return True   
+            client.run(clear_worker_memory)
             # clientを先に閉じて、完全に終了するまで待つ
             client.close(timeout=10)
             client.shutdown()  # 全てのワーカーとスケジューラーを確実に終了
