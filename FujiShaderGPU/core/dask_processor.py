@@ -84,6 +84,8 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             "distributed.worker.memory.spill":  0.70,     # 70% でディスク spill
             "distributed.worker.memory.pause":  0.80,     # 80% でタスク一時停止
             "distributed.worker.memory.terminate": 0.95,  # 95% でワーカ kill
+            "distributed.admin.event-loop.warning-duration": "20s",  # 4 s → 20 s に延長して不要な INFO スパムを抑制
+            "distributed.admin.event-loop.monitor-interval": "500ms", # 監視間隔も 100 ms → 500 ms に
         })
 
         cluster = LocalCUDACluster(
