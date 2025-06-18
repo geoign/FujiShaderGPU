@@ -78,7 +78,13 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             rmm_size = min(int(gpu_memory_gb * 0.3), 18)  # 0.4→0.3、20GB→18GB
         
         # Worker の terminate 閾値は Config で与える
-        dask_config.set({"distributed.worker.memory.terminate": "95%"})
+        # ────────── メモリ管理パラメータを Config で一括設定 ──────────
+        dask_config.set({
+            "distributed.worker.memory.target": 0.60,     # 60% で spill 開始
+            "distributed.worker.memory.spill":  0.70,     # 70% でディスク spill
+            "distributed.worker.memory.pause":  0.80,     # 80% でタスク一時停止
+            "distributed.worker.memory.terminate": 0.95,  # 95% でワーカ kill
+        })
 
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
