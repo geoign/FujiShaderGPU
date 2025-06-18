@@ -79,16 +79,32 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
-        dask_config.update(dask_config.config, {
-            "distributed.worker.memory.target": 0.60,
-            "distributed.worker.memory.spill":  0.70,
-            "distributed.worker.memory.pause":  0.80,
-            "distributed.worker.memory.terminate": 0.95,
-            "distributed.admin.event-loop.warning-duration": "12s",
-            "distributed.admin.event-loop.monitor-interval": "500ms",
-        }, priority='new')
+        dask_config.update(
+            dask_config.config,
+            {
+                "distributed": {
+                    "worker": {
+                        "memory": {
+                            "target": 0.60,      # 60% で spill 開始
+                            "spill":  0.70,      # 70% でディスク spill
+                            "pause":  0.80,      # 80% でタスク一時停止
+                            "terminate": 0.95,   # 95% でワーカ kill
+                        }
+                    },
+                    "admin": {
+                        # event-loop の既定 ("tornado") を
+                        # ↓ 辞書に差し替えて警告閾値を持たせる
+                        "event-loop": {
+                            "warning-duration": "12s",
+                            "monitor-interval": "500ms",
+                        }
+                    },
+                }
+            },
+            priority="new",
+        )
 
-        # distributed.coreのINFOログを抑制
+        # ────────── distributed.core の INFO スパムを抑制 ──────────
         logging.getLogger("distributed.core").setLevel(logging.WARNING)
 
         cluster = LocalCUDACluster(
