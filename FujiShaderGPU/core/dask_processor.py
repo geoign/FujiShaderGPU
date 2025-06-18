@@ -68,13 +68,21 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             logger.info(f"GPU detected: {gpus[0].name}, Memory: {gpu_memory_gb:.1f} GB")
         else:
             gpu_memory_gb = 40  # デフォルトA100想定
+
+        # 実際に利用可能なメモリを確認
+        try:
+            meminfo = cp.cuda.runtime.memGetInfo()
+            available_gb = meminfo[0] / (1024**3)
+            logger.info(f"Available GPU memory: {available_gb:.1f} GB")
+        except:
+            available_gb = gpu_memory_gb * 0.8  # フォールバック
         
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
-            # 修正: 最大値を増やし、より多くのメモリを使用可能にする
-            rmm_size = min(int(gpu_memory_gb * 0.6), 35)
+            # 利用可能メモリの50%程度を確保（安全マージンを持たせる）
+            rmm_size = min(int(available_gb * 0.5), 20)  # 最大20GBに制限
         else:
-            rmm_size = min(int(gpu_memory_gb * 0.5), 20)
+            rmm_size = min(int(available_gb * 0.4), 12)  # より保守的に
         
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
@@ -101,7 +109,7 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             death_timeout="60s" if is_colab else "30s",
             interface="lo" if is_colab else None,
             memory_limit='auto',
-            rmm_maximum_pool_size=f"{int(gpu_memory_gb * 0.7)}GB",
+            rmm_maximum_pool_size=f"{int(rmm_size * 1.5)}GB",
             enable_cudf_spill=True,
             local_directory='/tmp',
             memory_target_fraction=0.60,
