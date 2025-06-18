@@ -43,7 +43,7 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     # 512の倍数に丸める（COGブロックサイズとの整合性）
     # 修正: 大規模データの場合はチャンクサイズを制限
     if gpu_memory_gb >= 40:  # A100
-        return min(4096, (base_chunk // 512) * 512)  # 最大4096に制限
+        return min(3072, (base_chunk // 512) * 512)  # 最大3072に制限
     else:
         return min(2048, (base_chunk // 512) * 512)  # その他は2048に制限
 
@@ -69,9 +69,9 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
             # 修正: 最大値を増やし、より多くのメモリを使用可能にする
-            rmm_size = min(int(gpu_memory_gb * 0.5), 35)  # 0.3→0.5、20GB→35GB
+            rmm_size = min(int(gpu_memory_gb * 0.4), 30)  # 0.5→0.4、35GB→30GB
         else:
-            rmm_size = min(int(gpu_memory_gb * 0.4), 20)  # 0.25→0.4、上限も引き上げ
+            rmm_size = min(int(gpu_memory_gb * 0.3), 18)  # 0.4→0.3、20GB→18GB
         
         cluster = LocalCUDACluster(
             device_memory_limit=str(memory_fraction),
@@ -84,7 +84,7 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             interface="lo" if is_colab else None,
             # 大規模データ用の追加設定
             memory_limit='auto',  # ワーカーのCPUメモリ制限
-            rmm_maximum_pool_size=f"{int(gpu_memory_gb * 0.8)}GB",  # RMMプールの最大サイズ（無制限）
+            rmm_maximum_pool_size=f"{int(gpu_memory_gb * 0.7)}GB",  # 0.8→0.7
             enable_cudf_spill=True,  # GPU→CPUメモリへのスピル有効化
             local_directory='/tmp',  # スピル用ディレクトリ
         )
@@ -449,7 +449,7 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
             cp.get_default_pinned_memory_pool().free_all_blocks()
             import gc
             gc.collect()
-            
+
         # 一時ディレクトリ作成
         with tempfile.TemporaryDirectory() as tmpdir:
             # チャンクごとに処理
@@ -724,7 +724,7 @@ def run_pipeline(
                 
             # 巨大データの場合はより小さなチャンクを使用
             if total_gb > 50:  # 50GB以上
-                chunk = 2048
+                chunk = 1536
                 logger.info(f"Large dataset ({total_gb:.1f} GB), using smaller chunk size: {chunk}")
             else:
                 chunk = get_optimal_chunk_size()

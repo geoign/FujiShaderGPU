@@ -14,7 +14,7 @@ class Constants:
     DEFAULT_GAMMA = 1/2.2
     DEFAULT_AZIMUTH = 315
     DEFAULT_ALTITUDE = 45
-    MAX_DEPTH = 200
+    MAX_DEPTH = 150
     NAN_FILL_VALUE_POSITIVE = -1e6
     NAN_FILL_VALUE_NEGATIVE = 1e6
 
@@ -148,7 +148,7 @@ def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
 def determine_optimal_downsample_factor(
     data_shape: Tuple[int, int],
     algorithm_name: str = None,
-    target_pixels: int = 1000000,  # 目標ピクセル数（1000x1000）
+    target_pixels: int = 500000,  # 目標ピクセル数（1000x1000）
     min_factor: int = 5,
     max_factor: int = 100,
     algorithm_complexity: Dict[str, float] = None) -> int:
@@ -547,7 +547,7 @@ class RVIAlgorithm(DaskAlgorithm):
         )
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -617,7 +617,7 @@ def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str,
         hp = da.map_overlap(
             high_pass,
             gpu_arr,
-            depth=depth,
+            depth=min(depth, 100),
             boundary="reflect",
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
@@ -734,7 +734,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 results.append(hs)
 
             # 大規模データの場合、定期的にGCを実行（追加）
-            if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+            if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
                 import gc
                 gc.collect()
             
@@ -752,7 +752,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 return da.mean(stacked, axis=0)
         else:
             # 大規模データの場合、定期的にGCを実行（追加）
-            if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+            if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
                 import gc
                 gc.collect()
 
@@ -967,7 +967,7 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         )
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -1189,7 +1189,7 @@ class NPREdgesAlgorithm(DaskAlgorithm):
             depth = max(depth, int(edge_sigma * 4 + 2))
                         
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -1273,7 +1273,7 @@ class AtmosphericPerspectiveAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -1411,7 +1411,7 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -1498,7 +1498,7 @@ class TPIAlgorithm(DaskAlgorithm):
         )
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -1565,7 +1565,7 @@ class LRMAlgorithm(DaskAlgorithm):
         )
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -1676,7 +1676,7 @@ class OpennessAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
 
@@ -1744,7 +1744,7 @@ class SlopeAlgorithm(DaskAlgorithm):
             )
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -1864,7 +1864,7 @@ class SpecularAlgorithm(DaskAlgorithm):
         light_altitude = params.get('light_altitude', Constants.DEFAULT_ALTITUDE)
         
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
 
@@ -1952,7 +1952,7 @@ class AtmosphericScatteringAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -2119,7 +2119,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         )
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
 
@@ -2209,7 +2209,7 @@ class FrequencyEnhancementAlgorithm(DaskAlgorithm):
         )
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         
@@ -2305,7 +2305,7 @@ class CurvatureAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
 
         # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
 
@@ -2476,7 +2476,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         print(f"📊 Fractal dimension: μ={mean_D:.3f}, σ={std_D:.3f}")
         
         # 大規模データの場合、定期的にGCを実行
-        if gpu_arr.nbytes > 10 * 1024**3:  # 10GB以上
+        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
             import gc
             gc.collect()
         

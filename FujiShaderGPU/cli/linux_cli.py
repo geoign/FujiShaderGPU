@@ -63,7 +63,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         parser.add_argument(
             "--memory-fraction",
             type=float,
-            default=0.5,  # より保守的なデフォルト値に変更
+            default=0.4,  # より保守的なデフォルト値に変更
             help="GPU メモリ使用率 (default: 0.5)"  # ヘルプテキストも更新
         )
 
@@ -488,6 +488,9 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"]="0.7"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.6"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"]="0.8"
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE"]="0.95"
+        os.environ["DASK_DISTRIBUTED__SCHEDULER__WORK_STEALING"]="True"
+        os.environ["DASK_DISTRIBUTED__SCHEDULER__BANDWIDTH"]="100000000"  # 100MB/s
         # 追加: RMM環境変数
         gpus = GPUtil.getGPUs()
         if gpus:
