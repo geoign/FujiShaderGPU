@@ -9,17 +9,23 @@ Dask-CUDA地形解析処理のコア実装
 ###############################################################################
 from __future__ import annotations
 
-import os, subprocess, warnings, logging, rasterio, psutil, GPUtil
+import os, sys, time, subprocess, gc, warnings, logging, rasterio, psutil, GPUtil, tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional, Union
+from typing import List, Tuple, Optional
 from osgeo import gdal
 import cupy as cp
 import dask.array as da
 from dask_cuda import LocalCUDACluster
-from distributed import Client
+from dask import delayed
+from dask.callbacks import Callback
+from dask.diagnostics import ProgressBar
+from dask.distributed import progress
+from distributed import Client, get_client, wait
+from distributed.worker import get_worker
 import xarray as xr
 import rioxarray as rxr
 from tqdm.auto import tqdm
+
 
 # アルゴリズムのインポート
 try:
@@ -50,7 +56,6 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     try:
         # Google Colab環境の検出
-        import sys
         is_colab = 'google.colab' in sys.modules
         
         if is_colab:
@@ -251,9 +256,8 @@ def determine_optimal_radii(terrain_stats: dict) -> tuple[List[int], List[float]
     
     # 最大4つまでに制限
     if len(radii) > 4:
-        import numpy as np
         # 対数的に分布
-        indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
+        indices = cp.logspace(0, cp.log10(len(radii)-1), 4).astype(int)
         radii = [radii[i] for i in indices]
     
     # 重みの決定（小さいスケールを重視）
@@ -314,8 +318,7 @@ def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> Li
     
     # 最大3つまでに制限（メモリ効率のため、5→3に削減）
     if len(sigmas) > 3:
-        import numpy as np
-        indices = np.linspace(0, len(sigmas)-1, 3).astype(int)
+        indices = cp.linspace(0, len(sigmas)-1, 3).astype(int)
         sigmas = [sigmas[i] for i in indices]
     
     return [float(s) for s in sigmas]
@@ -348,7 +351,6 @@ def get_cog_options(dtype: str) -> dict:
 
 def check_gdal_version() -> tuple:
     """GDAL バージョンをチェック"""
-    import osgeo.gdal as gdal
     version = gdal.VersionInfo("VERSION_NUM")
     major = int(version[0])
     minor = int(version[1:3])
@@ -372,10 +374,7 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                 if show_progress:
                     # より詳細な進捗表示
                     logger.info("Computing result chunks...")
-                    # tqdmを使用した進捗表示
-                    from tqdm.auto import tqdm
-                    from dask.callbacks import Callback
-                    
+                    # tqdmを使用した進捗表示                    
                     class TqdmCallback(Callback):
                         def __init__(self):
                             self.tqdm = None
@@ -426,10 +425,7 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
         _fallback_cog_write(data, dst, cog_options)
 
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
-    """大規模データ対応のチャンク単位COG書き出し"""
-    import tempfile
-    from rasterio.merge import merge
-    
+    """大規模データ対応のチャンク単位COG書き出し"""   
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
     dtype_str = str(data.dtype)
@@ -447,8 +443,13 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
             # より積極的なメモリ解放
             cp.get_default_memory_pool().free_all_blocks()
             cp.get_default_pinned_memory_pool().free_all_blocks()
-            import gc
             gc.collect()
+            # Daskワーカーのメモリも解放
+            try:
+                client = get_client()
+                client.run(lambda: gc.collect())
+            except:
+                pass
 
         # 一時ディレクトリ作成
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -467,7 +468,6 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                     return
                 
                 # 進捗表示の準備
-                from tqdm.auto import tqdm
                 total_chunks = delayed_chunks.shape[0] * delayed_chunks.shape[1]
                 
                 # チャンクの形状を保持しながら処理
@@ -531,10 +531,8 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 
                                 # 5チャンクごとに完全なガベージコレクション
                                 if chunk_idx % 5 == 0:
-                                    import gc
                                     gc.collect()
                                     # Daskワーカーのメモリも解放
-                                    from distributed.worker import get_worker
                                     try:
                                         worker = get_worker()
                                         worker.memory_manager.memory_pause_fraction = 0.7  # より早めにpause
@@ -596,9 +594,7 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
         tiff_options = {k: v for k, v in cog_options.items() 
                        if k not in ['OVERVIEWS', 'OVERVIEW_RESAMPLING']}
         
-        # 進捗表示付きで計算してから書き込み
-        from dask.diagnostics import ProgressBar
-        
+        # 進捗表示付きで計算してから書き込み        
         logger.info("Computing result...")
         with ProgressBar():
             computed_data = data.compute()
@@ -872,8 +868,7 @@ def run_pipeline(
             logger.info("Processing data chunks...")
             
             # 大規模データ対応：チャンクごとに計算して即座にメモリ解放
-            from dask.distributed import progress
-            from dask import delayed
+            
             
             # データサイズに基づいて処理方法を決定
             total_gb = result_cpu.nbytes / (1024**3)
@@ -881,23 +876,44 @@ def run_pipeline(
             if total_gb > 20:  # 20GB以上の場合は特別な処理
                 logger.info(f"Large dataset ({total_gb:.1f} GB), using memory-efficient processing")
                 
-                # チャンクごとに計算してすぐにメモリを解放
-                result_cpu = result_cpu.persist(scheduler='threads')  # ローカルスレッドで処理
+                # distributed clientを使ってチャンク単位で処理
+                # persistの代わりにcompute_chunk_sizesを使用
+                
+                # スケジューラーの競合を避ける
+                result_cpu = client.persist(result_cpu, optimize_graph=True)
+
+                # 計算の進捗を表示
+                progress(result_cpu, interval='1s')
+
+                # 計算完了を待機
+                wait(result_cpu)
                 
                 # 定期的なメモリクリーンアップを追加
-                import gc
                 gc.collect()
                 cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+                
+                # 全ワーカーでGCを実行
+                client.run(lambda: __import__('gc').collect())
+                client.run(lambda: __import__('cupy').get_default_memory_pool().free_all_blocks())
+
             else:
                 # 通常サイズの場合は従来の処理
-                result_future = client.persist(result_cpu)
+                result_future = client.persist(result_cpu, optimize_graph=True)
                 progress(result_future, interval='1s')
                 result_cpu = result_future
         else:
             # 進捗表示なしでも同様の処理
             total_gb = result_cpu.nbytes / (1024**3)
             if total_gb > 20:
-                result_cpu = result_cpu.persist(scheduler='threads')
+                result_cpu = client.persist(result_cpu, optimize_graph=True)
+                from distributed import wait
+                wait(result_cpu)
+                # メモリクリーンアップ
+                import gc
+                gc.collect()
+                cp.get_default_memory_pool().free_all_blocks()
+                client.run(lambda: __import__('gc').collect())
             else:
                 result_cpu = result_cpu.persist()
     
@@ -966,10 +982,7 @@ def run_pipeline(
         
         # 6‑6) 出力 (直接 COG)
         write_cog_da_chunked(result_da, Path(dst_cog), show_progress=show_progress)
-        
         logger.info("Pipeline completed successfully!")
-
-        import gc
         gc.collect()
         
     except Exception as e:
@@ -984,19 +997,22 @@ def run_pipeline(
 
         # より確実なクリーンアップ
         try:
+            # 全ワーカーでGCを実行
+            client.run(lambda: __import__('gc').collect())
             # clientを先に閉じて、完全に終了するまで待つ
-            client.close()
+            client.close(timeout=10)
             client.shutdown()  # 全てのワーカーとスケジューラーを確実に終了
         except Exception as e:
             logger.debug(f"Client shutdown warning (can be ignored): {e}")
         
         try:
             # clusterの終了（既に終了している可能性があるので例外を無視）
-            cluster.close()
+            cluster.close(timeout=10)
         except Exception as e:
             logger.debug(f"Cluster close warning (can be ignored): {e}")
         
         # Daskワーカープロセスの確実な終了を待つ
-        import time
-        time.sleep(2)
-
+        time.sleep(3)
+        
+        # 最終的なGC
+        gc.collect()
