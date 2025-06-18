@@ -46,11 +46,10 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
     base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 10)
     # 512の倍数に丸める（COGブロックサイズとの整合性）
-    # 修正: 大規模データの場合はチャンクサイズを制限
     if gpu_memory_gb >= 40:  # A100
-        return min(3072, (base_chunk // 512) * 512)  # 最大3072に制限
+        return min(8192, (base_chunk // 512) * 512)  # 最大8192に拡大
     else:
-        return min(2048, (base_chunk // 512) * 512)  # その他は2048に制限
+        return min(4096, (base_chunk // 512) * 512)  # その他は4096に拡大
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     try:
@@ -73,9 +72,9 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
             # 修正: 最大値を増やし、より多くのメモリを使用可能にする
-            rmm_size = min(int(gpu_memory_gb * 0.4), 30)  # 0.5→0.4、35GB→30GB
+            rmm_size = min(int(gpu_memory_gb * 0.6), 35)
         else:
-            rmm_size = min(int(gpu_memory_gb * 0.3), 18)  # 0.4→0.3、20GB→18GB
+            rmm_size = min(int(gpu_memory_gb * 0.5), 20)
         
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
@@ -543,27 +542,9 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 del chunk_data, chunk_da
                                 chunk_idx += 1
 
-                                # より積極的なメモリ解放（毎チャンク後）
-                                cp.get_default_memory_pool().free_all_blocks()
-                                cp.get_default_pinned_memory_pool().free_all_blocks()
-                                
-                                # 5チャンクごとに完全なガベージコレクション
-                                if chunk_idx % 3 == 0:  # 3チャンクごとに
-                                    gc.collect()
-                                    try:
-                                        from distributed import get_worker
-                                        worker = get_worker()
-                                        # メモリ使用量を確認して動的に調整
-                                        memory_usage = worker.memory_manager.memory
-                                        memory_limit = worker.memory_manager.memory_limit
-                                        if memory_usage / memory_limit > 0.6:
-                                            # メモリ使用率が60%を超えたら、より積極的にクリーンアップ
-                                            cp.get_default_memory_pool().free_all_blocks()
-                                            gc.collect()
-                                            # 一時的にpause閾値を下げる
-                                            worker.memory_manager.memory_pause_fraction = 0.65
-                                    except:
-                                        pass
+                                # 10チャンクごとに軽量クリーンアップ
+                                if chunk_idx % 10 == 0:
+                                    cp.get_default_memory_pool().free_all_blocks()
                                 
                                 # 進捗更新
                                 pbar.update(1)

@@ -288,24 +288,7 @@ def compute_global_stats(gpu_arr: da.Array,
     # 統計量を計算
     stats = stat_func(result_small)
     
-    # CuPyのメモリプールをクリア
     result_small = None
-    cp.get_default_memory_pool().free_all_blocks()
-    cp.get_default_pinned_memory_pool().free_all_blocks()
-    cp.cuda.Stream.null.synchronize()
-
-    # Daskワーカーのメモリも解放
-    try:
-        from distributed import get_client
-        client = get_client()
-        client.run(lambda: __import__('cupy').get_default_memory_pool().free_all_blocks())
-        client.run(lambda: __import__('gc').collect())
-    except:
-        pass
-
-    # Pythonのガベージコレクションも実行
-    gc.collect()
-    
     return stats
 
 def apply_global_normalization(block: cp.ndarray, 
@@ -492,10 +475,6 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
         
         # メモリを即座に解放
         del mean_elev, diff
-        
-        # 大きなブロックの場合は毎回メモリクリーンアップ
-        if block.nbytes > 50 * 1024 * 1024:  # 50MB以上
-            cp.get_default_memory_pool().free_all_blocks()
     
     # NaN処理
     rvi_combined = restore_nan(rvi_combined, nan_mask)
@@ -553,11 +532,6 @@ class RVIAlgorithm(DaskAlgorithm):
             params.get('downsample_factor', None),
             depth=max_radius * 2 + 1
         )
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         # 正規化を適用
         return rvi.map_blocks(
@@ -740,11 +714,6 @@ class HillshadeAlgorithm(DaskAlgorithm):
                     pixel_size=pixel_size
                 )
                 results.append(hs)
-
-            # 大規模データの場合、定期的にGCを実行（追加）
-            if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-                import gc
-                gc.collect()
             
             # 集約
             stacked = da.stack(results, axis=0)
@@ -759,11 +728,6 @@ class HillshadeAlgorithm(DaskAlgorithm):
             else:
                 return da.mean(stacked, axis=0)
         else:
-            # 大規模データの場合、定期的にGCを実行（追加）
-            if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-                import gc
-                gc.collect()
-
             # 単一スケールHillshade
             return gpu_arr.map_overlap(
                 compute_hillshade_block,
@@ -973,11 +937,6 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
             downsample_factor=params.get('downsample_factor', None),
             depth=int(max_scale * 8)
         )
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         # フルサイズで処理
         return gpu_arr.map_overlap(
@@ -1195,11 +1154,6 @@ class NPREdgesAlgorithm(DaskAlgorithm):
         
         if edge_sigma != 1.0:
             depth = max(depth, int(edge_sigma * 4 + 2))
-                        
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         return gpu_arr.map_overlap(
             compute_npr_edges_block,
@@ -1279,11 +1233,6 @@ class AtmosphericPerspectiveAlgorithm(DaskAlgorithm):
         depth_scale = params.get('depth_scale', 1000.0)
         haze_strength = params.get('haze_strength', 0.7)
         pixel_size = params.get('pixel_size', 1.0)
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         return gpu_arr.map_overlap(
             compute_atmospheric_perspective_block,
@@ -1417,11 +1366,6 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         radius = params.get('radius', 10.0)
         intensity = params.get('intensity', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         # 修正: radiusをピクセル単位として扱うので、pixel_sizeで除算しない
         # ユーザーが指定するradiusは既にピクセル単位
@@ -1504,11 +1448,6 @@ class TPIAlgorithm(DaskAlgorithm):
             downsample_factor=None,
             depth=radius+1
         )
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         return gpu_arr.map_overlap(
             compute_tpi_block,
@@ -1571,11 +1510,6 @@ class LRMAlgorithm(DaskAlgorithm):
             downsample_factor=None,
             depth=int(kernel_size * 2)
         )
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         return gpu_arr.map_overlap(
             compute_lrm_block,
@@ -1683,11 +1617,6 @@ class OpennessAlgorithm(DaskAlgorithm):
         num_directions = params.get('num_directions', 16)
         pixel_size = params.get('pixel_size', 1.0)
 
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
-
         return gpu_arr.map_overlap(
             compute_openness_vectorized,  # ベクトル化版を使用
             depth=max_distance+1,
@@ -1750,11 +1679,6 @@ class SlopeAlgorithm(DaskAlgorithm):
                 downsample_factor=None,
                 depth=1
             )
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         return gpu_arr.map_overlap(
             compute_slope_block,
@@ -1870,11 +1794,6 @@ class SpecularAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
         light_azimuth = params.get('light_azimuth', Constants.DEFAULT_AZIMUTH)
         light_altitude = params.get('light_altitude', Constants.DEFAULT_ALTITUDE)
-        
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
 
         return gpu_arr.map_overlap(
             compute_specular_block,
@@ -1958,11 +1877,6 @@ class AtmosphericScatteringAlgorithm(DaskAlgorithm):
         scattering_strength = params.get('scattering_strength', 0.5)
         intensity = params.get('intensity', None)
         pixel_size = params.get('pixel_size', 1.0)
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         return gpu_arr.map_overlap(
             compute_atmospheric_scattering_block,
@@ -2125,12 +2039,6 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32)
         )
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
-
         return combined
     
     def get_default_params(self) -> dict:
@@ -2215,11 +2123,6 @@ class FrequencyEnhancementAlgorithm(DaskAlgorithm):
             downsample_factor=None,
             depth=32
         )
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         return gpu_arr.map_overlap(
             enhance_frequency_block,
@@ -2311,11 +2214,6 @@ class CurvatureAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         curvature_type = params.get('curvature_type', 'mean')
         pixel_size = params.get('pixel_size', 1.0)
-
-        # 大規模データの場合、定期的にGCを実行（追加）
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
 
         return gpu_arr.map_overlap(
             compute_curvature_block,
@@ -2482,11 +2380,6 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         
         mean_D, std_D = stats
         print(f"📊 Fractal dimension: μ={mean_D:.3f}, σ={std_D:.3f}")
-        
-        # 大規模データの場合、定期的にGCを実行
-        if gpu_arr.nbytes > 5 * 1024**3:  # 5GB以上
-            import gc
-            gc.collect()
         
         # フルサイズで処理（正規化あり）
         return gpu_arr.map_overlap(
