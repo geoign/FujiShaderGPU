@@ -488,13 +488,14 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"]="0.7"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.6"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"]="0.8"
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE"]="0.95"
-        os.environ["DASK_DISTRIBUTED__SCHEDULER__WORK_STEALING"]="True"
-        os.environ["DASK_DISTRIBUTED__SCHEDULER__BANDWIDTH"]="100000000"  # 100MB/s
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"]="0.6"
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.5"
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"]="0.75"
+        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE"]="0.90"
         os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT"]="30s"
         os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP"]="60s"
         os.environ["DASK_DISTRIBUTED__DEPLOY__LOST_WORKER_TIMEOUT"]="60s"
-        
+
         # 追加: RMM環境変数
         gpus = GPUtil.getGPUs()
         if gpus:

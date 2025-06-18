@@ -4,7 +4,7 @@ FujiShaderGPU/algorithms/dask_algorithms.py
 from __future__ import annotations
 from typing import List, Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
-
+import gc
 import cupy as cp
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation
@@ -289,13 +289,21 @@ def compute_global_stats(gpu_arr: da.Array,
     stats = stat_func(result_small)
     
     # CuPyのメモリプールをクリア
-    result_small = None  # 参照を切る
+    result_small = None
     cp.get_default_memory_pool().free_all_blocks()
     cp.get_default_pinned_memory_pool().free_all_blocks()
-    cp.cuda.Stream.null.synchronize()  # GPU処理の完了を待つ
-    
+    cp.cuda.Stream.null.synchronize()
+
+    # Daskワーカーのメモリも解放
+    try:
+        from distributed import get_client
+        client = get_client()
+        client.run(lambda: __import__('cupy').get_default_memory_pool().free_all_blocks())
+        client.run(lambda: __import__('gc').collect())
+    except:
+        pass
+
     # Pythonのガベージコレクションも実行
-    import gc
     gc.collect()
     
     return stats

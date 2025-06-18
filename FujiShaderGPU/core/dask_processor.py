@@ -82,16 +82,18 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             device_memory_limit=str(memory_fraction),
             jit_unspill=True,
             rmm_pool_size=f"{rmm_size}GB",
-            threads_per_worker=1,  # メモリ競合を避ける
+            threads_per_worker=1,
             silence_logs=logging.WARNING,
-            # Colab環境用の追加設定
             death_timeout="60s" if is_colab else "30s",
             interface="lo" if is_colab else None,
-            # 大規模データ用の追加設定
-            memory_limit='auto',  # ワーカーのCPUメモリ制限
-            rmm_maximum_pool_size=f"{int(gpu_memory_gb * 0.7)}GB",  # 0.8→0.7
-            enable_cudf_spill=True,  # GPU→CPUメモリへのスピル有効化
-            local_directory='/tmp',  # スピル用ディレクトリ
+            memory_limit='auto',
+            rmm_maximum_pool_size=f"{int(gpu_memory_gb * 0.7)}GB",
+            enable_cudf_spill=True,
+            local_directory='/tmp',
+            memory_target_fraction=0.60,     # より早めにスピル開始
+            memory_spill_fraction=0.70,      # スピル閾値を下げる
+            memory_pause_fraction=0.80,      # pause閾値は維持
+            memory_terminate_fraction=0.95,  # terminate閾値は維持
         )
         client = Client(cluster)
         try:
@@ -332,7 +334,7 @@ def get_cog_options(dtype: str) -> dict:
     """データ型に応じた最適なCOGオプションを返す"""
     base_options = {
         "COMPRESS": "ZSTD",
-        "LEVEL": "1",
+        "LEVEL": "6",
         "BLOCKSIZE": "512",
         "OVERVIEWS": "AUTO",
         "OVERVIEW_RESAMPLING": "NEAREST",
@@ -530,12 +532,20 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
                                 cp.get_default_pinned_memory_pool().free_all_blocks()
                                 
                                 # 5チャンクごとに完全なガベージコレクション
-                                if chunk_idx % 5 == 0:
+                                if chunk_idx % 3 == 0:  # 3チャンクごとに
                                     gc.collect()
-                                    # Daskワーカーのメモリも解放
                                     try:
+                                        from distributed import get_worker
                                         worker = get_worker()
-                                        worker.memory_manager.memory_pause_fraction = 0.7  # より早めにpause
+                                        # メモリ使用量を確認して動的に調整
+                                        memory_usage = worker.memory_manager.memory
+                                        memory_limit = worker.memory_manager.memory_limit
+                                        if memory_usage / memory_limit > 0.6:
+                                            # メモリ使用率が60%を超えたら、より積極的にクリーンアップ
+                                            cp.get_default_memory_pool().free_all_blocks()
+                                            gc.collect()
+                                            # 一時的にpause閾値を下げる
+                                            worker.memory_manager.memory_pause_fraction = 0.65
                                     except:
                                         pass
                                 
@@ -713,18 +723,21 @@ def run_pipeline(
     try:
         # チャンクサイズの自動決定
         if chunk is None:
-            # データサイズを先に確認
             with rasterio.open(src_cog) as src:
                 total_pixels = src.width * src.height
-                total_gb = (total_pixels * 4) / (1024**3)  # float32として計算
+                total_gb = (total_pixels * 4) / (1024**3)
                 
-            # 巨大データの場合はより小さなチャンクを使用
-            if total_gb > 50:  # 50GB以上
+            # より細かい段階的な調整
+            if total_gb > 100:  # 100GB以上
+                chunk = 1024
+            elif total_gb > 50:  # 50-100GB
                 chunk = 1536
-                logger.info(f"Large dataset ({total_gb:.1f} GB), using smaller chunk size: {chunk}")
+            elif total_gb > 20:  # 20-50GB
+                chunk = 2048
             else:
                 chunk = get_optimal_chunk_size()
-                logger.info(f"Auto-selected chunk size: {chunk}x{chunk}")
+            
+            logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
         
         # 6‑1) DEM 遅延ロード
         with warnings.catch_warnings():
@@ -864,58 +877,20 @@ def run_pipeline(
         )
 
         # 進捗表示付きで計算を実行
-        if show_progress:
-            logger.info("Processing data chunks...")
-            
-            # 大規模データ対応：チャンクごとに計算して即座にメモリ解放
-            
-            
-            # データサイズに基づいて処理方法を決定
-            total_gb = result_cpu.nbytes / (1024**3)
-            
-            if total_gb > 20:  # 20GB以上の場合は特別な処理
-                logger.info(f"Large dataset ({total_gb:.1f} GB), using memory-efficient processing")
-                
-                # distributed clientを使ってチャンク単位で処理
-                # persistの代わりにcompute_chunk_sizesを使用
-                
-                # スケジューラーの競合を避ける
+        # ────────── GPU→CPU 変換後の計算トリガ ──────────
+        # 20 GB を超える場合は persist をスキップし、
+        # write_cog_da_chunked() によるストリーム計算に任せる。
+        total_gb = result_cpu.nbytes / (1024**3)
+        if total_gb <= 20:
+            if show_progress:
+                logger.info("Persisting small dataset for faster workflow")
                 result_cpu = client.persist(result_cpu, optimize_graph=True)
-
-                # 計算の進捗を表示
                 progress(result_cpu, interval='1s')
-
-                # 計算完了を待機
-                wait(result_cpu)
-                
-                # 定期的なメモリクリーンアップを追加
-                gc.collect()
-                cp.get_default_memory_pool().free_all_blocks()
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-                
-                # 全ワーカーでGCを実行
-                client.run(lambda: __import__('gc').collect())
-                client.run(lambda: __import__('cupy').get_default_memory_pool().free_all_blocks())
-
-            else:
-                # 通常サイズの場合は従来の処理
-                result_future = client.persist(result_cpu, optimize_graph=True)
-                progress(result_future, interval='1s')
-                result_cpu = result_future
-        else:
-            # 進捗表示なしでも同様の処理
-            total_gb = result_cpu.nbytes / (1024**3)
-            if total_gb > 20:
-                result_cpu = client.persist(result_cpu, optimize_graph=True)
-                from distributed import wait
-                wait(result_cpu)
-                # メモリクリーンアップ
-                import gc
-                gc.collect()
-                cp.get_default_memory_pool().free_all_blocks()
-                client.run(lambda: __import__('gc').collect())
             else:
                 result_cpu = result_cpu.persist()
+        else:
+            logger.info(f"Large dataset ({total_gb:.1f} GB) – skip persist; "
+                        "chunked writer will stream-compute each tile")
     
         # 6‑5) xarray ラップ（改善：座標構築の簡略化）
         if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
