@@ -47,10 +47,16 @@ def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
     # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
     base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 15)
     # 512の倍数に丸める（COGブロックサイズとの整合性）
-    if gpu_memory_gb >= 40:  # A100
-        return min(16384, (base_chunk // 512) * 512)  # 最大8192に拡大
+    if 20 > gpu_memory_gb >= 10: # T4(16GB)
+        return 1024
+    elif 30 > gpu_memory_gb >= 20: # L4(24GB)
+        return 2048
+    elif 50 > gpu_memory_gb >= 30:  # A100(40GB)
+        return 8192
+    elif gpu_memory_gb >= 70: # Ultra-high-end(80GB and more)
+        return 16384
     else:
-        return min(8192, (base_chunk // 512) * 512)  # その他は4096に拡大
+        return min(8192, (base_chunk // 512) * 512)
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     try:
