@@ -459,16 +459,12 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
 
         # ストリーミング書き込みを試みる
         try:
-            # 直接書き込み
             logger.info("Attempting direct streaming write...")
             
-            # ストリーミング用のCOGオプションを準備
             streaming_options = cog_options.copy()
-            # BLOCKSIZEが設定されている場合は削除（個別に指定するため）
             if 'BLOCKSIZE' in streaming_options:
                 del streaming_options['BLOCKSIZE']
             
-            # タイル関連のオプションを追加
             streaming_options.update({
                 'TILED': 'YES',
                 'BLOCKXSIZE': '1024',
@@ -476,12 +472,42 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
             })
             
             with rasterio.Env(GDAL_CACHEMAX=4096):
-                data.rio.to_raster(
-                    dst,
-                    driver="COG" if use_cog_driver else "GTiff",
-                    windowed=True,  # ウィンドウ処理を有効化
-                    **streaming_options
-                )
+                if show_progress:
+                    # TqdmCallbackを使用
+                    class StreamingProgressCallback(Callback):
+                        def __init__(self):
+                            self.tqdm = None
+                            
+                        def _start(self, dsk):
+                            self.tqdm = tqdm(
+                                total=len(dsk), 
+                                desc='Streaming to COG', 
+                                unit='chunks',
+                                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+                            )
+                            
+                        def _posttask(self, key, result, dsk, state, worker_id):
+                            self.tqdm.update(1)
+                            
+                        def _finish(self, dsk, state, failed):
+                            self.tqdm.close()
+                    
+                    with StreamingProgressCallback():
+                        data.rio.to_raster(
+                            dst,
+                            driver="COG" if use_cog_driver else "GTiff",
+                            windowed=True,
+                            **streaming_options
+                        )
+                else:
+                    data.rio.to_raster(
+                        dst,
+                        driver="COG" if use_cog_driver else "GTiff",
+                        windowed=True,
+                        **streaming_options
+                    )
+            
+            logger.info("Direct streaming write completed successfully")
             return
         except Exception as e:
             logger.warning(f"Direct streaming failed: {e}, falling back to chunked write")
