@@ -459,17 +459,28 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
 
         # ストリーミング書き込みを試みる
         try:
-            # Zarr経由での直接書き込み
+            # 直接書き込み
             logger.info("Attempting direct streaming write...")
+            
+            # ストリーミング用のCOGオプションを準備
+            streaming_options = cog_options.copy()
+            # BLOCKSIZEが設定されている場合は削除（個別に指定するため）
+            if 'BLOCKSIZE' in streaming_options:
+                del streaming_options['BLOCKSIZE']
+            
+            # タイル関連のオプションを追加
+            streaming_options.update({
+                'TILED': 'YES',
+                'BLOCKXSIZE': '1024',
+                'BLOCKYSIZE': '1024'
+            })
+            
             with rasterio.Env(GDAL_CACHEMAX=4096):
                 data.rio.to_raster(
                     dst,
                     driver="COG" if use_cog_driver else "GTiff",
                     windowed=True,  # ウィンドウ処理を有効化
-                    tiled=True,
-                    blockxsize=1024,
-                    blockysize=1024,
-                    **cog_options
+                    **streaming_options
                 )
             return
         except Exception as e:
