@@ -444,211 +444,202 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
         logger.warning(f"GDAL {major}.{minor} < 3.8, using fallback method")
         _fallback_cog_write(data, dst, cog_options)
 
-def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
-    """大規模データ対応のチャンク単位COG書き出し"""   
+def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: bool = True):
+    """大規模データ用のチャンク単位書き込み実装"""
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
     dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
-    # データサイズをチェック
-    total_gb = data.nbytes / (1024**3)
-    
-    if total_gb > 50:  # 50GB以上の場合のみチャンク処理（閾値を上げる）
-        logger.info(f"Large dataset ({total_gb:.1f} GB), using chunked writing")
-
-        # ストリーミング書き込みを試みる
+    # メモリ制限を考慮してチャンクサイズを動的に調整
+    available_memory = cp.get_default_memory_pool().free_bytes() / (1024**3)
+    if available_memory < 10:  # 利用可能メモリが10GB未満
+        # より積極的なメモリ解放
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+        gc.collect()
+        # Daskワーカーのメモリも解放
         try:
-            logger.info("Attempting direct streaming write...")
-            
-            streaming_options = cog_options.copy()
-            if 'BLOCKSIZE' in streaming_options:
-                del streaming_options['BLOCKSIZE']
-            
-            streaming_options.update({
-                'TILED': 'YES',
-                'BLOCKXSIZE': '1024',
-                'BLOCKYSIZE': '1024'
-            })
-            
-            with rasterio.Env(GDAL_CACHEMAX=4096):
-                if show_progress:
-                    # TqdmCallbackを使用
-                    class StreamingProgressCallback(Callback):
-                        def __init__(self):
-                            self.tqdm = None
-                            
-                        def _start(self, dsk):
-                            self.tqdm = tqdm(
-                                total=len(dsk), 
-                                desc='Streaming to COG', 
-                                unit='chunks',
-                                bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
-                            )
-                            
-                        def _posttask(self, key, result, dsk, state, worker_id):
-                            self.tqdm.update(1)
-                            
-                        def _finish(self, dsk, state, failed):
-                            self.tqdm.close()
-                    
-                    with StreamingProgressCallback():
-                        data.rio.to_raster(
-                            dst,
-                            driver="COG" if use_cog_driver else "GTiff",
-                            windowed=True,
-                            **streaming_options
-                        )
-                else:
-                    data.rio.to_raster(
-                        dst,
-                        driver="COG" if use_cog_driver else "GTiff",
-                        windowed=True,
-                        **streaming_options
-                    )
-            
-            logger.info("Direct streaming write completed successfully")
-            return
-        except Exception as e:
-            logger.warning(f"Direct streaming failed: {e}, falling back to chunked write")
+            client = get_client()
+            client.run(lambda: gc.collect())
+        except:
+            pass
+
+    # 一時ディレクトリ作成
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # チャンクごとに処理
+        chunk_files = []
         
-        # メモリ制限を考慮してチャンクサイズを動的に調整
-        available_memory = cp.get_default_memory_pool().free_bytes() / (1024**3)
-        if available_memory < 10:  # 利用可能メモリが10GB未満
-            # より積極的なメモリ解放
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-            gc.collect()
-            # Daskワーカーのメモリも解放
-            try:
-                client = get_client()
-                client.run(lambda: gc.collect())
-            except:
-                pass
-
-        # 一時ディレクトリ作成
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # チャンクごとに処理
-            chunk_files = []
+        # Dask配列のチャンクを取得
+        if hasattr(data.data, 'to_delayed'):
+            # data.dataがDask配列の場合
+            delayed_chunks = data.data.to_delayed()
             
-            # Dask配列のチャンクを取得
-            if hasattr(data.data, 'to_delayed'):
-                # data.dataがDask配列の場合
-                delayed_chunks = data.data.to_delayed()
-                
-                # チャンク情報の検証
-                if not hasattr(data, 'chunks') or data.chunks is None:
-                    logger.warning("No chunk information found, falling back to regular processing")
-                    _write_cog_da_original(data, dst, show_progress)
-                    return
-                
-                # 進捗表示の準備
-                total_chunks = delayed_chunks.shape[0] * delayed_chunks.shape[1]
-                
-                # チャンクの形状を保持しながら処理
-                chunk_idx = 0
-                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
-                    for i in range(delayed_chunks.shape[0]):
-                        for j in range(delayed_chunks.shape[1]):
-                            chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
-                            try:
-                                # チャンクを計算
-                                chunk_data = delayed_chunks[i, j].compute()
-                                
-                                # チャンクの実際のサイズを取得
-                                chunk_height, chunk_width = chunk_data.shape
-                                
-                                # チャンクの開始位置を計算
-                                y_start = sum(data.chunks[0][:i])
-                                x_start = sum(data.chunks[1][:j])
-                                
-                                # チャンクの終了位置を計算
-                                y_end = y_start + chunk_height
-                                x_end = x_start + chunk_width
-                                
-                                # 座標のスライスを作成
-                                y_slice = slice(y_start, y_end)
-                                x_slice = slice(x_start, x_end)
-                                
-                                # チャンクをDataArrayとして作成
-                                chunk_da = xr.DataArray(
-                                    chunk_data,
-                                    dims=data.dims,
-                                    coords={
-                                        data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
-                                        data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
-                                    },
-                                    attrs=data.attrs
-                                )
-
-                                # 座標参照系を設定（存在する場合のみ）
-                                if hasattr(data, 'rio') and data.rio.crs is not None:
-                                    chunk_da.rio.write_crs(data.rio.crs, inplace=True)
-                                
-                                # チャンクをGeoTIFFとして保存
-                                chunk_da.rio.to_raster(
-                                    chunk_file,
-                                    driver="GTiff",
-                                    compress="ZSTD",
-                                    tiled=True,
-                                    blockxsize=512,
-                                    blockysize=512
-                                )
-                                chunk_files.append(chunk_file)
-                                
-                                # メモリ解放
-                                del chunk_data, chunk_da
-                                chunk_idx += 1
-
-                                # 10チャンクごとに軽量クリーンアップ
-                                if chunk_idx % 10 == 0:
-                                    cp.get_default_memory_pool().free_all_blocks()
-                                
-                                # 進捗更新
-                                pbar.update(1)
-                                pbar.set_postfix({"saved": f"{len(chunk_files)}", "size_MB": f"{os.path.getsize(chunk_file)/(1024**2):.1f}"})
-                                
-                            except Exception as e:
-                                logger.error(f"Failed to process chunk {i},{j}: {e}")
-                                raise
-            else:
-                # Dask配列でない場合は通常の処理にフォールバック
-                logger.info("Data is not chunked with Dask, falling back to regular processing")
+            # チャンク情報の検証
+            if not hasattr(data, 'chunks') or data.chunks is None:
+                logger.warning("No chunk information found, falling back to regular processing")
                 _write_cog_da_original(data, dst, show_progress)
                 return
-                
-            # VRTで統合してCOGに変換
-            if not chunk_files:
-                raise ValueError("No chunks were successfully processed")
-                
-            logger.info(f"Creating VRT from {len(chunk_files)} chunks...")
-            vrt_file = Path(tmpdir) / "merged.vrt"
-            gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
             
-            # COGに変換
-            logger.info("Converting to COG format...")
+            # 進捗表示の準備
+            total_chunks = delayed_chunks.shape[0] * delayed_chunks.shape[1]
             
-            # GDALの進捗コールバック
-            def gdal_progress_callback(complete, message, cb_data):
-                if not hasattr(gdal_progress_callback, 'pbar'):
-                    gdal_progress_callback.pbar = tqdm(total=100, desc="COG conversion", unit="%")
-                gdal_progress_callback.pbar.n = int(complete * 100)
-                gdal_progress_callback.pbar.refresh()
-                if complete >= 1.0:
-                    gdal_progress_callback.pbar.close()
-                return 1
+            # チャンクの形状を保持しながら処理
+            chunk_idx = 0
+            with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                for i in range(delayed_chunks.shape[0]):
+                    for j in range(delayed_chunks.shape[1]):
+                        chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
+                        try:
+                            # チャンクを計算
+                            chunk_data = delayed_chunks[i, j].compute()
+                            
+                            # チャンクの実際のサイズを取得
+                            chunk_height, chunk_width = chunk_data.shape
+                            
+                            # チャンクの開始位置を計算
+                            y_start = sum(data.chunks[0][:i])
+                            x_start = sum(data.chunks[1][:j])
+                            
+                            # チャンクの終了位置を計算
+                            y_end = y_start + chunk_height
+                            x_end = x_start + chunk_width
+                            
+                            # 座標のスライスを作成
+                            y_slice = slice(y_start, y_end)
+                            x_slice = slice(x_start, x_end)
+                            
+                            # チャンクをDataArrayとして作成
+                            chunk_da = xr.DataArray(
+                                chunk_data,
+                                dims=data.dims,
+                                coords={
+                                    data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
+                                    data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
+                                },
+                                attrs=data.attrs
+                            )
+
+                            # 座標参照系を設定（存在する場合のみ）
+                            if hasattr(data, 'rio') and data.rio.crs is not None:
+                                chunk_da.rio.write_crs(data.rio.crs, inplace=True)
+                            
+                            # チャンクをGeoTIFFとして保存
+                            chunk_da.rio.to_raster(
+                                chunk_file,
+                                driver="GTiff",
+                                compress="ZSTD",
+                                tiled=True,
+                                blockxsize=512,
+                                blockysize=512
+                            )
+                            chunk_files.append(chunk_file)
+                            
+                            # メモリ解放
+                            del chunk_data, chunk_da
+                            chunk_idx += 1
+
+                            # 10チャンクごとに軽量クリーンアップ
+                            if chunk_idx % 10 == 0:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            
+                            # 進捗更新
+                            pbar.update(1)
+                            pbar.set_postfix({"saved": f"{len(chunk_files)}", "size_MB": f"{os.path.getsize(chunk_file)/(1024**2):.1f}"})
+                            
+                        except Exception as e:
+                            logger.error(f"Failed to process chunk {i},{j}: {e}")
+                            raise
+        else:
+            # Dask配列でない場合は通常の処理にフォールバック
+            logger.info("Data is not chunked with Dask, falling back to regular processing")
+            _write_cog_da_original(data, dst, show_progress)
+            return
             
-            gdal.Translate(
-                str(dst),
-                str(vrt_file),
-                format="COG" if use_cog_driver else "GTiff",
-                creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
-                callback=gdal_progress_callback
-            )
+        # VRTで統合してCOGに変換
+        if not chunk_files:
+            raise ValueError("No chunks were successfully processed")
             
-            logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
+        logger.info(f"Creating VRT from {len(chunk_files)} chunks...")
+        vrt_file = Path(tmpdir) / "merged.vrt"
+        gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
+        
+        # COGに変換
+        logger.info("Converting to COG format...")
+        
+        # GDALの進捗コールバック
+        def gdal_progress_callback(complete, message, cb_data):
+            if not hasattr(gdal_progress_callback, 'pbar'):
+                gdal_progress_callback.pbar = tqdm(total=100, desc="COG conversion", unit="%")
+            gdal_progress_callback.pbar.n = int(complete * 100)
+            gdal_progress_callback.pbar.refresh()
+            if complete >= 1.0:
+                gdal_progress_callback.pbar.close()
+            return 1
+        
+        gdal.Translate(
+            str(dst),
+            str(vrt_file),
+            format="COG" if use_cog_driver else "GTiff",
+            creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
+            callback=gdal_progress_callback
+        )
+        
+        logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
+
+def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
+    """COG書き出し（メモリ容量に応じて自動選択）"""
+    total_gb = data.nbytes / (1024**3)
+    
+    # システムメモリに基づいて閾値を自動決定
+    mem_info = psutil.virtual_memory()
+    total_ram_gb = mem_info.total / (1024**3)
+    available_ram_gb = mem_info.available / (1024**3)
+    
+    # Google Colab環境の検出
+    is_colab = 'google.colab' in sys.modules
+    
+    # 安全係数の設定
+    if is_colab:
+        # Colabは保守的に（利用可能メモリの40%）
+        safety_factor = 0.4
+        # ただし、最低でも20GB、最高でも60GBに制限
+        min_threshold = 20
+        max_threshold = 60
     else:
-        # 既存の処理
+        # ローカル環境はもう少し積極的に（60%）
+        safety_factor = 0.6
+        min_threshold = 30
+        max_threshold = 100
+    
+    # 閾値の計算
+    # 現在利用可能なメモリベースで計算（より現実的）
+    chunk_threshold = available_ram_gb * safety_factor
+    
+    # 範囲内に収める
+    chunk_threshold = max(min_threshold, min(chunk_threshold, max_threshold))
+    
+    # ログ出力
+    logger.info(f"System RAM: {total_ram_gb:.1f}GB total, {available_ram_gb:.1f}GB available")
+    logger.info(f"Memory threshold: {chunk_threshold:.1f}GB (safety factor: {safety_factor*100:.0f}%)")
+    
+    # GPU情報も参考に表示
+    try:
+        meminfo = cp.cuda.runtime.memGetInfo()
+        vram_free_gb = meminfo[0] / (1024**3)
+        vram_total_gb = meminfo[1] / (1024**3)
+        logger.info(f"GPU VRAM: {vram_total_gb:.1f}GB total, {vram_free_gb:.1f}GB free")
+    except:
+        pass
+    
+    # データサイズと閾値の比較
+    if total_gb > chunk_threshold:
+        logger.info(f"Large dataset ({total_gb:.1f}GB) > threshold ({chunk_threshold:.1f}GB)")
+        logger.info("Using chunked writing to avoid memory issues")
+        _write_cog_da_chunked_impl(data, dst, show_progress)
+    else:
+        logger.info(f"Dataset ({total_gb:.1f}GB) <= threshold ({chunk_threshold:.1f}GB)")
+        logger.info("Using direct writing for better performance")
         _write_cog_da_original(data, dst, show_progress)
 
 def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
@@ -690,7 +681,7 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
         tmp.unlink(missing_ok=True)
 
 ###############################################################################
-# 5. gdal_translate/gdaladdo フォールバック関数（改善版）
+# 5. gdal_translate/gdaladdo フォールバック関数
 ###############################################################################
 
 def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
@@ -728,7 +719,7 @@ def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
         raise
 
 ###############################################################################
-# 6. メインパイプライン（改善版）
+# 6. メインパイプライン
 ###############################################################################
 
 def validate_inputs(src_cog: str, sigmas: Optional[List[float]] = None):
@@ -1019,7 +1010,7 @@ def run_pipeline(
         logger.error(f"Pipeline failed: {e}")
         raise
     finally:
-        # CuPyメモリプールの明示的なクリア（追加）
+        # CuPyメモリプールの明示的なクリア
         mempool = cp.get_default_memory_pool()
         pinned_mempool = cp.get_default_pinned_memory_pool()
         mempool.free_all_blocks()

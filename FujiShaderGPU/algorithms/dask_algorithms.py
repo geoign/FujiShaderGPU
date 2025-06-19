@@ -4,7 +4,6 @@ FujiShaderGPU/algorithms/dask_algorithms.py
 from __future__ import annotations
 from typing import List, Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
-import gc
 import cupy as cp
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation
