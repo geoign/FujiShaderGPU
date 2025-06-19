@@ -5,9 +5,9 @@ from __future__ import annotations
 from typing import List, Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
 import cupy as cp
+import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation
-from tqdm.auto import tqdm
 
 class Constants:
     DEFAULT_GAMMA = 1/2.2
@@ -191,6 +191,7 @@ def determine_optimal_downsample_factor(
             'tpi': 1.0,                    # 畳み込み処理
             'lrm': 1.1,                    # ガウシアンフィルタ
             'openness': 1.8,               # 多方向探索
+            'fractal_anomaly': 1.6,        # マルチスケール回帰計算
         }
     
     # 現在のピクセル数
@@ -286,8 +287,7 @@ def compute_global_stats(gpu_arr: da.Array,
     
     # 統計量を計算
     stats = stat_func(result_small)
-    
-    result_small = None
+
     return stats
 
 def apply_global_normalization(block: cp.ndarray, 
@@ -481,9 +481,9 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
     return rvi_combined
 
 
-def multiscale_rvi_efficient(gpu_arr: da.Array, *, 
-                            radii: List[int], 
-                            weights: Optional[List[float]] = None) -> da.Array:
+def multiscale_rvi(gpu_arr: da.Array, *, 
+                   radii: List[int], 
+                   weights: Optional[List[float]] = None) -> da.Array:
     """効率的なマルチスケールRVI（Dask版）"""
     
     if not radii:
@@ -520,7 +520,7 @@ class RVIAlgorithm(DaskAlgorithm):
             pixel_size = params.get('pixel_size', 1.0)
             radii = self._determine_optimal_radii(pixel_size)
         max_radius = max(radii)
-        rvi = multiscale_rvi_efficient(gpu_arr, radii=radii, weights=weights)
+        rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights)
         
         # グローバル統計を使用 統計量を計算
         stats = compute_global_stats(
@@ -557,10 +557,9 @@ class RVIAlgorithm(DaskAlgorithm):
         # 最大4つまでに制限
         if len(radii) > 4:
             # 対数的に分布するように選択
-            # CuPy配列をPythonリストに変換してからアクセス
-            indices = cp.logspace(0, cp.log10(len(radii)-1), 4).astype(int)
-            indices_list = indices.get()  # CuPy配列をホストメモリ（NumPy配列）に転送
-            radii = [radii[int(i)] for i in indices_list]
+            # NumPyを使用してCPU上で計算（小さな配列なのでGPU転送のオーバーヘッドを避ける）
+            indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
+            radii = [radii[int(i)] for i in indices]
         
         return radii
     
@@ -573,63 +572,6 @@ class RVIAlgorithm(DaskAlgorithm):
             'agg': 'mean',     # 従来モード用（互換性）
             'auto_sigma': False,  # 従来のsigma自動決定は無効化
         }
-
-###############################################################################
-# 4. マルチスケール計算 (sigma 複数 → 集約) - 改善版
-###############################################################################
-
-def multiscale_rvi(gpu_arr: da.Array, *, sigmas: List[float], agg: str, 
-                   show_progress: bool = True) -> da.Array:
-    """複数 σ の RVI を計算し、集約 (メモリ効率版)"""
-    
-    # 最初のsigmaで初期化
-    if not sigmas:
-        raise ValueError("At least one sigma value is required")
-    
-    iterator = tqdm(sigmas, desc="Computing scales") if show_progress else sigmas
-    
-    result = None
-    
-    for i, sigma in enumerate(iterator):
-        # 大きなsigmaに対してdepthを制限
-        depth = min(int(4 * sigma), Constants.MAX_DEPTH)  # 最大depth=200に制限
-        
-        # 各sigmaを個別に計算（メモリ効率向上）
-        hp = da.map_overlap(
-            high_pass,
-            gpu_arr,
-            depth=min(depth, 100),
-            boundary="reflect",
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            sigma=sigma,
-        )
-        
-        if i == 0:
-            # 最初のsigma
-            if agg == "stack":
-                result = da.expand_dims(hp, axis=0)
-            else:
-                result = hp
-        else:
-            # 2番目以降のsigma
-            if agg == "stack":
-                result = da.concatenate([result, da.expand_dims(hp, axis=0)], axis=0)
-            elif agg == "mean":
-                result = (result * i + hp) / (i + 1)  # 累積平均
-            elif agg == "min":
-                result = da.minimum(result, hp)
-            elif agg == "max":
-                result = da.maximum(result, hp)
-            elif agg == "sum":
-                result = result + hp
-            else:
-                raise ValueError(f"Unknown aggregation method: {agg}")
-        
-        # メモリクリーンアップ
-        del hp
-    
-    return result
     
 ###############################################################################
 # 2.2. Hillshade アルゴリズム
@@ -1822,7 +1764,7 @@ class SpecularAlgorithm(DaskAlgorithm):
 
 def compute_atmospheric_scattering_block(block: cp.ndarray, *, 
                                        scattering_strength: float = 0.5,
-                                       intensity: float | None = None,
+                                       intensity: Optional[float] = None,
                                        pixel_size: float = 1.0) -> cp.ndarray:
     """大気散乱によるシェーディング（Rayleigh散乱の簡略版）"""
     # intensity は scattering_strength のエイリアス（後方互換）

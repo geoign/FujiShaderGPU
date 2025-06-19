@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 from osgeo import gdal
 import cupy as cp
+import numpy as np
 import dask.array as da
 from dask_cuda import LocalCUDACluster
 from dask import config as dask_config
@@ -79,7 +80,6 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         
         # RMMプールサイズを動的に調整
         if gpu_memory_gb >= 40:  # A100
-            # 利用可能メモリの50%程度を確保（安全マージンを持たせる）
             rmm_size = min(int(available_gb * 0.7), 20)  # 最大20GBに制限
         else:
             rmm_size = min(int(available_gb * 0.6), 12)  # より保守的に
@@ -239,11 +239,18 @@ def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.0
                 dominant_scales = [float(1.0 / (f + 1e-10)) for f in dominant_freqs if f > 0.01]
             else:
                 dominant_scales = []
+            stats['dominant_scales'] = dominant_scales
         else:
             dominant_scales = []
+            stats['dominant_scales'] = []
+            stats['dominant_freqs'] = []
+    else:
+        stats['dominant_scales'] = []
+        stats['dominant_freqs'] = []
+        stats['mean_curvature'] = 0.0
     return stats
 
-def determine_optimal_radii(terrain_stats: dict) -> tuple[List[int], List[float]]:
+def determine_optimal_radii(terrain_stats: dict) -> Tuple[List[int], List[float]]:
     """地形統計に基づいて最適な半径を決定"""
     pixel_size = terrain_stats.get('pixel_size', 1.0)
     mean_slope = terrain_stats['mean_slope']
@@ -277,8 +284,8 @@ def determine_optimal_radii(terrain_stats: dict) -> tuple[List[int], List[float]
     # 最大4つまでに制限
     if len(radii) > 4:
         # 対数的に分布
-        indices = cp.logspace(0, cp.log10(len(radii)-1), 4).astype(int)
-        radii = [radii[i] for i in indices]
+        indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
+        radii = [radii[int(i)] for i in indices]
     
     # 重みの決定（小さいスケールを重視）
     weights = []
@@ -313,7 +320,7 @@ def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> Li
         base_scales = [25, 50, 100, 200]
     
     # 2. FFT解析から得られたスケールを追加
-    if terrain_stats['dominant_scales']:
+    if terrain_stats.get('dominant_scales', []):
         for scale in terrain_stats['dominant_scales']:
             if 10 < scale < 500:  # 現実的な範囲のスケールのみ
                 # Gaussianフィルタのsigmaは、検出されたスケールの約1/4
@@ -465,127 +472,146 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         except:
             pass
 
-    # 一時ディレクトリ作成
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # チャンクごとに処理
-        chunk_files = []
+    # DRAMの空き容量を確認してプリフェッチを有効化
+    mem_info = psutil.virtual_memory()
+    available_ram_gb = mem_info.available / (1024**3)
+    
+    if available_ram_gb > 20:  # 20GB以上空いている場合
+        logger.info(f"Enabling chunk prefetching (available DRAM: {available_ram_gb:.1f}GB)")
         
-        # Dask配列のチャンクを取得
-        if hasattr(data.data, 'to_delayed'):
-            # data.dataがDask配列の場合
-            delayed_chunks = data.data.to_delayed()
+        # Daskのスケジューラーヒントを設定
+        prefetch_config = {
+            "optimization.fuse.active": False,  # チャンクの融合を無効化
+            "distributed.worker.memory.pause": 0.90,  # メモリ使用率90%まで許可
+            "distributed.worker.memory.spill": 0.95,  # 95%でスピル
+        }
+    else:
+        logger.info(f"Prefetching disabled (available DRAM: {available_ram_gb:.1f}GB < 20GB)")
+        prefetch_config = {}
+    
+    # プリフェッチ設定を適用してチャンク処理を実行
+    with dask_config.set(prefetch_config):
+
+        # 一時ディレクトリ作成
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # チャンクごとに処理
+            chunk_files = []
             
-            # チャンク情報の検証
-            if not hasattr(data, 'chunks') or data.chunks is None:
-                logger.warning("No chunk information found, falling back to regular processing")
+            # Dask配列のチャンクを取得
+            if hasattr(data.data, 'to_delayed'):
+                # data.dataがDask配列の場合
+                delayed_chunks = data.data.to_delayed()
+                
+                # チャンク情報の検証
+                if not hasattr(data, 'chunks') or data.chunks is None:
+                    logger.warning("No chunk information found, falling back to regular processing")
+                    _write_cog_da_original(data, dst, show_progress)
+                    return
+                
+                # 進捗表示の準備
+                total_chunks = delayed_chunks.shape[0] * delayed_chunks.shape[1]
+                
+                # チャンクの形状を保持しながら処理
+                chunk_idx = 0
+                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                    for i in range(delayed_chunks.shape[0]):
+                        for j in range(delayed_chunks.shape[1]):
+                            chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
+                            try:
+                                # チャンクを計算
+                                chunk_data = delayed_chunks[i, j].compute()
+                                
+                                # チャンクの実際のサイズを取得
+                                chunk_height, chunk_width = chunk_data.shape
+                                
+                                # チャンクの開始位置を計算
+                                y_start = sum(data.chunks[0][:i])
+                                x_start = sum(data.chunks[1][:j])
+                                
+                                # チャンクの終了位置を計算
+                                y_end = y_start + chunk_height
+                                x_end = x_start + chunk_width
+                                
+                                # 座標のスライスを作成
+                                y_slice = slice(y_start, y_end)
+                                x_slice = slice(x_start, x_end)
+                                
+                                # チャンクをDataArrayとして作成
+                                chunk_da = xr.DataArray(
+                                    chunk_data,
+                                    dims=data.dims,
+                                    coords={
+                                        data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
+                                        data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
+                                    },
+                                    attrs=data.attrs
+                                )
+
+                                # 座標参照系を設定（存在する場合のみ）
+                                if hasattr(data, 'rio') and data.rio.crs is not None:
+                                    chunk_da.rio.write_crs(data.rio.crs, inplace=True)
+                                
+                                # チャンクをGeoTIFFとして保存
+                                chunk_da.rio.to_raster(
+                                    chunk_file,
+                                    driver="GTiff",
+                                    compress="ZSTD",
+                                    tiled=True,
+                                    blockxsize=512,
+                                    blockysize=512
+                                )
+                                chunk_files.append(chunk_file)
+                                
+                                # メモリ解放
+                                del chunk_data, chunk_da
+                                chunk_idx += 1
+
+                                # 10チャンクごとに軽量クリーンアップ
+                                if chunk_idx % 10 == 0:
+                                    cp.get_default_memory_pool().free_all_blocks()
+                                
+                                # 進捗更新
+                                pbar.update(1)
+                                pbar.set_postfix({"saved": f"{len(chunk_files)}", "size_MB": f"{os.path.getsize(chunk_file)/(1024**2):.1f}"})
+                                
+                            except Exception as e:
+                                logger.error(f"Failed to process chunk {i},{j}: {e}")
+                                raise
+            else:
+                # Dask配列でない場合は通常の処理にフォールバック
+                logger.info("Data is not chunked with Dask, falling back to regular processing")
                 _write_cog_da_original(data, dst, show_progress)
                 return
+                
+            # VRTで統合してCOGに変換
+            if not chunk_files:
+                raise ValueError("No chunks were successfully processed")
+                
+            logger.info(f"Creating VRT from {len(chunk_files)} chunks...")
+            vrt_file = Path(tmpdir) / "merged.vrt"
+            gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
             
-            # 進捗表示の準備
-            total_chunks = delayed_chunks.shape[0] * delayed_chunks.shape[1]
+            # COGに変換
+            logger.info("Converting to COG format...")
             
-            # チャンクの形状を保持しながら処理
-            chunk_idx = 0
-            with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
-                for i in range(delayed_chunks.shape[0]):
-                    for j in range(delayed_chunks.shape[1]):
-                        chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
-                        try:
-                            # チャンクを計算
-                            chunk_data = delayed_chunks[i, j].compute()
-                            
-                            # チャンクの実際のサイズを取得
-                            chunk_height, chunk_width = chunk_data.shape
-                            
-                            # チャンクの開始位置を計算
-                            y_start = sum(data.chunks[0][:i])
-                            x_start = sum(data.chunks[1][:j])
-                            
-                            # チャンクの終了位置を計算
-                            y_end = y_start + chunk_height
-                            x_end = x_start + chunk_width
-                            
-                            # 座標のスライスを作成
-                            y_slice = slice(y_start, y_end)
-                            x_slice = slice(x_start, x_end)
-                            
-                            # チャンクをDataArrayとして作成
-                            chunk_da = xr.DataArray(
-                                chunk_data,
-                                dims=data.dims,
-                                coords={
-                                    data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
-                                    data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
-                                },
-                                attrs=data.attrs
-                            )
-
-                            # 座標参照系を設定（存在する場合のみ）
-                            if hasattr(data, 'rio') and data.rio.crs is not None:
-                                chunk_da.rio.write_crs(data.rio.crs, inplace=True)
-                            
-                            # チャンクをGeoTIFFとして保存
-                            chunk_da.rio.to_raster(
-                                chunk_file,
-                                driver="GTiff",
-                                compress="ZSTD",
-                                tiled=True,
-                                blockxsize=512,
-                                blockysize=512
-                            )
-                            chunk_files.append(chunk_file)
-                            
-                            # メモリ解放
-                            del chunk_data, chunk_da
-                            chunk_idx += 1
-
-                            # 10チャンクごとに軽量クリーンアップ
-                            if chunk_idx % 10 == 0:
-                                cp.get_default_memory_pool().free_all_blocks()
-                            
-                            # 進捗更新
-                            pbar.update(1)
-                            pbar.set_postfix({"saved": f"{len(chunk_files)}", "size_MB": f"{os.path.getsize(chunk_file)/(1024**2):.1f}"})
-                            
-                        except Exception as e:
-                            logger.error(f"Failed to process chunk {i},{j}: {e}")
-                            raise
-        else:
-            # Dask配列でない場合は通常の処理にフォールバック
-            logger.info("Data is not chunked with Dask, falling back to regular processing")
-            _write_cog_da_original(data, dst, show_progress)
-            return
+            # GDALの進捗コールバック
+            pbar = tqdm(total=100, desc="COG conversion", unit="%")
+            def gdal_progress_callback(complete, message, cb_data):
+                pbar.n = int(complete * 100)
+                pbar.refresh()
+                if complete >= 1.0:
+                    pbar.close()
+                return 1
             
-        # VRTで統合してCOGに変換
-        if not chunk_files:
-            raise ValueError("No chunks were successfully processed")
+            gdal.Translate(
+                str(dst),
+                str(vrt_file),
+                format="COG" if use_cog_driver else "GTiff",
+                creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
+                callback=gdal_progress_callback
+            )
             
-        logger.info(f"Creating VRT from {len(chunk_files)} chunks...")
-        vrt_file = Path(tmpdir) / "merged.vrt"
-        gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
-        
-        # COGに変換
-        logger.info("Converting to COG format...")
-        
-        # GDALの進捗コールバック
-        def gdal_progress_callback(complete, message, cb_data):
-            if not hasattr(gdal_progress_callback, 'pbar'):
-                gdal_progress_callback.pbar = tqdm(total=100, desc="COG conversion", unit="%")
-            gdal_progress_callback.pbar.n = int(complete * 100)
-            gdal_progress_callback.pbar.refresh()
-            if complete >= 1.0:
-                gdal_progress_callback.pbar.close()
-            return 1
-        
-        gdal.Translate(
-            str(dst),
-            str(vrt_file),
-            format="COG" if use_cog_driver else "GTiff",
-            creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
-            callback=gdal_progress_callback
-        )
-        
-        logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
+            logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
 
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """COG書き出し（メモリ容量に応じて自動選択）"""
@@ -840,7 +866,8 @@ def run_pipeline(
                 logger.info("Analyzing terrain for automatic radii determination...")
                 
                 # 地形解析
-                terrain_stats = analyze_terrain_characteristics(gpu_arr, pixel_size, include_fft=False)
+                terrain_stats = analyze_terrain_characteristics(gpu_arr, sample_ratio=0.01, include_fft=False)
+                terrain_stats['pixel_size'] = pixel_size
                 
                 # 最適な半径を決定
                 radii, weights = determine_optimal_radii(terrain_stats)
