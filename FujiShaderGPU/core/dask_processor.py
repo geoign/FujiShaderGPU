@@ -352,6 +352,11 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
         dtype_str = str(data.data.dtype)
     else:
         dtype_str = str(data.dtype)
+        
+    # NumPy dtypeオブジェクトの場合は名前を取得
+    if hasattr(dtype_str, 'name'):
+        dtype_str = dtype_str.name
+
     cog_options = get_cog_options(dtype_str)
     
     if not hasattr(data, 'rio') or data.rio.crs is None:
@@ -899,10 +904,30 @@ def run_pipeline(
         result_gpu: da.Array = algo.process(gpu_arr, **params)
 
         # 6-4) GPU→CPU 戻し（改善：明示的なdtype）
+        # アルゴリズムが返すdtypeを保持
+        if hasattr(result_gpu, 'dtype'):
+            output_dtype = result_gpu.dtype
+        else:
+            output_dtype = cp.float32  # フォールバック
+            
+        # NumPy型に変換
+        if output_dtype == cp.int16:
+            numpy_dtype = "int16"
+        elif output_dtype == cp.int32:
+            numpy_dtype = "int32"  
+        elif output_dtype == cp.uint16:
+            numpy_dtype = "uint16"
+        elif output_dtype == cp.uint32:
+            numpy_dtype = "uint32"
+        elif output_dtype == cp.float64:
+            numpy_dtype = "float64"
+        else:
+            numpy_dtype = "float32"  # デフォルト
+
         result_cpu = result_gpu.map_blocks(
             cp.asnumpy, 
-            dtype="float32",
-            meta=cp.empty((0, 0), dtype=cp.float32).get()
+            dtype=numpy_dtype,
+            meta=cp.empty((0, 0), dtype=output_dtype).get()
         )
 
         # 進捗表示付きで計算を実行
