@@ -347,7 +347,11 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
     
-    dtype_str = str(data.dtype)
+    # Dask配列の場合は、実際のdtypeを正しく取得
+    if hasattr(data.data, 'dtype'):
+        dtype_str = str(data.data.dtype)
+    else:
+        dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
     if not hasattr(data, 'rio') or data.rio.crs is None:
@@ -410,7 +414,12 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
     """大規模データ用のチャンク単位書き込み実装（改善版：windowed writing）"""
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
-    dtype_str = str(data.dtype)
+    
+    # Dask配列の場合は、実際のdtypeを正しく取得
+    if hasattr(data.data, 'dtype'):
+        dtype_str = str(data.data.dtype)
+    else:
+        dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
     # メモリ制限を考慮してチャンクサイズを動的に調整（既存のコードと同じ）
