@@ -265,7 +265,7 @@ def determine_optimal_downsample_factor(
     adjusted_factor = base_factor * complexity
     
     # 整数化して範囲内に収める
-    downsample_factor = int(cp.clip(adjusted_factor, min_factor, max_factor))
+    downsample_factor = int(max(min_factor, min(adjusted_factor, max_factor)))
     
     # データが小さい場合は係数を小さくする
     if current_pixels < 1_000_000:  # 1Mピクセル未満
