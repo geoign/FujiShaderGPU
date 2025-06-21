@@ -155,10 +155,10 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         dask_config.set({
             # ■ メモリしきい値
             # 環境変数で設定されていない場合のみデフォルト値を設定
-            "distributed.worker.memory.target": os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__TARGET", "0.70"),
-            "distributed.worker.memory.spill": os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__SPILL", "0.75"),
-            "distributed.worker.memory.pause": os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE", "0.85"),
-            "distributed.worker.memory.terminate": os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE", "0.95"),
+            "distributed.worker.memory.target": float(os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__TARGET", "0.70")),
+            "distributed.worker.memory.spill": float(os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__SPILL", "0.75")),
+            "distributed.worker.memory.pause": float(os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE", "0.85")),
+            "distributed.worker.memory.terminate": float(os.environ.get("DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE", "0.95")),
 
             # ■ イベントループ警告を 15 s まで黙らせる
             "distributed.admin.tick.limit": "15s",
