@@ -6,6 +6,7 @@ from typing import List, Optional
 import os, argparse, rasterio, GPUtil
 import numpy as np
 from .base import BaseCLI
+from ..core.dask_processor import run_pipeline
 
 class LinuxCLI(BaseCLI):
     """Linux環境向けCLI実装（Dask-CUDA処理）"""
@@ -63,8 +64,8 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         parser.add_argument(
             "--memory-fraction",
             type=float,
-            default=0.4,  # より保守的なデフォルト値に変更
-            help="GPU メモリ使用率 (default: 0.5)"  # ヘルプテキストも更新
+            default=0.6,
+            help="GPU メモリ使用率 (default: 0.6)"
         )
 
         parser.add_argument(
@@ -383,15 +384,24 @@ Cloud-Optimized GeoTIFF として書き出します。"""
     def parse_args(self, args: Optional[List[str]] = None) -> argparse.Namespace:
         """引数をパース（基底クラスをオーバーライド）"""
         parsed_args = super().parse_args(args)
+
+        # 共通パターンを関数化
+        def parse_comma_list(value_str, type_func, error_msg):
+            if value_str:
+                try:
+                    return [type_func(v.strip()) for v in value_str.split(",")]
+                except ValueError:
+                    self.parser.error(error_msg)
+            return None
+
+        if hasattr(parsed_args, 'auto_sigma') and not hasattr(parsed_args, 'no_auto_sigma'):
+            parsed_args.no_auto_sigma = False
         
-        # radiiのパース（属性の存在チェックを追加）
-        if hasattr(parsed_args, 'radii') and parsed_args.radii:
-            try:
-                parsed_args.radii_list = [int(r.strip()) for r in parsed_args.radii.split(",")]
-            except ValueError:
-                self.parser.error("無効なradii形式です。カンマ区切りの整数を指定してください: 4,16,64,256")
-        else:
-            parsed_args.radii_list = None
+        if hasattr(parsed_args, 'radii'):
+            parsed_args.radii_list = parse_comma_list(
+                parsed_args.radii, int,
+                "無効なradii形式です。カンマ区切りの整数を指定してください: 4,16,64,256"
+            )
         
         # weightsのパース（属性の存在チェックを追加）
         if hasattr(parsed_args, 'weights') and parsed_args.weights:
@@ -467,11 +477,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             args.auto_fractal_radii = args.auto_fractal_radii and not args.no_auto_fractal_radii
         
         # RVIでradii/sigmaが未指定かつ自動決定も無効の場合エラー
-        if args.algorithm == "rvi":
-            # use_sigma_modeのデフォルト値を設定
-            if not hasattr(args, 'use_sigma_mode'):
-                args.use_sigma_mode = False
-                
+        if args.algorithm == "rvi":               
             if args.use_sigma_mode:
                 # 従来モード
                 # sigma_listはbase.pyのparse_argsで設定されるので、そちらを使用
@@ -485,20 +491,17 @@ Cloud-Optimized GeoTIFF として書き出します。"""
 
     def execute(self, args: argparse.Namespace):
         """Dask-CUDA処理を実行"""
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.70"
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"]="0.75"
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"]="0.85"
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE"]="0.95"
         os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT"]="30s"
         os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP"]="60s"
         os.environ["DASK_DISTRIBUTED__DEPLOY__LOST_WORKER_TIMEOUT"]="60s"
 
-        # 追加: RMM環境変数
+        # RMM環境変数を設定
         gpus = GPUtil.getGPUs()
         if gpus:
             gpu_memory_gb = gpus[0].memoryTotal / 1024
         else:
             gpu_memory_gb = 40  # デフォルトA100想定
+        
         if gpu_memory_gb >= 40:
             os.environ["RMM_ALLOCATOR"]="pool"
             os.environ["RMM_POOL_SIZE"]="35GB"  # A100の場合
@@ -508,7 +511,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         params = self.get_common_params(args)
 
         # pixel_sizeの自動取得（指定されていない場合）
-        if not hasattr(args, 'pixel_size') or args.pixel_size is None:
+        if getattr(args, 'pixel_size', None) is None:
             with rasterio.open(params['input_path']) as src:
                 # CRSをチェック
                 if src.crs and src.crs.is_geographic:
@@ -705,59 +708,8 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'fractal_radii_list') and args.fractal_radii_list:
                 algo_params['radii'] = args.fractal_radii_list
 
-        # RVI用ログ出力
-        if args.algorithm == "rvi":
-            if args.use_sigma_mode:
-                # Sigmaモード
-                rvi_params = {
-                    'mode': 'sigma',
-                    'sigmas': params['sigma_list'],
-                    'radii': None,
-                    'weights': None,
-                    'auto_sigma': getattr(args, 'auto_sigma', False),
-                    'auto_radii': False,
-                    'agg': getattr(args, 'agg', 'mean'),
-                }
-            else:
-                # Radiusモード（デフォルト）
-                rvi_params = {
-                    'mode': 'radius',
-                    'sigmas': None,
-                    'radii': args.radii_list,
-                    'weights': args.weights_list,
-                    'auto_sigma': False,
-                    'auto_radii': args.radii_list is None,
-                    'agg': getattr(args, 'agg', 'mean'),
-                }
-        
         # 処理の実行
         try:
-            from ..core.dask_processor import run_pipeline
-            
-            # RVIパラメータの安全な処理
-            if args.algorithm == "rvi":
-                if args.use_sigma_mode:
-                    # Sigmaモード
-                    rvi_params = {
-                        'sigmas': params['sigma_list'],
-                        'radii': None,
-                        'weights': None,
-                        'auto_sigma': getattr(args, 'auto_sigma', False),
-                        'auto_radii': False,
-                    }
-                else:
-                    # Radiusモード（デフォルト）
-                    rvi_params = {
-                        'sigmas': None,
-                        'radii': args.radii_list,  # 手動指定がある場合のみ
-                        'weights': args.weights_list,
-                        'auto_sigma': False,
-                        'auto_radii': args.radii_list is None,  # radiiが指定されていない場合は自動決定
-                    }
-            else:
-                # RVI以外のアルゴリズム
-                rvi_params = {}
-
             run_pipeline(
                 src_cog=params['input_path'],
                 dst_cog=params['output_path'],
@@ -766,7 +718,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 chunk=getattr(args, 'chunk', None),
                 show_progress=params['show_progress'],
                 memory_fraction=getattr(args, 'memory_fraction', 0.5),
-                **rvi_params,
                 **algo_params
             )
             

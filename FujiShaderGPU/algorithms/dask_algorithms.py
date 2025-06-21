@@ -2,12 +2,16 @@
 FujiShaderGPU/algorithms/dask_algorithms.py
 """
 from __future__ import annotations
+import logging
 from typing import List, Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
 import cupy as cp
 import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation
+
+# ロギング設定
+logger = logging.getLogger(__name__)
 
 class Constants:
     DEFAULT_GAMMA = 1/2.2
@@ -16,6 +20,27 @@ class Constants:
     MAX_DEPTH = 150
     NAN_FILL_VALUE_POSITIVE = -1e6
     NAN_FILL_VALUE_NEGATIVE = 1e6
+    EPSILON = 1e-8 # ゼロ除算防止用の小さな値
+
+    # アルゴリズムの複雑度係数
+    ALGORITHM_COMPLEXITY = {
+        'rvi': 1.2,                    # マルチスケール処理
+        'hillshade': 0.8,              # 単純な勾配計算
+        'slope': 0.8,                  # 単純な勾配計算
+        'specular': 1.5,               # ラフネス計算が重い
+        'atmospheric_scattering': 0.9,
+        'multiscale_terrain': 1.5,     # マルチスケール処理
+        'frequency_enhancement': 1.3,   # FFT処理
+        'curvature': 1.0,              # 2次微分
+        'visual_saliency': 1.4,        # マルチスケール特徴抽出
+        'npr_edges': 1.1,              # エッジ検出
+        'atmospheric_perspective': 0.9,
+        'ambient_occlusion': 2.0,      # 最も計算コストが高い
+        'tpi': 1.0,                    # 畳み込み処理
+        'lrm': 1.1,                    # ガウシアンフィルタ
+        'openness': 1.8,               # 多方向探索
+        'fractal_anomaly': 1.6,        # マルチスケール回帰計算
+    }
 
 # 1. より詳細な解像度分類関数（既存のclassify_resolutionを置き換え）
 def classify_resolution(pixel_size: float) -> str:
@@ -70,7 +95,7 @@ def get_gradient_scale_factor(pixel_size: float, algorithm: str = 'default') -> 
             return 2.5
     else:
         # デフォルトの係数
-        return cp.sqrt(max(1.0, pixel_size))
+        return np.sqrt(max(1.0, pixel_size))
     
 ###############################################################################
 # アルゴリズム基底クラスと共通インターフェース
@@ -132,13 +157,72 @@ def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0,
     else:
         filled = block
     
-    dy, dx = cp.gradient(filled * scale, pixel_size, edge_order=2)
+    dy, dx = cp.gradient(filled, pixel_size, edge_order=2)
+    dy = dy * scale
+    dx = dx * scale
     return dy, dx, nan_mask
     
 def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
     """NaN位置を復元"""
     if nan_mask.any():
         result[nan_mask] = cp.nan
+    return result
+
+###############################################################################
+# int16変換用の共通関数
+###############################################################################
+
+def compute_gamma_corrected_range(data: cp.ndarray, apply_gamma: bool = True, 
+                                 signed_range: bool = False) -> Tuple[float, float]:
+    """ガンマ補正後の最小値・最大値を計算"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) == 0:
+        return (-1.0, 1.0) if signed_range else (0.0, 1.0)
+    
+    if apply_gamma:
+        if signed_range:
+            # 符号を保持したガンマ補正
+            sign = cp.sign(valid_data)
+            gamma_corrected = sign * cp.power(cp.abs(valid_data), Constants.DEFAULT_GAMMA)
+        else:
+            gamma_corrected = cp.power(cp.clip(valid_data, 0, 1), Constants.DEFAULT_GAMMA)
+        return (float(cp.min(gamma_corrected)), float(cp.max(gamma_corrected)))
+    else:
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
+
+def normalize_and_convert_to_int16(block: cp.ndarray, 
+                                   global_min: float, 
+                                   global_max: float,
+                                   apply_gamma: bool = True,
+                                   signed_input: bool = False) -> cp.ndarray:
+    """グローバル統計に基づいて正規化し、int16に変換"""
+    nan_mask = cp.isnan(block)
+    
+    # ガンマ補正
+    if apply_gamma:
+        if signed_input:
+            # NaNやInfを考慮した安全な処理
+            valid_mask = cp.isfinite(block)
+            sign = cp.sign(block)
+            abs_values = cp.abs(block)
+            # 0や非常に小さい値でのpower演算エラーを防ぐ
+            abs_values = cp.maximum(abs_values, Constants.EPSILON)
+            processed = cp.where(valid_mask, 
+                                 sign * cp.power(abs_values, Constants.DEFAULT_GAMMA),
+                                 block)
+        else:
+            processed = cp.power(cp.clip(block, 0, 1), Constants.DEFAULT_GAMMA)
+    else:
+        processed = block
+    
+    # グローバル範囲で正規化してint16にマッピング
+    if global_max > global_min:
+        normalized = (processed - global_min) / (global_max - global_min)
+        result = (normalized * 65534 - 32767).astype(cp.int16)
+    else:
+        result = cp.zeros_like(block, dtype=cp.int16)
+    
+    result[nan_mask] = -32768
     return result
 
 ###############################################################################
@@ -149,8 +233,7 @@ def determine_optimal_downsample_factor(
     algorithm_name: str = None,
     target_pixels: int = 500000,  # 目標ピクセル数（1000x1000）
     min_factor: int = 5,
-    max_factor: int = 100,
-    algorithm_complexity: Dict[str, float] = None) -> int:
+    max_factor: int = 100) -> int:
     """
     データサイズとアルゴリズムの特性に基づいて最適なダウンサンプル係数を決定
     
@@ -166,42 +249,19 @@ def determine_optimal_downsample_factor(
         最小ダウンサンプル係数
     max_factor : int
         最大ダウンサンプル係数
-    algorithm_complexity : Dict[str, float]
-        アルゴリズムごとの複雑度係数（デフォルトは内蔵辞書）
     
     Returns:
     --------
     int : 最適なダウンサンプル係数
-    """
-    # アルゴリズムの複雑度係数（計算コストが高いほど大きい値）
-    if algorithm_complexity is None:
-        algorithm_complexity = {
-            'rvi': 1.2,                    # マルチスケール処理
-            'hillshade': 0.8,              # 単純な勾配計算
-            'slope': 0.8,                  # 単純な勾配計算
-            'specular': 1.5,               # ラフネス計算が重い
-            'atmospheric_scattering': 0.9,
-            'multiscale_terrain': 1.5,     # マルチスケール処理
-            'frequency_enhancement': 1.3,   # FFT処理
-            'curvature': 1.0,              # 2次微分
-            'visual_saliency': 1.4,        # マルチスケール特徴抽出
-            'npr_edges': 1.1,              # エッジ検出
-            'atmospheric_perspective': 0.9,
-            'ambient_occlusion': 2.0,      # 最も計算コストが高い
-            'tpi': 1.0,                    # 畳み込み処理
-            'lrm': 1.1,                    # ガウシアンフィルタ
-            'openness': 1.8,               # 多方向探索
-            'fractal_anomaly': 1.6,        # マルチスケール回帰計算
-        }
-    
+    """    
     # 現在のピクセル数
     current_pixels = data_shape[0] * data_shape[1]
     
     # 基本のダウンサンプル係数（平方根で計算）
-    base_factor = cp.sqrt(current_pixels / target_pixels).get()
+    base_factor = float(cp.sqrt(current_pixels / target_pixels))
     
     # アルゴリズムの複雑度で調整
-    complexity = algorithm_complexity.get(algorithm_name, 1.0)
+    complexity = Constants.ALGORITHM_COMPLEXITY.get(algorithm_name, 1.0)
     adjusted_factor = base_factor * complexity
     
     # 整数化して範囲内に収める
@@ -333,12 +393,18 @@ def apply_global_normalization(block: cp.ndarray,
 ###############################################################################
 
 # RVI用
-def rvi_stat_func(data: cp.ndarray) -> Tuple[float]:
-    """RVI用の統計量計算（標準偏差）"""
+def rvi_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float]:
+    """RVI用の統計量計算（ガンマ補正後の範囲も含む）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        return (float(cp.std(valid_data)),)
-    return (1.0,)
+        std = float(cp.std(valid_data))
+        # 正規化
+        normalized = valid_data / (3 * std) if std > 0 else valid_data
+        normalized = cp.clip(normalized, -1, 1)
+        # ガンマ補正後の範囲
+        min_gamma, max_gamma = compute_gamma_corrected_range(normalized, apply_gamma=True, signed_range=True)
+        return (std, min_gamma, max_gamma)
+    return (1.0, -1.0, 1.0)
 
 def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
     """RVI用の正規化"""
@@ -349,12 +415,24 @@ def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     return cp.zeros_like(block)
 
 # FrequencyEnhancement用
-def freq_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """周波数強調用の統計量計算（最小値・最大値）"""
+def freq_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float, float]:
+    """周波数強調用の統計量計算（ガンマ補正後の範囲も含む）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
-    return (0.0, 1.0)
+        raw_min = float(cp.min(valid_data))
+        raw_max = float(cp.max(valid_data))
+        
+        # 正規化とガンマ補正をシミュレート
+        if raw_max > raw_min:
+            normalized = (valid_data - raw_min) / (raw_max - raw_min)
+            gamma_corrected = cp.power(normalized, Constants.DEFAULT_GAMMA)
+            gamma_min = float(cp.min(gamma_corrected))
+            gamma_max = float(cp.max(gamma_corrected))
+        else:
+            gamma_min, gamma_max = 0.5, 0.5
+            
+        return (raw_min, raw_max, gamma_min, gamma_max)
+    return (0.0, 1.0, 0.0, 1.0)
 
 def freq_norm_func(block: cp.ndarray, stats: Tuple[float, float], nan_mask: cp.ndarray) -> cp.ndarray:
     """周波数強調用の正規化"""
@@ -363,27 +441,27 @@ def freq_norm_func(block: cp.ndarray, stats: Tuple[float, float], nan_mask: cp.n
         return (block - min_val) / (max_val - min_val)
     return cp.full_like(block, 0.5)
 
-# NPREdges用
-def npr_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """NPRエッジ用の統計量計算（勾配のパーセンタイル）"""
-    # 簡易的に勾配を計算
-    dy, dx = cp.gradient(data)
-    gradient_mag = cp.sqrt(dx**2 + dy**2)
-    valid_grad = gradient_mag[~cp.isnan(gradient_mag)]
-    
-    if len(valid_grad) > 0:
-        return (float(cp.percentile(valid_grad, 70)), 
-                float(cp.percentile(valid_grad, 90)))
-    return (0.1, 0.3)
-
 # TPI/LRM用
-def tpi_lrm_stat_func(data: cp.ndarray) -> Tuple[float]:
-    """TPI/LRM用の統計量計算（最大絶対値）"""
+def tpi_lrm_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float]:
+    """TPI/LRM用の統計量計算（ガンマ補正後の範囲も含む）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        return (float(cp.maximum(cp.abs(cp.min(valid_data)), 
-                                cp.abs(cp.max(valid_data)))),)
-    return (1.0,)
+        max_abs = float(cp.maximum(cp.abs(cp.min(valid_data)), 
+                                   cp.abs(cp.max(valid_data))))
+        
+        # 正規化後の値でガンマ補正をシミュレート
+        if max_abs > 0:
+            normalized = valid_data / max_abs  # -1～1の範囲
+            # 符号を保持したガンマ補正
+            sign = cp.sign(normalized)
+            gamma_corrected = sign * cp.power(cp.abs(normalized), Constants.DEFAULT_GAMMA)
+            gamma_min = float(cp.min(gamma_corrected))
+            gamma_max = float(cp.max(gamma_corrected))
+        else:
+            gamma_min, gamma_max = -1.0, 1.0
+            
+        return (max_abs, gamma_min, gamma_max)
+    return (1.0, -1.0, 1.0)
 
 def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
     """TPI/LRM用の正規化"""
@@ -393,66 +471,249 @@ def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     return cp.zeros_like(block)
 
 # Visual Saliency用
-def visual_saliency_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """Visual Saliency用の統計量計算（解像度適応型）"""
+# 統計関数を修正してガンマ補正後の範囲を返すように
+def visual_saliency_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float, float]:
+    """Visual Saliency用の統計量計算（ガンマ補正後）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        # より狭い範囲でコントラストを強調
-        # 低い値を切り捨てて、特徴的な部分を強調
-        low_p = float(cp.percentile(valid_data, 25))   # 5→25に変更
-        high_p = float(cp.percentile(valid_data, 85))  # 95→85に変更
+        low_p = float(cp.percentile(valid_data, 25))
+        high_p = float(cp.percentile(valid_data, 85))
         
-        # 範囲が狭すぎる場合でも、あまり広げすぎない
         if (high_p - low_p) < cp.std(valid_data) * 0.3:
-            low_p = float(cp.percentile(valid_data, 15))   # 5→15
-            high_p = float(cp.percentile(valid_data, 90))  # 95→90
-            
-        return (low_p, high_p)
+            low_p = float(cp.percentile(valid_data, 15))
+            high_p = float(cp.percentile(valid_data, 90))
+        
+        # テスト正規化とガンマ補正
+        test_normalized = cp.linspace(0, 1, 100)
+        test_gamma = cp.power(test_normalized, Constants.DEFAULT_GAMMA)
+        gamma_min = float(cp.min(test_gamma))
+        gamma_max = float(cp.max(test_gamma))
+        
+        return (low_p, high_p, gamma_min, gamma_max)
+    return (0.0, 1.0, 0.0, 1.0)
+
+def specular_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """Specular用の統計量計算（ガンマ補正後の範囲）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        # Specularは既にガンマ補正（0.7）が適用されている
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
     return (0.0, 1.0)
+
+def atmospheric_scattering_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """大気散乱用の統計量計算（ガンマ補正後の範囲）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        # すでにガンマ補正済みの値の範囲を取得
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
+    return (0.0, 1.0)
+
+def curvature_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """曲率用の統計量計算（ガンマ補正後の範囲）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        # すでにガンマ補正済みの値の範囲を取得
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
+    return (0.0, 1.0)
+
+def atmospheric_perspective_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """大気遠近法用の統計量計算（ガンマ補正後の範囲）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
+    return (0.0, 1.0)
+
+def ambient_occlusion_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """環境光遮蔽用の統計量計算（ガンマ補正後の範囲）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
+    return (0.0, 1.0)
+
+def openness_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """開度用の統計量計算（ガンマ補正後の範囲）"""
+    valid_data = data[~cp.isnan(data)]
+    if len(valid_data) > 0:
+        return (float(cp.min(valid_data)), float(cp.max(valid_data)))
+    return (0.0, 1.0)
+
+## 共通したHillshade計算の関数
+def compute_hillshade_component(block: cp.ndarray, nan_mask: cp.ndarray, 
+                               pixel_size: float = 1.0,
+                               azimuth: float = Constants.DEFAULT_AZIMUTH,
+                               altitude: float = Constants.DEFAULT_ALTITUDE) -> cp.ndarray:
+    """Hillshadeコンポーネントの計算（0-1範囲）"""
+    # NaNマスクを再利用
+    if nan_mask.any():
+        filled = cp.where(nan_mask, cp.nanmean(block), block)
+    else:
+        filled = block
+    
+    dy, dx = cp.gradient(filled, pixel_size, edge_order=2)
+    
+    slope = cp.arctan(cp.sqrt(dx**2 + dy**2))
+    aspect = cp.arctan2(-dy, dx)
+    
+    azimuth_rad = cp.radians(azimuth)
+    altitude_rad = cp.radians(altitude)
+    
+    hillshade = cp.cos(altitude_rad) * cp.cos(slope) + \
+                cp.sin(altitude_rad) * cp.sin(slope) * cp.cos(aspect - azimuth_rad)
+    
+    # 0-1に正規化
+    return (hillshade + 1) / 2
+
+def determine_optimal_radii(terrain_stats: dict) -> Tuple[List[int], List[float]]:
+    """地形統計に基づいて最適な半径を決定"""
+    pixel_size = terrain_stats.get('pixel_size', 1.0)
+    mean_slope = terrain_stats['mean_slope']
+    std_dev = terrain_stats['std_dev']
+    
+    # 地形の複雑さ
+    complexity = mean_slope * std_dev
+    
+    # 基本的な実世界距離（メートル）
+    if complexity < 0.1:
+        # 平坦な地形：大きめのスケール
+        base_distances = [10, 40, 160, 640]
+    elif complexity < 0.3:
+        # 緩やかな地形：中程度のスケール
+        base_distances = [5, 20, 80, 320]
+    else:
+        # 複雑な地形：細かいスケール
+        base_distances = [2.5, 10, 40, 160]
+    
+    # 最初からsetで管理してソート
+    radii_set = set()
+    for dist in base_distances:
+        radius = int(dist / pixel_size)
+        radius = max(2, min(radius, 256))
+        radii_set.add(radius)
+    radii = sorted(radii_set)
+    
+    # 最大4つまでに制限
+    if len(radii) > 4:
+        # 対数的に分布
+        indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
+        radii = [radii[int(i)] for i in indices]
+    
+    # 重みの決定（小さいスケールを重視）
+    weights = []
+    for i, r in enumerate(radii):
+        weight = 1.0 / (i + 1)  # 1, 1/2, 1/3, 1/4
+        weights.append(weight)
+    
+    # 正規化
+    total = sum(weights)
+    weights = [w / total for w in weights]
+    
+    return radii, weights
+
+def determine_optimal_sigmas(terrain_stats: dict) -> List[float]:
+    """地形統計に基づいて最適なsigma値を決定"""
+    sigmas_set = set()  # setを使って重複を確実に排除
+    
+    # 1. 標高レンジと勾配に基づく基本スケール
+    elev_range = terrain_stats['elevation_range']
+    mean_slope = terrain_stats['mean_slope']
+    
+    # 地形の複雑さの指標
+    terrain_complexity = mean_slope * terrain_stats['std_dev'] / (elev_range + 1e-6)
+    
+    # 基本スケール（地形の複雑さに応じて調整）
+    if terrain_complexity < 0.1:  # 平坦な地形
+        base_scales = [50, 100, 150]  # より小さい値に制限
+    elif terrain_complexity < 0.3:  # 緩やかな地形
+        base_scales = [50, 100, 200]
+    else:  # 複雑な地形
+        base_scales = [25, 50, 100, 200]
+    
+    # 2. FFT解析から得られたスケールを追加
+    if terrain_stats.get('dominant_scales', []):
+        for scale in terrain_stats['dominant_scales']:
+            if 10 < scale < 500:  # 現実的な範囲のスケールのみ
+                # Gaussianフィルタのsigmaは、検出されたスケールの約1/4
+                sigma_candidate = round(scale / 4, 0)  # 整数に丸める
+                if 5 <= sigma_candidate <= 150:  # 最大値を150に制限
+                    sigmas_set.add(sigma_candidate)
+    
+    # 3. 曲率に基づく微細スケール
+    mean_curv = terrain_stats['mean_curvature']
+    if mean_curv > 0.01:  # 曲率が高い場合は細かいスケールも追加
+        sigmas_set.add(10)
+    
+    # 基本スケールを追加
+    for scale in base_scales:
+        if 5 <= scale <= 150:  # 最大値を150に制限
+            sigmas_set.add(scale)
+    
+    # setをリストに変換してソート
+    sigmas = sorted(list(sigmas_set))
+    
+    # 最大3つまでに制限（メモリ効率のため、5→3に削減）
+    if len(sigmas) > 3:
+        indices = cp.linspace(0, len(sigmas)-1, 3).astype(int)
+        sigmas = [sigmas[i] for i in indices]
+    
+    return [float(s) for s in sigmas]
+
+def compute_tpi_lrm_no_gamma(block: cp.ndarray, *, radius: int, max_abs: float) -> cp.ndarray:
+    """TPIを計算（ガンマ補正なし）"""
+    nan_mask = cp.isnan(block)
+    
+    # 円形カーネルの作成
+    y, x = cp.ogrid[-radius:radius+1, -radius:radius+1]
+    kernel = (x**2 + y**2) <= radius**2
+    kernel = kernel.astype(cp.float32)
+    kernel /= kernel.sum()
+    
+    # 周囲の平均標高を計算（NaN考慮）
+    if nan_mask.any():
+        filled = cp.where(nan_mask, 0, block)
+        valid = (~nan_mask).astype(cp.float32)
+        
+        sum_values = convolve(filled * valid, kernel, mode='reflect')
+        sum_weights = convolve(valid, kernel, mode='reflect')
+        mean_elev = cp.where(sum_weights > 0, sum_values / sum_weights, 0)
+    else:
+        mean_elev = convolve(block, kernel, mode='reflect')
+    
+    # TPIは中心と周囲の差
+    tpi = block - mean_elev
+    
+    # グローバル統計量で正規化
+    if max_abs > 0:
+        tpi = tpi / max_abs
+    
+    # -1～1にクリップ（ガンマ補正はしない）
+    result = cp.clip(tpi, -1, 1)
+    
+    # NaN処理
+    result = restore_nan(result, nan_mask)
+    
+    return result.astype(cp.float32)
 
 ###############################################################################
 # 2.1. RVI (Ridge-Valley Index) アルゴリズム
 ###############################################################################
 
-def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
-    """CuPy でガウシアンぼかし後に差分を取る高‑pass フィルタ（NaN対応）"""
-    # NaNマスク処理
-    nan_mask = cp.isnan(block)
-    if nan_mask.any():
-        # NaNを周囲の値で埋める（一時的に）
-        filled = cp.where(nan_mask, 0, block)
-        # 有効なピクセルのマスクも作成
-        valid_mask = (~nan_mask).astype(cp.float32)
-        
-        # ガウシアンフィルタを値と有効マスクの両方に適用
-        blurred_values = gaussian_filter(filled * valid_mask, sigma=sigma, mode="nearest", truncate=4.0)
-        blurred_weights = gaussian_filter(valid_mask, sigma=sigma, mode="nearest", truncate=4.0)
-        
-        # 重み付き平均でNaN領域を考慮したぼかし
-        blurred = cp.where(blurred_weights > 0, blurred_values / blurred_weights, 0)
-    else:
-        blurred = gaussian_filter(block, sigma=sigma, mode="nearest", truncate=4.0)
-    
-    result = block - blurred
-    
-    # NaN位置を復元
-    result = restore_nan(result, nan_mask)
-        
-    return result
-
 def compute_rvi_efficient_block(block: cp.ndarray, *, 
                                radii: List[int] = [4, 16, 64], 
                                weights: Optional[List[float]] = None) -> cp.ndarray:
-    """効率的なRVI計算（メモリ最適化版）"""
+    """効率的なRVI計算"""
+    if not radii:
+        raise ValueError("radii list cannot be empty")
+    if any(r <= 0 for r in radii):
+        raise ValueError("All radii must be positive integers")
+    
     nan_mask = cp.isnan(block)
     
     if weights is None:
         weights = cp.array([1.0 / len(radii)] * len(radii), dtype=cp.float32)
-    else:
-        if not isinstance(weights, cp.ndarray):
-            weights = cp.array(weights, dtype=cp.float32)
-        if len(weights) != len(radii):
-            raise ValueError(f"Length of weights ({len(weights)}) must match length of radii ({len(radii)})")
+    elif not isinstance(weights, cp.ndarray):
+        weights = cp.array(weights, dtype=cp.float32)
+    if len(weights) != len(radii):
+        raise ValueError(f"Length of weights ({len(weights)}) must match length of radii ({len(radii)})")
     
     # 結果をインプレースで累積（メモリ効率向上）
     rvi_combined = None
@@ -516,52 +777,32 @@ class RVIAlgorithm(DaskAlgorithm):
         weights = params.get('weights', None)
         
         # 自動決定
+        terrain_stats = params.get('terrain_stats', None)
         if radii is None:
-            pixel_size = params.get('pixel_size', 1.0)
-            radii = self._determine_optimal_radii(pixel_size)
+            radii, weights = determine_optimal_radii(terrain_stats)
         max_radius = max(radii)
         rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights)
-        
-        # グローバル統計を使用 統計量を計算
+
         stats = compute_global_stats(
-            rvi,  # 正規化前のRVI結果
-            rvi_stat_func,
+            rvi,
+            rvi_stat_func_with_gamma,
             compute_rvi_efficient_block,
             {'radii': radii, 'weights': weights},
             params.get('downsample_factor', None),
-            depth=max_radius * 2 + 1
+            depth=max_radius * 2 + 1,
+            algorithm_name='rvi'
         )
-        
-        # 正規化を適用
+
+        # 正規化とint16変換を一度に
+        std_global, gamma_min, gamma_max = stats
         return rvi.map_blocks(
-            lambda block: apply_global_normalization(block, rvi_norm_func, stats),
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32)
+            lambda block: normalize_and_convert_to_int16(
+                apply_global_normalization(block, rvi_norm_func, (std_global,)),
+                gamma_min, gamma_max, apply_gamma=True, signed_input=True
+            ),
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
         )
-    
-    def _determine_optimal_radii(self, pixel_size: float) -> List[int]:
-        """ピクセルサイズに基づいて最適な半径を決定"""
-        # 実世界の距離（メートル）をピクセルに変換
-        target_distances = [5, 20, 80, 320]  # メートル単位
-        radii = []
-        
-        for dist in target_distances:
-            radius = int(dist / pixel_size)
-            # 現実的な範囲に制限
-            radius = max(2, min(radius, 256))
-            radii.append(radius)
-        
-        # 重複を削除してソート
-        radii = sorted(list(set(radii)))
-        
-        # 最大4つまでに制限
-        if len(radii) > 4:
-            # 対数的に分布するように選択
-            # NumPyを使用してCPU上で計算（小さな配列なのでGPU転送のオーバーヘッドを避ける）
-            indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
-            radii = [radii[int(i)] for i in indices]
-        
-        return radii
     
     def get_default_params(self) -> dict:
         return {
@@ -580,33 +821,15 @@ class RVIAlgorithm(DaskAlgorithm):
 def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = Constants.DEFAULT_AZIMUTH, 
                            altitude: float = Constants.DEFAULT_ALTITUDE, z_factor: float = 1.0,
                            pixel_size: float = 1.0) -> cp.ndarray:
-    """1ブロックに対するHillshade計算"""
+    """1ブロックに対するHillshade計算（0-1の範囲で返す）"""
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
-    # 方位角と高度角をラジアンに変換
-    azimuth_rad = cp.radians(azimuth)
-    altitude_rad = cp.radians(altitude)
-    
-    # 勾配計算（中央差分）- NaNを含む場合は隣接値で補間
-    dy, dx, nan_mask = handle_nan_for_gradient(block, scale=z_factor, pixel_size=pixel_size)
-    
-    # 勾配と傾斜角
-    slope = cp.arctan(cp.sqrt(dx**2 + dy**2))
-    
-    # アスペクト（斜面方位）
-    aspect = cp.arctan2(-dy, dx)  # 北を0°とする座標系
-    
-    # 光源ベクトルとの角度差
-    aspect_diff = aspect - azimuth_rad
-    
-    # Hillshade計算（Lambertian reflectance model）
-    hillshade = cp.cos(altitude_rad) * cp.cos(slope) + \
-                cp.sin(altitude_rad) * cp.sin(slope) * cp.cos(aspect_diff)
-    
-    # 0-255の範囲に正規化（Hillshadeは例外的に0-255出力）
-    hillshade = cp.clip(hillshade, -1, 1)
-    hillshade = ((hillshade + 1) / 2 * 255).astype(cp.float32)
+    # z_factorを適用
+    scaled_block = block * z_factor
+
+    # compute_hillshade_componentを再利用
+    hillshade = compute_hillshade_component(scaled_block, nan_mask, pixel_size, azimuth, altitude)
     
     # NaN処理
     hillshade = restore_nan(hillshade, nan_mask)
@@ -622,8 +845,15 @@ class HillshadeAlgorithm(DaskAlgorithm):
         z_factor = params.get('z_factor', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
         multiscale = params.get('multiscale', False)
-        sigmas = params.get('sigmas', [1])  # Hillshadeでのマルチスケール用
+        sigmas = params.get('sigmas', [1])
         agg = params.get('agg', 'mean')
+        
+        # Hillshadeは常に0-1の範囲
+        # ガンマ補正後の範囲を事前計算
+        test_values = cp.linspace(0, 1, 100)
+        gamma_corrected = cp.power(test_values, Constants.DEFAULT_GAMMA)
+        gamma_min = 0.0  # ガンマ補正後も0が最小
+        gamma_max = float(cp.max(gamma_corrected))
         
         if multiscale and len(sigmas) > 1:
             # マルチスケールHillshade
@@ -642,44 +872,71 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 else:
                     smoothed = gpu_arr
                 
-                # Hillshade計算
+                # Hillshade計算とint16変換を一度に
                 hs = smoothed.map_overlap(
-                    compute_hillshade_block,
+                    lambda block: normalize_and_convert_to_int16(
+                        compute_hillshade_block(
+                            block,
+                            azimuth=azimuth,
+                            altitude=altitude,
+                            z_factor=z_factor,
+                            pixel_size=pixel_size
+                        ),
+                        gamma_min,
+                        gamma_max,
+                        apply_gamma=True  # ガンマ補正を適用
+                    ),
                     depth=1,
                     boundary='reflect',
-                    dtype=cp.float32,
-                    meta=cp.empty((0, 0), dtype=cp.float32),
-                    azimuth=azimuth,
-                    altitude=altitude,
-                    z_factor=z_factor,
-                    pixel_size=pixel_size
+                    dtype=cp.int16,
+                    meta=cp.empty((0, 0), dtype=cp.int16)
                 )
                 results.append(hs)
             
-            # 集約
+            # 集約（int16のまま処理）
             stacked = da.stack(results, axis=0)
             if agg == "stack":
                 return stacked
             elif agg == "mean":
-                return da.mean(stacked, axis=0)
+                # int16の平均を計算
+                # 一時的にfloat32に変換して平均を取り、結果をint16に戻す
+                mean_float = da.mean(stacked.astype(cp.float32), axis=0)
+                return mean_float.map_blocks(
+                    lambda b: cp.clip(b, -32767, 32767).astype(cp.int16),
+                    dtype=cp.int16,
+                    meta=cp.empty((0, 0), dtype=cp.int16)
+                )
             elif agg == "min":
                 return da.min(stacked, axis=0)
             elif agg == "max":
                 return da.max(stacked, axis=0)
             else:
-                return da.mean(stacked, axis=0)
+                # デフォルトは平均
+                mean_float = da.mean(stacked.astype(cp.float32), axis=0)
+                return mean_float.map_blocks(
+                    lambda b: cp.clip(b, -32767, 32767).astype(cp.int16),
+                    dtype=cp.int16,
+                    meta=cp.empty((0, 0), dtype=cp.int16)
+                )
         else:
             # 単一スケールHillshade
             return gpu_arr.map_overlap(
-                compute_hillshade_block,
+                lambda block: normalize_and_convert_to_int16(
+                    compute_hillshade_block(
+                        block,
+                        azimuth=azimuth,
+                        altitude=altitude,
+                        z_factor=z_factor,
+                        pixel_size=pixel_size
+                    ),
+                    gamma_min,
+                    gamma_max,
+                    apply_gamma=True  # ガンマ補正を適用
+                ),
                 depth=1,
                 boundary='reflect',
-                dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32),
-                azimuth=azimuth,
-                altitude=altitude,
-                z_factor=z_factor,
-                pixel_size=pixel_size
+                dtype=cp.int16,
+                meta=cp.empty((0, 0), dtype=cp.int16)
             )
     
     def get_default_params(self) -> dict:
@@ -700,23 +957,6 @@ class HillshadeAlgorithm(DaskAlgorithm):
 ###############################################################################
 # 2.8. Visual Saliency (視覚的顕著性) アルゴリズム
 ###############################################################################
-def visual_saliency_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """Visual Saliency用の統計量計算（解像度適応型）"""
-    valid_data = data[~cp.isnan(data)]
-    if len(valid_data) > 0:
-        # データの分布の広がりを確認
-        std_val = float(cp.std(valid_data))
-        mean_val = float(cp.mean(valid_data))
-        
-        # 分布が狭い場合（低解像度データでよくある）はパーセンタイルを調整
-        if std_val < mean_val * 0.1:  # 変動係数が小さい場合
-            return (float(cp.percentile(valid_data, 20)), 
-                    float(cp.percentile(valid_data, 80)))
-        else:
-            return (float(cp.percentile(valid_data, 5)), 
-                    float(cp.percentile(valid_data, 95)))
-    return (0.0, 1.0)
-
 def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2, 4, 8, 16],
                                 pixel_size: float = 1.0,
                                 normalize: bool = True,
@@ -805,10 +1045,6 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
             
         feature = cp.where(cp.isnan(feature), 0, feature)
         
-        # 中間変数を解放
-        del contrast
-        del gradient_mag
-        
         # 各スケールの値の範囲を揃える（より控えめな正規化）
         # コントラストは log(scale + e) で除算済みなので、追加の正規化は軽めに
         if scale > 1:
@@ -859,8 +1095,6 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
     return result.astype(cp.float32)
 
 class VisualSaliencyAlgorithm(DaskAlgorithm):
-    """視覚的顕著性アルゴリズム"""
-    
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         scales = params.get('scales', [2, 4, 8, 16])
         max_scale = max(scales)
@@ -868,7 +1102,7 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         # 統計量を計算（新しい共通関数を使用）
         stats = compute_global_stats(
             gpu_arr,
-            visual_saliency_stat_func,
+            visual_saliency_stat_func_with_gamma,
             compute_visual_saliency_block,
             {
                 'scales': scales,
@@ -876,21 +1110,32 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
                 'normalize': False
             },
             downsample_factor=params.get('downsample_factor', None),
-            depth=int(max_scale * 8)
+            depth=int(max_scale * 8),
+            algorithm_name='visual_saliency'
         )
         
-        # フルサイズで処理
+        # 修正: 正しい統計値の取り出し
+        raw_min, raw_max, gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
         return gpu_arr.map_overlap(
-            compute_visual_saliency_block,
+            lambda block: normalize_and_convert_to_int16(  # 修正: 正しい関数名
+                compute_visual_saliency_block(
+                    block,
+                    scales=scales,
+                    pixel_size=params.get('pixel_size', 1.0),
+                    normalize=True,
+                    norm_min=raw_min,   # 修正: raw_min
+                    norm_max=raw_max    # 修正: raw_max
+                ),
+                gamma_min,  # ガンマ補正後の最小値
+                gamma_max,  # ガンマ補正後の最大値
+                apply_gamma=False  # compute_visual_saliency_block内で既にガンマ補正済み
+            ),
             depth=int(max_scale * 8),
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            scales=scales,
-            pixel_size=params.get('pixel_size', 1.0),
-            normalize=True,
-            norm_min=stats[0],
-            norm_max=stats[1]
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
         )
     
     def get_default_params(self) -> dict:
@@ -1092,27 +1337,40 @@ class NPREdgesAlgorithm(DaskAlgorithm):
         
         # depthを3に増やす（Sobelフィルタと膨張処理のため）
         depth = 3
-        
         if edge_sigma != 1.0:
             depth = max(depth, int(edge_sigma * 4 + 2))
         
+        # NPREdgesは常に0.2-1.0の範囲で出力される
+        # ガンマ補正後の範囲を事前計算
+        test_values = cp.linspace(0.2, 1.0, 100)
+        gamma_corrected = cp.power(test_values, Constants.DEFAULT_GAMMA)
+        gamma_min = float(cp.min(gamma_corrected))
+        gamma_max = float(cp.max(gamma_corrected))
+        
         return gpu_arr.map_overlap(
-            compute_npr_edges_block,
+            lambda block: normalize_and_convert_to_int16(
+                compute_npr_edges_block(
+                    block,
+                    edge_sigma=edge_sigma,
+                    threshold_low=threshold_low,
+                    threshold_high=threshold_high,
+                    pixel_size=pixel_size
+                ),
+                gamma_min,  # ガンマ補正後の最小値
+                gamma_max,  # ガンマ補正後の最大値
+                apply_gamma=False  # compute_npr_edges_block内で既にガンマ補正済み
+            ),
             depth=depth,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            edge_sigma=edge_sigma,
-            threshold_low=threshold_low,
-            threshold_high=threshold_high,
-            pixel_size=pixel_size,
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
         )
     
     def get_default_params(self) -> dict:
         return {
             'edge_sigma': 1.0,
-            'threshold_low': 0.1,
-            'threshold_high': 0.3,
+            'threshold_low': 0.2,
+            'threshold_high': 0.5,
             'pixel_size': 1.0
         }
 
@@ -1141,9 +1399,7 @@ def compute_atmospheric_perspective_block(block: cp.ndarray, *,
     azimuth_rad = cp.radians(Constants.DEFAULT_AZIMUTH)
     altitude_rad = cp.radians(Constants.DEFAULT_ALTITUDE)
     
-    hillshade = cp.cos(altitude_rad) * cp.cos(slope) + \
-                cp.sin(altitude_rad) * cp.sin(slope) * cp.cos(aspect - azimuth_rad)
-    hillshade = (hillshade + 1) / 2
+    hillshade = compute_hillshade_component(block, nan_mask, pixel_size)
     
     # 深度に応じたヘイズ（霞）効果
     haze = 1.0 - cp.exp(-haze_strength * depth)
@@ -1175,20 +1431,45 @@ class AtmosphericPerspectiveAlgorithm(DaskAlgorithm):
         haze_strength = params.get('haze_strength', 0.7)
         pixel_size = params.get('pixel_size', 1.0)
         
-        return gpu_arr.map_overlap(
+        # グローバル統計を計算（新規追加）
+        stats = compute_global_stats(
+            gpu_arr,
+            atmospheric_perspective_stat_func,
             compute_atmospheric_perspective_block,
+            {
+                'depth_scale': depth_scale,
+                'haze_strength': haze_strength,
+                'pixel_size': pixel_size
+            },
+            downsample_factor=None,
+            depth=1,
+            algorithm_name='atmospheric_perspective'
+        )
+        
+        gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
+        return gpu_arr.map_overlap(
+            lambda block: normalize_and_convert_to_int16(
+                compute_atmospheric_perspective_block(
+                    block,
+                    depth_scale=depth_scale,
+                    haze_strength=haze_strength,
+                    pixel_size=pixel_size
+                ),
+                gamma_min,
+                gamma_max,
+                apply_gamma=False  # すでにガンマ補正済み
+            ),
             depth=1,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            depth_scale=depth_scale,
-            haze_strength=haze_strength,
-            pixel_size=pixel_size
+            dtype=cp.int16,  # 変更
+            meta=cp.empty((0, 0), dtype=cp.int16)  # 変更
         )
     
     def get_default_params(self) -> dict:
         return {
-            'depth_scale': 1000.0,  # 最大標高値に応じて調整
+            'depth_scale': 1000.0,
             'haze_strength': 0.7,
             'pixel_size': 1.0
         }
@@ -1198,17 +1479,17 @@ class AtmosphericPerspectiveAlgorithm(DaskAlgorithm):
 ###############################################################################
 
 def compute_ambient_occlusion_block(block: cp.ndarray, *, 
-                                    num_samples: int = 16,
-                                    radius: float = 10.0,
-                                    intensity: float = 1.0,
-                                    pixel_size: float = 1.0) -> cp.ndarray:
+                                  num_samples: int = 16,
+                                  radius: float = 10.0,
+                                  intensity: float = 1.0,
+                                  pixel_size: float = 1.0) -> cp.ndarray:
     """スクリーン空間環境光遮蔽（SSAO）の地形版（高速ベクトル化版）"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
     
-    # サンプリング方向を事前計算
-    angles = cp.linspace(0, 2 * cp.pi, num_samples, endpoint=False)
-    directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
+    # サンプリング方向を事前計算（CPU側で）
+    angles = np.linspace(0, 2 * np.pi, num_samples, endpoint=False)
+    directions = np.stack([np.cos(angles), np.sin(angles)], axis=1)
     
     # 距離のサンプリング
     r_factors = cp.array([0.25, 0.5, 0.75, 1.0])
@@ -1221,15 +1502,13 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     for r_factor in r_factors:
         r = radius * r_factor
         
-        # 全方向の変位を一度に計算（ピクセル単位に変換）
-        # 修正: radiusはピクセル単位として扱う（pixel_sizeで除算しない）
-        dx_all = cp.round(r * directions[:, 0]).astype(int)
-        dy_all = cp.round(r * directions[:, 1]).astype(int)
+        # CPU側で変位を計算
+        dx_all = np.round(r * directions[:, 0]).astype(int)
+        dy_all = np.round(r * directions[:, 1]).astype(int)
         
         for i in range(num_samples):
-            # CuPy配列から個別の値を取得して明示的にintに変換
-            dx = int(dx_all[i])
-            dy = int(dy_all[i])
+            dx = dx_all[i]  # すでにCPU上
+            dy = dy_all[i]
             
             if dx == 0 and dy == 0:
                 continue
@@ -1308,24 +1587,48 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         intensity = params.get('intensity', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
         
-        # 修正: radiusをピクセル単位として扱うので、pixel_sizeで除算しない
-        # ユーザーが指定するradiusは既にピクセル単位
-        return gpu_arr.map_overlap(
+        # グローバル統計を計算（新規追加）
+        stats = compute_global_stats(
+            gpu_arr,
+            ambient_occlusion_stat_func,
             compute_ambient_occlusion_block,
+            {
+                'num_samples': num_samples,
+                'radius': radius,
+                'intensity': intensity,
+                'pixel_size': pixel_size
+            },
+            downsample_factor=None,
+            depth=int(radius + 1),
+            algorithm_name='ambient_occlusion'
+        )
+        
+        gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
+        return gpu_arr.map_overlap(
+            lambda block: normalize_and_convert_to_int16(
+                compute_ambient_occlusion_block(
+                    block,
+                    num_samples=num_samples,
+                    radius=radius,
+                    intensity=intensity,
+                    pixel_size=pixel_size
+                ),
+                gamma_min,
+                gamma_max,
+                apply_gamma=False  # すでにガンマ補正済み
+            ),
             depth=int(radius + 1),
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            num_samples=num_samples,
-            radius=radius,
-            intensity=intensity,
-            pixel_size=pixel_size
+            dtype=cp.int16,  # 変更
+            meta=cp.empty((0, 0), dtype=cp.int16)  # 変更
         )
     
     def get_default_params(self) -> dict:
         return {
             'num_samples': 16,
-            'radius': 10.0,     # ピクセル単位の探索半径
+            'radius': 10.0,
             'intensity': 1.0,
             'pixel_size': 1.0
         }
@@ -1380,31 +1683,38 @@ class TPIAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         radius = params.get('radius', 10)
         
-        # 統計量を計算
+        # 統計量を計算（修正版を使用）
         stats = compute_global_stats(
             gpu_arr,
-            lambda data: tpi_lrm_stat_func(compute_tpi_block(data, radius=radius, std_global=None)),
+            tpi_lrm_stat_func_with_gamma,  # 修正版を使用
             compute_tpi_block,
             {'radius': radius, 'std_global': None},
             downsample_factor=None,
-            depth=radius+1
+            depth=radius+1,
+            algorithm_name='tpi'
         )
         
+        # フルサイズで処理し、int16に変換
+        max_abs, gamma_min, gamma_max = stats
         return gpu_arr.map_overlap(
-            compute_tpi_block,
+            lambda block: normalize_and_convert_to_int16(
+                compute_tpi_lrm_no_gamma(block, radius=radius, max_abs=max_abs),
+                gamma_min,  # ガンマ補正後の最小値
+                gamma_max,  # ガンマ補正後の最大値
+                apply_gamma=True,  # 符号を保持したガンマ補正を適用
+                signed_input=True  # 入力が符号付きであることを指定
+            ),
             depth=radius+1,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            radius=radius,
-            std_global=stats[0]
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
         )
     
     def get_default_params(self) -> dict:
         return {
             'radius': 10,  # 解析半径（ピクセル）
         }
-
+    
 ###############################################################################
 # 2.13. LRM (Local Relief Model) アルゴリズム
 ###############################################################################
@@ -1441,25 +1751,33 @@ class LRMAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         kernel_size = params.get('kernel_size', 25)
+        pixel_size = params.get('pixel_size', 1.0)
         
-        # 統計量を計算
+        # 統計量を計算（TPIと同じ関数を使用）
         stats = compute_global_stats(
             gpu_arr,
-            lambda data: tpi_lrm_stat_func(compute_lrm_block(data, kernel_size=kernel_size)),
+            tpi_lrm_stat_func_with_gamma,  # 修正: 正しい関数名
             compute_lrm_block,
-            {'kernel_size': kernel_size},
+            {'kernel_size': kernel_size, 'pixel_size': pixel_size},  # pixel_sizeを追加
             downsample_factor=None,
-            depth=int(kernel_size * 2)
+            depth=int(kernel_size * 2),
+            algorithm_name='lrm'
         )
         
+        # フルサイズで処理し、int16に変換
+        max_abs, gamma_min, gamma_max = stats
         return gpu_arr.map_overlap(
-            compute_lrm_block,
+            lambda block: normalize_and_convert_to_int16(
+                compute_lrm_block(block, kernel_size=kernel_size, std_global=max_abs),
+                gamma_min,  # ガンマ補正後の最小値
+                gamma_max,  # ガンマ補正後の最大値
+                apply_gamma=True,  # 符号を保持したガンマ補正を適用
+                signed_input=True  # 入力が符号付きであることを指定
+            ),
             depth=int(kernel_size * 2),
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            kernel_size=kernel_size,
-            std_global=stats[0]
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
         )
     
     def get_default_params(self) -> dict:
@@ -1482,70 +1800,98 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     
     # 方向ベクトルの事前計算
     angles = cp.linspace(0, 2 * cp.pi, num_directions, endpoint=False)
-    directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
+    
+    # より効率的な距離サンプリング メモリ効率を考慮して距離サンプル数を調整
+    num_samples = min(5, int(cp.log2(max_distance)) + 1)
+    distances = cp.unique(cp.logspace(0, cp.log10(max_distance), num_samples, dtype=cp.float32)).astype(cp.int32)
+    distances = distances[distances > 0]
     
     # 初期化
     init_val = -cp.pi/2 if openness_type == 'positive' else cp.pi/2
     max_angles = cp.full((h, w), init_val, dtype=cp.float32)
     
-    # 距離サンプルを事前計算（整数値に）
-    distances = cp.unique(cp.linspace(0.1, 1.0, 10) * max_distance).astype(int)
-    distances = distances[distances > 0]  # 0を除外
+    # バッチサイズの決定（メモリ使用量を考慮）
+    available_memory = cp.cuda.runtime.memGetInfo()[0] / (1024**3)  # GB
+    if available_memory > 10:
+        batch_size = 8  # 8方向ずつ処理
+    elif available_memory > 5:
+        batch_size = 4
+    else:
+        batch_size = 2
     
-    # パディング値の決定
-    pad_value = Constants.NAN_FILL_VALUE_POSITIVE if openness_type == 'positive' else Constants.NAN_FILL_VALUE_NEGATIVE
-    
-    for r in distances:
-        # 全方向のオフセットを一度に計算
-        offsets = cp.round(r * directions).astype(int)
+    # 方向をバッチ処理
+    for dir_start in range(0, num_directions, batch_size):
+        dir_end = min(dir_start + batch_size, num_directions)
+        batch_angles = angles[dir_start:dir_end]
         
-        for offset in offsets:
-            offset_x, offset_y = offset
-            # CuPy配列要素をPython intに明示的に変換
-            offset_x = int(offset_x)
-            offset_y = int(offset_y)
+        # このバッチの全方向・全距離のオフセットを計算
+        # shape: (batch_size, len(distances), 2)
+        cos_vals = cp.cos(batch_angles)[:, cp.newaxis]
+        sin_vals = cp.sin(batch_angles)[:, cp.newaxis]
+        
+        for dist_idx, r in enumerate(distances):
+            # バッチ内の全方向のオフセットを一度に計算
+            offset_x = cp.round(r * cos_vals).astype(cp.int32).ravel()
+            offset_y = cp.round(r * sin_vals).astype(cp.int32).ravel()
             
-            if offset_x == 0 and offset_y == 0:
+            # ゼロオフセットをスキップ
+            valid_offsets = (offset_x != 0) | (offset_y != 0)
+            if not valid_offsets.any():
                 continue
             
-            # パディングサイズの計算（簡潔に）
-            pad_left = max(0, -offset_x)
-            pad_right = max(0, offset_x)
-            pad_top = max(0, -offset_y)
-            pad_bottom = max(0, offset_y)
+            offset_x = offset_x[valid_offsets]
+            offset_y = offset_y[valid_offsets]
             
-            # パディング
-            if nan_mask.any():
-                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                            mode='constant', constant_values=pad_value)
-            else:
-                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)), 
-                            mode='edge')
-            
-            # 以下は変更なし
-            # シフト（簡潔な記述）
-            start_y = pad_top + offset_y
-            start_x = pad_left + offset_x
-            shifted = padded[start_y:start_y+h, start_x:start_x+w]
-            
-            # 角度計算と更新
-            angle = cp.arctan((shifted - block) / (r * pixel_size))
-            
-            if openness_type == 'positive':
+            # バッチ内の全方向を処理（メモリ効率的な実装）
+            for i, (ox, oy) in enumerate(zip(offset_x, offset_y)):
+                # 各ピクセルごとに計算（ベクトル化）
+                # 元のインデックス
+                y_indices = cp.arange(h)[:, cp.newaxis]
+                x_indices = cp.arange(w)[cp.newaxis, :]
+                
+                # シフト後のインデックス
+                shifted_y = y_indices + oy
+                shifted_x = x_indices + ox
+                
+                # 境界チェック
+                valid_mask = (shifted_y >= 0) & (shifted_y < h) & (shifted_x >= 0) & (shifted_x < w)
+                
+                # 有効な位置の値を取得（無効な位置はNaNとする）
+                shifted_values = cp.full((h, w), cp.nan, dtype=cp.float32)
+                shifted_values[valid_mask] = block[shifted_y[valid_mask], shifted_x[valid_mask]]
+
+                # 角度計算
+                angle = cp.arctan((shifted_values - block) / (r * pixel_size))
+                
+                # NaNでない有効な位置のみ更新
                 valid = ~(cp.isnan(angle) | nan_mask)
-                max_angles = cp.where(valid, cp.maximum(max_angles, angle), max_angles)
-            else:
-                valid = ~(cp.isnan(angle) | nan_mask)
-                max_angles = cp.where(valid, cp.minimum(max_angles, angle), max_angles)
+                
+                if openness_type == 'positive':
+                    max_angles = cp.where(valid, cp.maximum(max_angles, angle), max_angles)
+                else:
+                    max_angles = cp.where(valid, cp.minimum(max_angles, angle), max_angles)
+        
+        # メモリ解放（バッチごと）
+        del cos_vals, sin_vals
+        cp.cuda.Stream.null.synchronize()
     
     # 開度の計算と正規化
-    openness = (cp.pi/2 - max_angles if openness_type == 'positive' 
-                else cp.pi/2 + max_angles)
+    if openness_type == 'positive':
+        openness = cp.pi/2 - max_angles
+    else:
+        openness = cp.pi/2 + max_angles
+    
+    # 0-1に正規化
     openness = cp.clip(openness / (cp.pi/2), 0, 1)
     
-    # ガンマ補正とNaN処理
+    # ガンマ補正
     result = cp.power(openness, Constants.DEFAULT_GAMMA)
+    
+    # NaN処理
     result = restore_nan(result, nan_mask)
+    
+    # メモリ解放
+    del max_angles
     
     return result.astype(cp.float32)
 
@@ -1557,24 +1903,50 @@ class OpennessAlgorithm(DaskAlgorithm):
         openness_type = params.get('openness_type', 'positive')
         num_directions = params.get('num_directions', 16)
         pixel_size = params.get('pixel_size', 1.0)
-
+        
+        # グローバル統計を計算（新規追加）
+        stats = compute_global_stats(
+            gpu_arr,
+            openness_stat_func,
+            compute_openness_vectorized,
+            {
+                'openness_type': openness_type,
+                'num_directions': num_directions,
+                'max_distance': max_distance,
+                'pixel_size': pixel_size
+            },
+            downsample_factor=None,
+            depth=max_distance + 1,
+            algorithm_name='openness'
+        )
+        
+        gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
         return gpu_arr.map_overlap(
-            compute_openness_vectorized,  # ベクトル化版を使用
-            depth=max_distance+1,
+            lambda block: normalize_and_convert_to_int16(
+                compute_openness_vectorized(
+                    block,
+                    openness_type=openness_type,
+                    num_directions=num_directions,
+                    max_distance=max_distance,
+                    pixel_size=pixel_size
+                ),
+                gamma_min,
+                gamma_max,
+                apply_gamma=False  # すでにガンマ補正済み
+            ),
+            depth=max_distance + 1,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            openness_type=openness_type,
-            num_directions=num_directions,
-            max_distance=max_distance,
-            pixel_size=pixel_size
+            dtype=cp.int16,  # 変更
+            meta=cp.empty((0, 0), dtype=cp.int16)  # 変更
         )
     
     def get_default_params(self) -> dict:
         return {
-            'openness_type': 'positive',  # 'positive' or 'negative'
-            'num_directions': 16,  # 探索方向数（少なくして高速化）
-            'max_distance': 50,    # 最大探索距離（ピクセル）
+            'openness_type': 'positive',
+            'num_directions': 16,
+            'max_distance': 50,
             'pixel_size': 1.0
         }
 
@@ -1607,28 +1979,40 @@ class SlopeAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         unit = params.get('unit', 'degree')
         pixel_size = params.get('pixel_size', 1.0)
-        normalize = params.get('normalize', False)  # 正規化オプションを追加
         
-        if normalize and unit == 'degree':
-            # グローバル統計を計算
-            stats = compute_global_stats(
-                gpu_arr,
-                lambda data: (float(cp.min(data[~cp.isnan(data)])), 
-                             float(cp.max(data[~cp.isnan(data)]))),
-                compute_slope_block,
-                {'unit': unit, 'pixel_size': pixel_size},
-                downsample_factor=None,
-                depth=1
-            )
+        # 単位に応じた自明な範囲
+        if unit == 'degree':
+            expected_range = (0.0, 90.0)
+        elif unit == 'percent':
+            expected_range = (0.0, 1000.0)
+        else:  # radians
+            expected_range = (0.0, cp.pi/2)
+        
+        # 正規化関数を定義
+        def normalize_slope(block):
+            if unit == 'degree':
+                normalized = block / 90.0
+            elif unit == 'percent':
+                normalized = cp.tanh(block / 100.0)
+            else:
+                normalized = block / (cp.pi / 2)
+            return cp.clip(normalized, 0, 1)
+        
+        # ガンマ補正後の範囲を計算
+        test_values = cp.array([0.0, 0.5, 1.0])
+        gamma_corrected = cp.power(test_values, Constants.DEFAULT_GAMMA)
+        global_min = 0.0
+        global_max = float(gamma_corrected[-1])
         
         return gpu_arr.map_overlap(
-            compute_slope_block,
+            lambda block: normalize_and_convert_to_int16(
+                normalize_slope(compute_slope_block(block, unit=unit, pixel_size=pixel_size)),
+                global_min, global_max, apply_gamma=True, signed_input=False
+            ),
             depth=1,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            unit=unit,
-            pixel_size=pixel_size
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
         )
     
     def get_default_params(self) -> dict:
@@ -1736,22 +2120,49 @@ class SpecularAlgorithm(DaskAlgorithm):
         light_azimuth = params.get('light_azimuth', Constants.DEFAULT_AZIMUTH)
         light_altitude = params.get('light_altitude', Constants.DEFAULT_ALTITUDE)
 
-        return gpu_arr.map_overlap(
+        # グローバル統計を計算（新規追加）
+        stats = compute_global_stats(
+            gpu_arr,
+            specular_stat_func,
             compute_specular_block,
+            {
+                'roughness_scale': roughness_scale,
+                'shininess': shininess,
+                'pixel_size': pixel_size,
+                'light_azimuth': light_azimuth,
+                'light_altitude': light_altitude
+            },
+            downsample_factor=None,
+            depth=int(roughness_scale),
+            algorithm_name='specular'
+        )
+        
+        gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
+        return gpu_arr.map_overlap(
+            lambda block: normalize_and_convert_to_int16(
+                compute_specular_block(
+                    block,
+                    roughness_scale=roughness_scale,
+                    shininess=shininess,
+                    pixel_size=pixel_size,
+                    light_azimuth=light_azimuth,
+                    light_altitude=light_altitude
+                ),
+                gamma_min,
+                gamma_max,
+                apply_gamma=False  # compute_specular_block内で既にガンマ補正（0.7）済み
+            ),
             depth=int(roughness_scale),
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            roughness_scale=roughness_scale,
-            shininess=shininess,
-            pixel_size=pixel_size,
-            light_azimuth=light_azimuth,
-            light_altitude=light_altitude
+            dtype=cp.int16,  # 変更
+            meta=cp.empty((0, 0), dtype=cp.int16)  # 変更
         )
     
     def get_default_params(self) -> dict:
         return {
-            'roughness_scale': 20.0,
+            'roughness_scale': 20.0,  # デフォルト値も調整
             'shininess': 10.0,
             'light_azimuth': Constants.DEFAULT_AZIMUTH,
             'light_altitude': Constants.DEFAULT_ALTITUDE,
@@ -1764,13 +2175,8 @@ class SpecularAlgorithm(DaskAlgorithm):
 
 def compute_atmospheric_scattering_block(block: cp.ndarray, *, 
                                        scattering_strength: float = 0.5,
-                                       intensity: Optional[float] = None,
                                        pixel_size: float = 1.0) -> cp.ndarray:
-    """大気散乱によるシェーディング（Rayleigh散乱の簡略版）"""
-    # intensity は scattering_strength のエイリアス（後方互換）
-    if intensity is not None:
-        scattering_strength = intensity
-        
+    """大気散乱によるシェーディング（Rayleigh散乱の簡略版）"""        
     # NaNマスクを保存
     nan_mask = cp.isnan(block)
     
@@ -1783,21 +2189,14 @@ def compute_atmospheric_scattering_block(block: cp.ndarray, *,
     zenith_angle = cp.arctan(slope)
     
     # 大気の厚さ（簡略化：天頂角に比例）
-    air_mass = 1.0 / (cp.cos(zenith_angle) + 0.001)  # ゼロ除算回避
+    air_mass = 1.0 / (cp.cos(zenith_angle) + Constants.EPSILON)  # ゼロ除算回避
     
     # Rayleigh散乱の近似
     scattering = 1.0 - cp.exp(-scattering_strength * air_mass)
     
     # 青みがかった散乱光を表現（単一チャンネルなので明度のみ）
-    ambient = 0.4 + 0.6 * scattering
-    
-    # 通常のHillshadeと組み合わせ
-    azimuth_rad = cp.radians(Constants.DEFAULT_AZIMUTH)
-    altitude_rad = cp.radians(Constants.DEFAULT_ALTITUDE)
-    aspect = cp.arctan2(-dy, dx)
-    
-    hillshade = cp.cos(altitude_rad) * cp.cos(slope) + \
-                cp.sin(altitude_rad) * cp.sin(slope) * cp.cos(aspect - azimuth_rad)
+    ambient = 0.4 + 0.6 * scattering    
+    hillshade = compute_hillshade_component(block, nan_mask, pixel_size)
     
     # 散乱光と直接光の合成
     result = ambient * 0.3 + hillshade * 0.7
@@ -1816,18 +2215,40 @@ class AtmosphericScatteringAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         scattering_strength = params.get('scattering_strength', 0.5)
-        intensity = params.get('intensity', None)
         pixel_size = params.get('pixel_size', 1.0)
         
-        return gpu_arr.map_overlap(
+        # グローバル統計を計算（新規追加）
+        stats = compute_global_stats(
+            gpu_arr,
+            atmospheric_scattering_stat_func,
             compute_atmospheric_scattering_block,
+            {
+                'scattering_strength': scattering_strength,
+                'pixel_size': pixel_size
+            },
+            downsample_factor=None,
+            depth=1,
+            algorithm_name='atmospheric_scattering'
+        )
+        
+        gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
+        return gpu_arr.map_overlap(
+            lambda block: normalize_and_convert_to_int16(
+                compute_atmospheric_scattering_block(
+                    block,
+                    scattering_strength=scattering_strength,
+                    pixel_size=pixel_size
+                ),
+                gamma_min,
+                gamma_max,
+                apply_gamma=False  # compute_atmospheric_scattering_block内で既にガンマ補正済み
+            ),
             depth=1,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            scattering_strength=scattering_strength,
-            intensity=intensity,
-            pixel_size=pixel_size
+            dtype=cp.int16,  # 変更
+            meta=cp.empty((0, 0), dtype=cp.int16)  # 変更
         )
     
     def get_default_params(self) -> dict:
@@ -1849,44 +2270,39 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         
         downsample_factor = params.get('downsample_factor', None)
         if downsample_factor is None:
-            # 自動決定
             downsample_factor = determine_optimal_downsample_factor(
                 gpu_arr.shape,
                 algorithm_name='multiscale_terrain'
             )
             
         if weights is None:
-            # デフォルト：スケールに反比例する重み
             weights = [1.0 / s for s in scales]
         
-        # 重みを正規化
         weights = cp.array(weights, dtype=cp.float32)
         weights = weights / weights.sum()
         
-        # 最大スケールに基づいて共通のdepthを決定
         max_scale = max(scales)
         common_depth = min(int(4 * max_scale), Constants.MAX_DEPTH)
         
-        # 縮小版で統計量を計算
+        # Step 1: 縮小版で統計量を計算
         downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
         
-        # 縮小版でマルチスケール処理
         results_small = []
-
-        # 共通のdepthを計算（追加）
         max_scale_small = max([max(1, s // downsample_factor) for s in scales])
         common_depth_small = min(int(4 * max_scale_small), Constants.MAX_DEPTH)
 
         def create_weighted_combiner(weights):
             def weighted_combine_for_stats(*blocks):
-                nan_mask = cp.isnan(blocks[0])
                 result = cp.zeros_like(blocks[0])
                 
                 for i, block in enumerate(blocks):
                     valid = ~cp.isnan(block)
                     result[valid] += block[valid] * weights[i]
                 
-                result[nan_mask] = cp.nan
+                all_nan = cp.ones_like(blocks[0], dtype=bool)
+                for block in blocks:
+                    all_nan &= cp.isnan(block)
+                result[all_nan] = cp.nan
                 return result
             return weighted_combine_for_stats
         
@@ -1894,7 +2310,6 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             scale_small = max(1, scale // downsample_factor)
             
             def compute_detail_small(block, *, scale):
-                # scale=1でも最小限のスムージングを適用
                 smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=max(scale, 0.5), mode='nearest')
                 detail = block - smoothed
                 detail = restore_nan(detail, nan_mask)
@@ -1902,7 +2317,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             
             detail_small = downsampled.map_overlap(
                 compute_detail_small,
-                depth=common_depth_small,  # 共通のdepthを使用
+                depth=common_depth_small,
                 boundary='reflect',
                 dtype=cp.float32,
                 meta=cp.empty((0, 0), dtype=cp.float32),
@@ -1910,7 +2325,6 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             )
             results_small.append(detail_small)
             
-        # ループ後に一度だけ合成
         combined_small = da.map_blocks(
             create_weighted_combiner(weights),
             *results_small,
@@ -1918,22 +2332,36 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             meta=cp.empty((0, 0), dtype=cp.float32)
         ).compute()
 
-        # 統計量を計算
+        # 統計量を計算（ガンマ補正後の範囲も含む）
         valid_data = combined_small[~cp.isnan(combined_small)]
         if len(valid_data) > 0:
             norm_min = float(cp.percentile(valid_data, 5))
             norm_max = float(cp.percentile(valid_data, 95))
+            
+            # ガンマ補正後の範囲をシミュレート
+            if norm_max > norm_min:
+                test_normalized = (valid_data - norm_min) / (norm_max - norm_min)
+                test_normalized = cp.clip(test_normalized, 0, 1)
+                gamma_corrected = cp.power(test_normalized, Constants.DEFAULT_GAMMA)
+                gamma_min = float(cp.min(gamma_corrected))
+                gamma_max = float(cp.max(gamma_corrected))
+            else:
+                gamma_min, gamma_max = 0.5, 0.5
         else:
             norm_min, norm_max = 0.0, 1.0
+            gamma_min, gamma_max = 0.0, 1.0
         
         if params.get('verbose', False):
-            print(f"Multiscale Terrain global stats: min={norm_min:.3f}, max={norm_max:.3f}")
+            logger.debug(
+                "Multiscale Terrain global stats: min=%.3f, max=%.3f | "
+                "After γ-correction: min=%.3f, max=%.3f",
+                norm_min, norm_max, gamma_min, gamma_max,
+            )
         
         # Step 2: フルサイズで処理
         results = []
         for scale in scales:
             def compute_detail_with_smooth(block, *, scale):
-                # scale=1でも最小限のスムージングを適用
                 smoothed, nan_mask = handle_nan_with_gaussian(block, sigma=max(scale, 0.5), mode='nearest')
                 detail = block - smoothed
                 detail = restore_nan(detail, nan_mask)
@@ -1949,9 +2377,9 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             )
             results.append(detail)
         
-        # 重み付き合成とグローバル正規化
-        def weighted_combine_and_normalize(*blocks):
-            """グローバル統計量を使用して正規化"""
+        # 重み付き合成（ガンマ補正なし）
+        def weighted_combine_no_gamma(*blocks):
+            """グローバル統計量を使用して正規化（ガンマ補正なし）"""
             nan_mask = cp.isnan(blocks[0])
             result = cp.zeros_like(blocks[0])
             
@@ -1966,8 +2394,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             else:
                 result = cp.full_like(result, 0.5)
             
-            # ガンマ補正
-            result = cp.power(result, Constants.DEFAULT_GAMMA)
+            # ガンマ補正は削除（normalize_and_convert_to_int16で行う）
             
             # NaN位置を復元
             result[nan_mask] = cp.nan
@@ -1975,19 +2402,31 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             return result.astype(cp.float32)
         
         combined = da.map_blocks(
-            weighted_combine_and_normalize,
+            weighted_combine_no_gamma,
             *results,
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32)
         )
-        return combined
+        
+        # int16に変換（ガンマ補正を含む）
+        return combined.map_blocks(
+            lambda block: normalize_and_convert_to_int16(
+                block,
+                0.0,  # 既に正規化済みなので0-1
+                1.0,
+                apply_gamma=True,  # ここでガンマ補正を適用
+                signed_input=False
+            ),
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
+        )
     
     def get_default_params(self) -> dict:
         return {
             'scales': [1, 10, 50, 100],
             'weights': None,
-            'downsample_factor': None,       # ダウンサンプル係数
-            'verbose': False               # デバッグ出力
+            'downsample_factor': None,
+            'verbose': False
         }
 
 ###############################################################################
@@ -2050,33 +2489,44 @@ class FrequencyEnhancementAlgorithm(DaskAlgorithm):
     """周波数強調アルゴリズム"""
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
-        # 統計量を計算
+        # 統計量を計算（修正版の統計関数を使用）
         stats = compute_global_stats(
             gpu_arr,
-            freq_stat_func,
+            freq_stat_func_with_gamma,  # 修正版を使用
             enhance_frequency_block,
             {
                 'target_frequency': params.get('target_frequency', 0.1),
                 'bandwidth': params.get('bandwidth', 0.05),
                 'enhancement': params.get('enhancement', 2.0),
-                'normalize': False
+                'normalize': False  # 統計計算時は正規化なし
             },
-            downsample_factor=None,
-            depth=32
+            downsample_factor=params.get('downsample_factor', None),
+            depth=32,
+            algorithm_name='frequency_enhancement'
         )
         
+        raw_min, raw_max, gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
         return gpu_arr.map_overlap(
-            enhance_frequency_block,
+            lambda block: normalize_and_convert_to_int16(
+                enhance_frequency_block(
+                    block,
+                    target_frequency=params.get('target_frequency', 0.1),
+                    bandwidth=params.get('bandwidth', 0.05),
+                    enhancement=params.get('enhancement', 2.0),
+                    normalize=True,
+                    norm_min=raw_min,  # 生の最小値
+                    norm_max=raw_max   # 生の最大値
+                ),
+                gamma_min,  # ガンマ補正後の最小値
+                gamma_max,  # ガンマ補正後の最大値
+                apply_gamma=False  # enhance_frequency_block内で既にガンマ補正済み
+            ),
             depth=32,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            target_frequency=params.get('target_frequency', 0.1),
-            bandwidth=params.get('bandwidth', 0.05),
-            enhancement=params.get('enhancement', 2.0),
-            normalize=True,
-            norm_min=stats[0],
-            norm_max=stats[1]
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
         )
     
     def get_default_params(self) -> dict:
@@ -2120,7 +2570,7 @@ def compute_curvature_block(block: cp.ndarray, *, curvature_type: str = 'mean',
         denominator = cp.power(1 + p**2 + q**2, 1.5)
         numerator = (1 + q**2) * r - 2 * p * q * s + (1 + p**2) * t
         
-        curvature = -numerator / (2 * denominator + 1e-10)
+        curvature = -numerator / (2 * denominator + Constants.EPSILON)
         
     elif curvature_type == 'gaussian':
         # ガウス曲率
@@ -2129,12 +2579,12 @@ def compute_curvature_block(block: cp.ndarray, *, curvature_type: str = 'mean',
     elif curvature_type == 'planform':
         # 平面曲率（等高線の曲率）
         curvature = -2 * (dx**2 * dxx + 2 * dx * dy * dxy + dy**2 * dyy) / \
-                   (cp.power(dx**2 + dy**2, 1.5) + 1e-10)
+                   (cp.power(dx**2 + dy**2, 1.5) + Constants.EPSILON)
                    
     else:  # profile
         # 断面曲率（最大傾斜方向の曲率）
         curvature = -2 * (dx**2 * dyy - 2 * dx * dy * dxy + dy**2 * dxx) / \
-                   ((dx**2 + dy**2) * cp.power(1 + dx**2 + dy**2, 0.5) + 1e-10)
+                   ((dx**2 + dy**2) * cp.power(1 + dx**2 + dy**2, 0.5) + Constants.EPSILON)
     
     # 曲率の可視化（正負で色分け）
     # 正の曲率（凸）を明るく、負の曲率（凹）を暗く
@@ -2155,15 +2605,39 @@ class CurvatureAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         curvature_type = params.get('curvature_type', 'mean')
         pixel_size = params.get('pixel_size', 1.0)
-
-        return gpu_arr.map_overlap(
+        
+        # グローバル統計を計算（新規追加）
+        stats = compute_global_stats(
+            gpu_arr,
+            curvature_stat_func,
             compute_curvature_block,
+            {
+                'curvature_type': curvature_type,
+                'pixel_size': pixel_size
+            },
+            downsample_factor=None,
+            depth=2,
+            algorithm_name='curvature'
+        )
+        
+        gamma_min, gamma_max = stats
+        
+        # フルサイズで処理し、int16に変換
+        return gpu_arr.map_overlap(
+            lambda block: normalize_and_convert_to_int16(
+                compute_curvature_block(
+                    block,
+                    curvature_type=curvature_type,
+                    pixel_size=pixel_size
+                ),
+                gamma_min,
+                gamma_max,
+                apply_gamma=False  # compute_curvature_block内で既にガンマ補正済み
+            ),
             depth=2,
             boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            curvature_type=curvature_type,
-            pixel_size=pixel_size
+            dtype=cp.int16,  # 変更
+            meta=cp.empty((0, 0), dtype=cp.int16)  # 変更
         )
     
     def get_default_params(self) -> dict:
@@ -2216,11 +2690,14 @@ def compute_roughness_multiscale(block: cp.ndarray, radii: List[int], window_mul
 
 
 def compute_fractal_dimension_block(block: cp.ndarray, *, 
-                                  radii: List[int] = [2, 4, 8, 16, 32],
-                                  normalize: bool = True,
-                                  mean_global: float = None,
-                                  std_global: float = None) -> cp.ndarray:
+                                    radii: Optional[List[int]] = None,
+                                    normalize: bool = True,
+                                    mean_global: float = None,
+                                    std_global: float = None) -> cp.ndarray:
     """参考実装に準拠したフラクタル次元計算"""
+    if radii is None:
+        radii = [2, 4, 8, 16, 32]
+
     nan_mask = cp.isnan(block)
     
     # 1. マルチスケールroughness計算（window_mult=3はデフォルト）
@@ -2231,7 +2708,7 @@ def compute_fractal_dimension_block(block: cp.ndarray, *,
     n_scales = len(radii)
     
     # log(sigmas)を計算
-    log_sigmas = cp.log(sigmas + 1e-10)
+    log_sigmas = cp.log(sigmas + Constants.EPSILON)
     
     # 回帰係数の計算（参考実装と同じ）
     mean_log_scale = cp.mean(log_scales)
@@ -2245,7 +2722,7 @@ def compute_fractal_dimension_block(block: cp.ndarray, *,
     var_log_scale = cp.mean(log_scales ** 2) - mean_log_scale ** 2
     
     # Hurst指数
-    H = cov / (var_log_scale + 1e-10)
+    H = cov / (var_log_scale + Constants.EPSILON)
     
     # フラクタル次元
     D = 3.0 - H
@@ -2293,22 +2770,17 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         radii = params.get('radii', None)
-        pixel_size = params.get('pixel_size', 1.0)
-        
+
         # 半径の自動決定
+        terrain_stats = params.get('terrain_stats', None)
         if radii is None:
-            radii = self._determine_optimal_radii(pixel_size)
-        
-        # 最低5つのスケールを確保（参考実装のデフォルトと同じ）
-        if len(radii) < 5:
-            radii = [2, 4, 8, 16, 32]
-        
-        max_radius = max(radii)
+            radii, weights = determine_optimal_radii(terrain_stats)
+
         # window_mult=3を考慮したdepth
-        depth = max_radius * 3 + 1
+        depth = max(radii) * 3 + 1
         
         # グローバル統計量を計算（平均と標準偏差）
-        print("🔍 Computing global fractal dimension statistics...")
+        logger.info("Computing global fractal dimension statistics...")
         stats = compute_global_stats(
             gpu_arr,
             fractal_stat_func,
@@ -2320,10 +2792,12 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         )
         
         mean_D, std_D = stats
-        print(f"📊 Fractal dimension: μ={mean_D:.3f}, σ={std_D:.3f}")
+        logger.info(f"Fractal dimension: μ={mean_D:.3f}, σ={std_D:.3f}")
         
-        # フルサイズで処理（正規化あり）
-        return gpu_arr.map_overlap(
+        # フルサイズで処理
+        # 注意: compute_fractal_dimension_blockは既に特殊なガンママッピングを含んでいる
+        # 結果は-1～1の範囲で、sign * |Z|^(1/gamma) の形式
+        result = gpu_arr.map_overlap(
             compute_fractal_dimension_block,
             depth=depth,
             boundary='reflect',
@@ -2334,36 +2808,20 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             mean_global=mean_D,
             std_global=std_D
         )
-    
-    def _determine_optimal_radii(self, pixel_size: float) -> List[int]:
-        """解像度に基づいて最適な半径を決定"""
-        resolution_class = classify_resolution(pixel_size)
         
-        if resolution_class == 'ultra_high':
-            # 0.5m以下 - より広い範囲に拡張
-            base_radii = [2, 4, 8, 16, 32, 64, 128]
-        elif resolution_class == 'very_high':
-            # 1m - より広い範囲に拡張
-            base_radii = [2, 4, 8, 16, 32, 64]
-        elif resolution_class == 'high':
-            # 2.5m
-            base_radii = [2, 4, 8, 16, 32, 48]
-        elif resolution_class == 'medium':
-            # 5m
-            base_radii = [2, 4, 8, 16, 24, 32]
-        elif resolution_class == 'low':
-            # 10-15m - 大幅に拡張
-            base_radii = [2, 4, 8, 16, 32, 48]
-        else:
-            # 30m以上
-            base_radii = [1, 2, 4, 8, 16, 24]
-        
-        # メモリ制約を考慮して最大6つまでに制限（5→6に増加）
-        if len(base_radii) > 6:
-            indices = cp.linspace(0, len(base_radii)-1, 6).astype(int).get()
-            base_radii = [base_radii[int(i)] for i in indices]
-        
-        return base_radii
+        # int16に変換
+        # 既に特殊なガンママッピング済みなので、apply_gamma=False
+        return result.map_blocks(
+            lambda block: normalize_and_convert_to_int16(
+                block,
+                -1.0,  # 最小値（理論値）
+                1.0,   # 最大値（理論値）
+                apply_gamma=False,  # 既に特殊なガンママッピング済み
+                signed_input=True   # 符号付き入力
+            ),
+            dtype=cp.int16,
+            meta=cp.empty((0, 0), dtype=cp.int16)
+        )
     
     def get_default_params(self) -> dict:
         return {
@@ -2371,6 +2829,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             'pixel_size': 1.0,
             'downsample_factor': None,  # 統計計算時のダウンサンプル係数
         }
+    
 ###############################################################################
 # 2.13. アルゴリズムレジストリ
 ###############################################################################

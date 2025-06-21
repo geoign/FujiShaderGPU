@@ -2,15 +2,18 @@
 FujiShaderGPU/utils/nodata_handler.py
 """
 import numpy as np
+import logging
+logger = logging.getLogger(__name__)
 
 # scipyのインポート（フル活用）
 try:
-    from scipy.ndimage import gaussian_filter, distance_transform_edt, uniform_filter
-    from scipy import ndimage
+    from scipy.ndimage import distance_transform_edt
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
-    print("警告: scipyが利用できません。一部の機能で代替処理を使用します。")
+    logging.getLogger(__name__).warning(
+        "scipy が利用できません。一部の CPU フォールバックに切り替えます。"
+    )
 
 def _handle_nodata_ultra_fast(dem_tile: np.ndarray, mask_nodata: np.ndarray) -> np.ndarray:
     """

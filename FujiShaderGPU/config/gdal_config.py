@@ -1,7 +1,7 @@
 """
 FujiShaderGPU/config/gdal_config.py
 """
-import os
+import os, logging
 from osgeo import gdal
 
 def _configure_gdal_ultra_performance(gpu_config: dict):
@@ -58,4 +58,9 @@ def _configure_gdal_ultra_performance(gpu_config: dict):
         os.environ[key] = value
         gdal.SetConfigOption(key, value)
     
-    print(f"GDAL超高速化（{gpu_name or 'CPU'}）: キャッシュ{cache_mb}MB, プール{dataset_pool_size}, HTTP/2有効")
+    logging.getLogger(__name__).info(
+        "GDAL超高速化（%s）: キャッシュ%dMB, プール%d, HTTP/2有効",
+        gpu_name or "CPU",
+        cache_mb,
+        dataset_pool_size,
+    )

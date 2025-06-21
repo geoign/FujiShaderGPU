@@ -2,10 +2,13 @@
 FujiShaderGPU/config/system_config.py
 """
 
-import math, multiprocessing, psutil
+import math, multiprocessing, psutil, logging
 import cupy as cp
 from typing import Optional, List
 from osgeo import gdal
+
+# ロギング設定
+logger = logging.getLogger(__name__)
 
 def get_gpu_config(gpu_type: str = "auto", sigma: float = 10.0, multiscale_mode: bool = True, pixel_size: float = 0.5, target_distances: Optional[List[float]] = None) -> dict:
     """
@@ -127,8 +130,9 @@ def detect_optimal_system_config() -> dict:
             config["vram_gb"] = cp.cuda.runtime.memGetInfo()[1] / (1024**3)
             config["gpu_compute_capability"] = f"{gpu_props['major']}.{gpu_props['minor']}"
             config["gpu_multiprocessors"] = gpu_props['multiProcessorCount']
-    except:
-        pass
+    except (cp.cuda.runtime.CUDARuntimeError, AttributeError) as e:
+        logger.debug(f"GPU detection failed: {e}")
+        raise RuntimeError("GPU detection failed")
     
     # Google Colab検出
     try:
