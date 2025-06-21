@@ -1487,9 +1487,9 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     h, w = block.shape
     nan_mask = cp.isnan(block)
     
-    # サンプリング方向を事前計算（CPU側で）
-    angles = np.linspace(0, 2 * np.pi, num_samples, endpoint=False)
-    directions = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+    # サンプリング方向を事前計算（修正: CuPy配列として作成）
+    angles = cp.linspace(0, 2 * cp.pi, num_samples, endpoint=False)
+    directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
     
     # 距離のサンプリング
     r_factors = cp.array([0.25, 0.5, 0.75, 1.0])
@@ -1502,13 +1502,13 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     for r_factor in r_factors:
         r = radius * r_factor
         
-        # CPU側で変位を計算
-        dx_all = np.round(r * directions[:, 0]).astype(int)
-        dy_all = np.round(r * directions[:, 1]).astype(int)
+        # GPU側で変位を計算（修正: すべてCuPyで処理）
+        dx_all = cp.round(r * directions[:, 0]).astype(cp.int32)
+        dy_all = cp.round(r * directions[:, 1]).astype(cp.int32)
         
         for i in range(num_samples):
-            dx = dx_all[i]  # すでにCPU上
-            dy = dy_all[i]
+            dx = int(dx_all[i])  # CuPyスカラーをPython intに変換
+            dy = int(dy_all[i])
             
             if dx == 0 and dy == 0:
                 continue
