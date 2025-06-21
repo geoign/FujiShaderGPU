@@ -2799,10 +2799,20 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         radii = params.get('radii', None)
 
-        # 半径の自動決定
+        # 半径の自動決定（修正: terrain_statsの初期化を追加）
         terrain_stats = params.get('terrain_stats', None)
         if radii is None:
+            # terrain_statsがない場合は、ここで計算する
+            if terrain_stats is None:
+                logger.info("Analyzing terrain characteristics for automatic radii determination...")
+                # dask_processor.pyのanalyze_terrain_characteristicsと同様の処理
+                from ..core.dask_processor import analyze_terrain_characteristics
+                terrain_stats = analyze_terrain_characteristics(gpu_arr, sample_ratio=0.01, include_fft=False)
+                # pixel_sizeも設定
+                terrain_stats['pixel_size'] = params.get('pixel_size', 1.0)
+                
             radii, weights = determine_optimal_radii(terrain_stats)
+            logger.info(f"Auto-determined radii for fractal analysis: {radii}")
 
         # window_mult=3を考慮したdepth
         depth = max(radii) * 3 + 1
