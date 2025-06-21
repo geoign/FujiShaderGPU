@@ -476,12 +476,12 @@ def visual_saliency_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float
     """Visual Saliency用の統計量計算（ガンマ補正後）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        low_p = float(cp.percentile(valid_data, 25))
-        high_p = float(cp.percentile(valid_data, 85))
+        low_p = float(cp.percentile(valid_data, 5))
+        high_p = float(cp.percentile(valid_data, 95))
         
         if (high_p - low_p) < cp.std(valid_data) * 0.3:
-            low_p = float(cp.percentile(valid_data, 15))
-            high_p = float(cp.percentile(valid_data, 90))
+            low_p = float(cp.percentile(valid_data, 2))
+            high_p = float(cp.percentile(valid_data, 98))
         
         # テスト正規化とガンマ補正
         test_normalized = cp.linspace(0, 1, 100)
@@ -1066,7 +1066,10 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
         if norm_min is not None and norm_max is not None:
             # 提供された統計量で正規化
             if norm_max > norm_min:
-                result = (combined_saliency - norm_min) / (norm_max - norm_min)
+                # より適切な正規化範囲を使用（パーセンタイルベース）
+                range_val = norm_max - norm_min
+                # 外れ値の影響を軽減するためのソフトクリッピング
+                result = cp.tanh((combined_saliency - norm_min) / (range_val * 0.5)) * 0.5 + 0.5
                 result = cp.clip(result, 0, 1)
             else:
                 result = cp.full_like(block, 0.5)
@@ -1074,10 +1077,12 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
             # 従来のローカル正規化（互換性のため残す）
             valid_result = combined_saliency[~nan_mask] if nan_mask.any() else combined_saliency.ravel()
             if len(valid_result) > 0:
-                min_val = float(cp.min(valid_result))
-                max_val = float(cp.max(valid_result))
+                # パーセンタイルベースの正規化で外れ値の影響を軽減
+                min_val = float(cp.percentile(valid_result, 2))
+                max_val = float(cp.percentile(valid_result, 98))
                 if max_val > min_val:
                     result = (combined_saliency - min_val) / (max_val - min_val)
+                    result = cp.clip(result, 0, 1)
                 else:
                     result = cp.full_like(combined_saliency, 0.5)
             else:
@@ -1369,8 +1374,8 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     def get_default_params(self) -> dict:
         return {
             'edge_sigma': 1.0,
-            'threshold_low': 0.2,
-            'threshold_high': 0.5,
+            'threshold_low': 0.1,
+            'threshold_high': 0.3,
             'pixel_size': 1.0
         }
 
@@ -1530,9 +1535,13 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             
             # 高さの差と遮蔽角度
             height_diff = shifted - block
-            # 修正: 実際の距離（メートル）を使用
+            # 平地での処理を追加 高さの差が非常に小さい場合は遮蔽なしとする
+            small_diff_mask = cp.abs(height_diff) < (pixel_size * 0.01)  # 1%未満の高さ変化
+            # 実際の距離（メートル）を使用
             distance = r * pixel_size
-            occlusion_angle = cp.arctan(height_diff / distance)
+            # ゼロ除算とオーバーフロー対策
+            occlusion_angle = cp.arctan(height_diff / (distance + Constants.EPSILON))
+            occlusion_angle = cp.where(small_diff_mask, 0, occlusion_angle)
             
             # 正の角度のみを遮蔽として扱う（修正: より適切な遮蔽の計算）
             # 角度を0-1の範囲に正規化（最大45度を1とする）
@@ -1736,7 +1745,11 @@ def compute_lrm_block(block: cp.ndarray, *, kernel_size: int = 25,
     if std_global is not None:
         # グローバル統計量で正規化
         if std_global > 0:
-            lrm = lrm / (3 * std_global)
+            # より穏やかな正規化（3→6に変更）
+            lrm = lrm / (6 * std_global)
+        else:
+            # std_globalが小さすぎる場合の処理
+            lrm = lrm / cp.std(lrm[~nan_mask])
     
     # 結果は-1から+1の範囲
     result = cp.clip(lrm, -1, 1)
@@ -2019,11 +2032,11 @@ class SlopeAlgorithm(DaskAlgorithm):
         # 正規化関数を定義
         def normalize_slope(block):
             if unit == 'degree':
-                normalized = block / 90.0
+                normalized = 1.0 - (block / 90.0) # 反転: 急斜面を暗く、平地を明るく
             elif unit == 'percent':
-                normalized = cp.tanh(block / 100.0)
+                normalized = 1.0 - cp.tanh(block / 100.0)
             else:
-                normalized = block / (cp.pi / 2)
+                normalized = 1.0 - (block / (cp.pi / 2))
             return cp.clip(normalized, 0, 1)
         
         # ガンマ補正後の範囲を計算
@@ -2761,12 +2774,14 @@ def compute_fractal_dimension_block(block: cp.ndarray, *,
         if std_global > 1e-6:
             Z = (D - mean_global) / std_global
             
-            # [-3, 3]にクリップして[-1, 1]に正規化
-            Z = cp.clip(Z, -3.0, 3.0) / 3.0
+            # より滑らかな正規化（tanh関数を使用）
+            Z = cp.tanh(Z / 2.0)  # より緩やかな変換
             
-            # ガンママッピング（参考実装と同じ）
+            # 階調性を保つためのガンママッピング
+            # より緩やかなガンマ値を使用
+            gamma_value = 1.0 / (Constants.DEFAULT_GAMMA * 1.5)  # ガンマを弱める
             sign = cp.sign(Z)
-            result = sign * cp.power(cp.abs(Z), 1.0 / Constants.DEFAULT_GAMMA)
+            result = sign * cp.power(cp.abs(Z), gamma_value)
         else:
             result = cp.zeros_like(D)
     else:

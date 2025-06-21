@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 from osgeo import gdal
 import cupy as cp
+import numpy as np
 import dask.array as da
 from dask_cuda import LocalCUDACluster
 from dask import config as dask_config
@@ -400,6 +401,9 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                 computed_da = _copy_crs_info(data, computed_da)
                 
                 # COG書き込み
+                # NoData値を設定（int16の場合は-32768）
+                if computed_da.dtype == np.int16:
+                    computed_da.rio.write_nodata(-32768, inplace=True)
                 logger.info("Writing to COG...")
                 computed_da.rio.to_raster(
                     dst,
