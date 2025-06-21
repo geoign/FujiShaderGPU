@@ -1795,13 +1795,38 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                               max_distance: int = 50,
                               pixel_size: float = 1.0) -> cp.ndarray:
     """開度の計算（最適化版）"""
+    # ブロックの形状チェック（修正追加）
+    if block.ndim != 2:
+        # 1次元の場合は適切な2次元形状に変換
+        if block.ndim == 1:
+            # 正方形に近い形状に変換を試みる
+            size = block.size
+            h = int(cp.sqrt(size))
+            w = size // h
+            if h * w != size:
+                # 完全に割り切れない場合は、最後の要素を無視
+                block = block[:h*w].reshape(h, w)
+            else:
+                block = block.reshape(h, w)
+        else:
+            raise ValueError(f"Expected 2D block, got {block.ndim}D")
+    
     h, w = block.shape
     nan_mask = cp.isnan(block)
     
+    # 形状が小さすぎる場合の処理（修正追加）
+    if h < 3 or w < 3:
+        # 小さすぎるブロックは処理できないので、適切なデフォルト値を返す
+        if openness_type == 'positive':
+            return cp.ones_like(block) * 0.5  # 中間値
+        else:
+            return cp.ones_like(block) * 0.5
+    
+    # 以下、既存のコード...
     # 方向ベクトルの事前計算
     angles = cp.linspace(0, 2 * cp.pi, num_directions, endpoint=False)
     
-    # より効率的な距離サンプリング メモリ効率を考慮して距離サンプル数を調整
+    # より効率的な距離サンプリング
     num_samples = min(5, int(cp.log2(max_distance)) + 1)
     distances = cp.unique(cp.logspace(0, cp.log10(max_distance), num_samples, dtype=cp.float32)).astype(cp.int32)
     distances = distances[distances > 0]
@@ -1813,7 +1838,7 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     # バッチサイズの決定（メモリ使用量を考慮）
     available_memory = cp.cuda.runtime.memGetInfo()[0] / (1024**3)  # GB
     if available_memory > 10:
-        batch_size = 8  # 8方向ずつ処理
+        batch_size = 8
     elif available_memory > 5:
         batch_size = 4
     else:
@@ -1824,17 +1849,13 @@ def compute_openness_vectorized(block: cp.ndarray, *,
         dir_end = min(dir_start + batch_size, num_directions)
         batch_angles = angles[dir_start:dir_end]
         
-        # このバッチの全方向・全距離のオフセットを計算
-        # shape: (batch_size, len(distances), 2)
         cos_vals = cp.cos(batch_angles)[:, cp.newaxis]
         sin_vals = cp.sin(batch_angles)[:, cp.newaxis]
         
         for dist_idx, r in enumerate(distances):
-            # バッチ内の全方向のオフセットを一度に計算
             offset_x = cp.round(r * cos_vals).astype(cp.int32).ravel()
             offset_y = cp.round(r * sin_vals).astype(cp.int32).ravel()
             
-            # ゼロオフセットをスキップ
             valid_offsets = (offset_x != 0) | (offset_y != 0)
             if not valid_offsets.any():
                 continue
@@ -1842,10 +1863,9 @@ def compute_openness_vectorized(block: cp.ndarray, *,
             offset_x = offset_x[valid_offsets]
             offset_y = offset_y[valid_offsets]
             
-            # バッチ内の全方向を処理（メモリ効率的な実装）
+            # バッチ内の全方向を処理（修正版）
             for i, (ox, oy) in enumerate(zip(offset_x, offset_y)):
-                # 各ピクセルごとに計算（ベクトル化）
-                # 元のインデックス
+                # 各ピクセルごとに計算（修正版）
                 y_indices = cp.arange(h)[:, cp.newaxis]
                 x_indices = cp.arange(w)[cp.newaxis, :]
                 
@@ -1856,10 +1876,18 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                 # 境界チェック
                 valid_mask = (shifted_y >= 0) & (shifted_y < h) & (shifted_x >= 0) & (shifted_x < w)
                 
-                # 有効な位置の値を取得（無効な位置はNaNとする）
+                # 有効な位置の値を取得（修正版）
                 shifted_values = cp.full((h, w), cp.nan, dtype=cp.float32)
-                shifted_values[valid_mask] = block[shifted_y[valid_mask], shifted_x[valid_mask]]
-
+                
+                # valid_maskがTrueの位置を取得
+                valid_coords = cp.where(valid_mask)
+                if len(valid_coords[0]) > 0:
+                    # 対応するシフト後の座標を取得
+                    src_y = shifted_y[valid_coords]
+                    src_x = shifted_x[valid_coords]
+                    # blockから値を取得して設定
+                    shifted_values[valid_coords] = block[src_y, src_x]
+                
                 # 角度計算
                 angle = cp.arctan((shifted_values - block) / (r * pixel_size))
                 

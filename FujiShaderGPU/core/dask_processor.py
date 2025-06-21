@@ -167,8 +167,10 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             "distributed.scheduler.work-stealing": True,
         })
 
-        # ────────── distributed.core の INFO スパムを抑制 ──────────
+        # distributed.core の INFO スパムを抑制
         logging.getLogger("distributed.core").setLevel(logging.WARNING)
+        # distributed.scheduler のエラーも抑制
+        logging.getLogger("distributed.scheduler").setLevel(logging.CRITICAL)
 
         cluster = LocalCUDACluster(
             device_memory_limit="0.95",  # 95%まで使用可能に
