@@ -165,7 +165,6 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
 
             # ■ スケジューラの同期を改善
             "distributed.scheduler.work-stealing": True,
-            "distributed.scheduler.bandwidth": "100 MB/s",
         })
 
         # ────────── distributed.core の INFO スパムを抑制 ──────────
