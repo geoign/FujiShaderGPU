@@ -208,7 +208,7 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             silence_logs=logging.WARNING,
             death_timeout=death_timeout,
             interface=interface,
-            rmm_pool_size=f"{rmm_size}GB",
+            #rmm_pool_size=f"{rmm_size}GB",
             enable_cudf_spill=True,
             local_directory='/tmp',
         )
