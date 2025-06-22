@@ -890,7 +890,7 @@ def run_pipeline(
                 "is_colab": _gpu_config_manager.is_colab()
             },
             "performance": {
-                "chunk_size": actual_chunk,
+                "chunk_size": chunk,
                 "memory_fraction": memory_fraction,
                 "rmm_pool_gb": gpu_preset["rmm_pool_size_gb"],
                 "rmm_pool_fraction": gpu_preset["rmm_pool_fraction"],
