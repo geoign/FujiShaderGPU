@@ -9,7 +9,7 @@ Dask-CUDA地形解析処理のコア実装
 ###############################################################################
 from __future__ import annotations
 
-import os, sys, time, subprocess, gc, warnings, logging, rasterio, psutil, GPUtil, rmm
+import os, sys, time, subprocess, gc, warnings, logging, rasterio, psutil, GPUtil, rmm, multiprocessing
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 from osgeo import gdal
@@ -111,15 +111,10 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             death_timeout = env_config.get("death_timeout", "60s")
             interface = env_config.get("interface", "lo")
             logger.info("Google Colab環境を検出: メモリ設定を調整")
-            # Colabではスレッドベースワーカーを使用
-            use_processes = False
         else:
             death_timeout = "30s"
             interface = None
-            # 通常環境ではプロセスベース（ただしforkを強制）
-            use_processes = True
             # forkメソッドを強制（Linux環境でのみ有効）
-            import multiprocessing
             if hasattr(multiprocessing, 'set_start_method'):
                 try:
                     multiprocessing.set_start_method('fork', force=True)
@@ -229,7 +224,6 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             interface=interface,
             enable_cudf_spill=True,
             local_directory='/tmp',
-            processes=use_processes,
         )
 
         client = Client(cluster)
