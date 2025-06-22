@@ -588,3 +588,42 @@ Fumihiko IKEGAMI (Ikegami GeoResearch): https://github.com/geoign/FujiShaderGPU
 - **内部依存関係・役割**
   - FujiShaderGPU 全体を **Python パッケージとして認識させるプレースホルダー**。  
     他モジュールは通常 `import FujiShaderGPU` で名前空間が解決される。
+
+
+### FujiShaderGPU/config/gpu_config_manager.py
+
+- **主要機能 (GPUプリセット & 環境設定マネージャ)**  
+  - `GPUConfigManager` シングルトンが **GPU名 / VRAM / Colab判定** からプリセットを読み込み、`get_preset()`, `detect_gpu_type()`, `get_system_preset()` などを提供。:contentReference[oaicite:0]{index=0}  
+  - 未知GPUには `get_preset_for_unknown_gpu()` が VRAM比を用いて **チャンクサイズ & RMMプール** を動的生成。
+  - `get_algorithm_complexity()` でアルゴリズム個別の **演算コスト係数** を返却し、後続のタイル/クラスタ設定最適化へ利用。
+
+- **主な外部依存**  
+  - **設定読込** : `yaml`, `pathlib.Path`  
+  - **ログ** : `logging`  
+  - **型定義** : `typing.Dict`, `typing.Any`
+
+- **内部依存関係・呼び出し元**  
+  - `config.system_config.get_gpu_config()` の下位ユーティリティとして、**GPUプリセット情報を集中管理**。  
+  - `core.dask_processor`, `core.tile_processor` が GPU種別に応じた **チャンクサイズ / RMMメモリプール** を取得する際に参照。  
+  - CLI 層では環境変数 `FUJISHADER_CHUNK_SIZE`, `FUJISHADER_RMM_POOL_GB` によるオーバーライドを使って **ユーザカスタム** を注入。
+
+- **ファイルの役割**  
+  FujiShaderGPU における **GPU & システム構成プリセットの単一ソースオブトゥルース**。GPU名やVRAMを入力すれば即座に最適な Dask/CuPy チャンク設定と GDAL キャッシュ量を返し、プラットフォーム差異を吸収する。  
+
+
+### FujiShaderGPU/config/gpu_presets.yaml  <!-- new -->
+
+- **主要データ (YAMLプリセット定義)**  
+  - `system_presets.gdal` — **RAM容量 (≥64 GB / ≥32 GB / <32 GB)** に応じた `cache_mb`, `dataset_pool` を設定。
+  - `gpu_presets` — GPUタイプ別に `vram_gb`, `chunk_size`, `rmm_pool_size_gb`, `rmm_pool_fraction` を網羅。Laptop RTX 4070 から H100 まで **6 クラス**を収録。  
+  - `algorithm_complexity` — RVI, Hillshade, Ambient Occlusion など **17 アルゴリズムの計算コスト係数** を持ち、負荷見積もりに利用。  
+
+- **主な外部依存**  
+  - なし（純粋な設定ファイル）。
+
+- **内部依存関係・呼び出し元**  
+  - `config.gpu_config_manager.GPUConfigManager._load_config()` が本YAMLを読み込み、**プリセット辞書**として保持。
+  - アルゴリズム複雑度値は `GPUConfigManager.get_algorithm_complexity()` を経由して **処理スケジューラ / チャンク判定**へ反映。  
+
+- **ファイルの役割**  
+  GPU ごとの **最適チャンク・メモリプール・GDAL キャッシュ** と **アルゴリズム重み付け** を集中管理する設定ハブ。コードを改変せず YAML 編集だけで新GPUやメモリ階層を追加できる。  

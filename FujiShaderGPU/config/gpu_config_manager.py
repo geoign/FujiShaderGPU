@@ -72,7 +72,17 @@ class GPUConfigManager:
     def is_colab(self) -> bool:
         """Google Colab環境かどうかを判定"""
         import sys
-        return 'google.colab' in sys.modules
+        # より確実なColab検出
+        if 'google.colab' in sys.modules:
+            return True
+        # 環境変数でも確認
+        import os
+        if os.getenv('COLAB_GPU', None):
+            return True
+        # /content ディレクトリの存在確認（Colab特有）
+        if os.path.exists('/content') and os.path.isdir('/content'):
+            return True
+        return False
     
     def get_preset(self, gpu_type: str) -> Dict[str, Any]:
         """GPU種別のプリセットを取得（環境変数でオーバーライド）"""
