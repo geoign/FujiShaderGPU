@@ -69,6 +69,11 @@ class GPUConfigManager:
         logger.info(f"Unknown GPU with {vram_gb}GB VRAM, using {closest_gpu} preset")
         return closest_gpu
     
+    def is_colab(self) -> bool:
+        """Google Colab環境かどうかを判定"""
+        import sys
+        return 'google.colab' in sys.modules
+    
     def get_preset(self, gpu_type: str) -> Dict[str, Any]:
         """GPU種別のプリセットを取得（環境変数でオーバーライド）"""
         if gpu_type not in self._config["gpu_presets"]:
