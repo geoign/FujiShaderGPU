@@ -146,25 +146,38 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         except:
             available_gb = gpu_memory_gb * 0.8  # フォールバック
         
-        # プリセットを取得（Colab調整込み）
+        # プリセットを取得
         gpu_type = config_mgr.detect_gpu_type(gpu_memory_gb, gpu_name)
         preset = config_mgr.get_preset(gpu_type)
         rmm_size = preset["rmm_pool_size_gb"]
 
+        # 実際に利用可能なメモリに基づいて調整
         if is_colab:
-            # Colab環境ではより控えめに（利用可能メモリの50%）
-            max_rmm_size = int(available_gb * 0.5)
+            # Colab環境では非常に控えめに（利用可能メモリの40%）
+            max_rmm_size = int(available_gb * 0.4)
+            # さらに最大値を制限
+            max_rmm_size = min(max_rmm_size, 16)  # 最大16GBに制限
             rmm_size = min(rmm_size, max_rmm_size)
             logger.info(f"Colab environment: Limiting RMM pool to {rmm_size}GB (available: {available_gb:.1f}GB)")
         else:
-            # 通常環境でも利用可能メモリの70%を上限とする
-            max_rmm_size = int(available_gb * 0.7)
+            # 通常環境でも利用可能メモリの60%を上限とする
+            max_rmm_size = int(available_gb * 0.6)
             if rmm_size > max_rmm_size:
                 rmm_size = max_rmm_size
                 logger.info(f"Adjusting RMM pool size to {rmm_size}GB based on available memory")
 
         # 最小値も設定（最低2GB）
         rmm_size = max(2, rmm_size)
+
+        # さらに安全のため、既に使用されているメモリを考慮
+        try:
+            meminfo = cp.cuda.runtime.memGetInfo()
+            free_gb = meminfo[0] / (1024**3)
+            # 現在の空きメモリの80%を上限とする
+            rmm_size = min(rmm_size, int(free_gb * 0.8))
+            logger.info(f"Final RMM pool size: {rmm_size}GB (free memory: {free_gb:.1f}GB)")
+        except:
+            pass
 
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
