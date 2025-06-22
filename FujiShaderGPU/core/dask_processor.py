@@ -831,25 +831,8 @@ def run_pipeline(
         
         # チャンクサイズの自動決定
         if chunk is None:
-            # まずGPUに応じた最適値を取得
-            optimal_chunk = get_optimal_chunk_size(gpu_info["gpu_memory_gb"], gpu_info["gpu_name"])
-            
-            with rasterio.open(src_cog) as src:
-                total_pixels = src.width * src.height
-                total_gb = (total_pixels * 4) / (1024**3)
-            
-            # データサイズに応じて調整（ただし下方向のみ）
-            if total_gb > 100 and optimal_chunk > 2048:
-                # 非常に大きなデータの場合は控えめに
-                chunk = min(optimal_chunk, 2048)
-            elif total_gb > 50 and optimal_chunk > 3072:
-                chunk = min(optimal_chunk, 3072)
-            elif total_gb > 20 and optimal_chunk > 4096:
-                chunk = min(optimal_chunk, 4096)
-            else:
-                # それ以外はGPUの最適値をそのまま使用
-                chunk = optimal_chunk
-            logger.info(f"Dataset size: {total_gb:.1f} GB, GPU optimal: {optimal_chunk}, using chunk size: {chunk}x{chunk}")
+            chunk = get_optimal_chunk_size(gpu_info["gpu_memory_gb"], gpu_info["gpu_name"])
+            logger.info(f"Using GPU-optimized chunk size: {chunk}x{chunk}")
             
         # 入力ファイル情報
         with rasterio.open(src_cog) as src:
@@ -912,21 +895,8 @@ def run_pipeline(
 
         # チャンクサイズの自動決定
         if chunk is None:
-            with rasterio.open(src_cog) as src:
-                total_pixels = src.width * src.height
-                total_gb = (total_pixels * 4) / (1024**3)
-                
-            # より細かい段階的な調整
-            if total_gb > 100:  # 100GB以上
-                chunk = 1024
-            elif total_gb > 50:  # 50-100GB
-                chunk = 1536
-            elif total_gb > 20:  # 20-50GB
-                chunk = 2048
-            else:
-                chunk = get_optimal_chunk_size()
-            
-            logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
+            chunk = get_optimal_chunk_size()
+            logger.info(f"Using GPU-optimized chunk size: {chunk}x{chunk}")
         
         # 6‑1) DEM 遅延ロード
         with warnings.catch_warnings():
