@@ -7,6 +7,7 @@ import os, argparse, rasterio, GPUtil
 import numpy as np
 from .base import BaseCLI
 from ..core.dask_processor import run_pipeline
+from ..config.gpu_config_manager import _gpu_config_manager
 
 class LinuxCLI(BaseCLI):
     """Linux環境向けCLI実装（Dask-CUDA処理）"""
@@ -495,17 +496,22 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP"]="60s"
         os.environ["DASK_DISTRIBUTED__DEPLOY__LOST_WORKER_TIMEOUT"]="60s"
 
-        # RMM環境変数を設定
+        # RMM環境変数を設定（gpu_config_managerを使用）
         gpus = GPUtil.getGPUs()
         if gpus:
             gpu_memory_gb = gpus[0].memoryTotal / 1024
+            gpu_name = gpus[0].name
         else:
             gpu_memory_gb = 40  # デフォルトA100想定
+            gpu_name = ""
         
-        if gpu_memory_gb >= 40:
-            os.environ["RMM_ALLOCATOR"]="pool"
-            os.environ["RMM_POOL_SIZE"]="35GB"  # A100の場合
-            os.environ["RMM_MAXIMUM_POOL_SIZE"]="38GB"  # VRAMの95%程度
+        # gpu_config_managerからプリセットを取得
+        gpu_type = _gpu_config_manager.detect_gpu_type(gpu_memory_gb, gpu_name)
+        preset = _gpu_config_manager.get_preset(gpu_type)
+        
+        os.environ["RMM_ALLOCATOR"] = "pool"
+        os.environ["RMM_POOL_SIZE"] = f"{preset['rmm_pool_size_gb']}GB"
+        os.environ["RMM_MAXIMUM_POOL_SIZE"] = f"{int(preset['rmm_pool_size_gb'] * 1.1)}GB"  # 10%余裕を持たせる
 
         # パラメータの準備
         params = self.get_common_params(args)

@@ -6,33 +6,24 @@ import math, multiprocessing, psutil, logging
 import cupy as cp
 from typing import Optional, List
 from osgeo import gdal
+from ..config.gpu_config_manager import _gpu_config_manager
 
 # ロギング設定
 logger = logging.getLogger(__name__)
 
-def get_gpu_config(gpu_type: str = "auto", sigma: float = 10.0, multiscale_mode: bool = True, pixel_size: float = 0.5, target_distances: Optional[List[float]] = None) -> dict:
-    """
-    GPU種別に応じた最適設定を取得（T4/L4対応安定版）
-    """
+def get_gpu_config(gpu_type: str = "auto", sigma: float = 10.0, multiscale_mode: bool = True, 
+                   pixel_size: float = 0.5, target_distances: Optional[List[float]] = None) -> dict:
+    """GPU種別に応じた最適設定を取得（T4/L4対応安定版）"""
     sys_config = detect_optimal_system_config()
     
     if gpu_type == "auto":
         gpu_name = sys_config.get("gpu_name", "").upper()
         vram_gb = sys_config["vram_gb"]
-        
-        # GPU名による詳細判定
-        if "A100" in gpu_name or vram_gb >= 40:
-            gpu_type = "a100"
-        elif "L4" in gpu_name or (vram_gb >= 20 and vram_gb < 32):
-            gpu_type = "l4"
-        elif "T4" in gpu_name or (vram_gb >= 14 and vram_gb < 20):
-            gpu_type = "t4"
-        elif "RTX 4070" in gpu_name or (vram_gb >= 8 and vram_gb < 14):
-            gpu_type = "rtx4070"
-        else:
-            gpu_type = "rtx4070"  # 安全側設定
-            
+        gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
         print(f"GPU自動検出: {gpu_name} ({vram_gb:.1f}GB) → {gpu_type}設定")
+    
+    # プリセットから設定を取得
+    preset = _gpu_config_manager.get_preset(gpu_type)
     
     # σ値とマルチスケール設定に基づくpadding計算
     if multiscale_mode:
@@ -50,59 +41,17 @@ def get_gpu_config(gpu_type: str = "auto", sigma: float = 10.0, multiscale_mode:
     min_padding = 32
     calculated_padding = max(min_padding, ((required_padding + 31) // 32) * 32)
     
-    # 安定版設定（T4/L4のメモリ使用量を削減）
-    configs = {
-        "rtx4070": {
-            "tile_size": 4096,      # 大幅増量（2048→4096）
-            "max_workers": min(6, sys_config["cpu_count"]),  # CPU数に応じて調整
-            "padding": calculated_padding,
-            "vram_monitor": False,
-            "batch_size": 2,        # 複数タイル同時処理
-            "prefetch_tiles": 4,    # プリフェッチ数
-            "description": "RTX 4070 超高速最適化（4K tiles）"
-        },
-        "t4": {
-            "tile_size": 2048,      # T4: 安定性重視（3072→2048）
-            "max_workers": min(6, sys_config["cpu_count"]),  # ワーカー数も削減
-            "padding": calculated_padding,
-            "vram_monitor": True,   # メモリ監視を有効化
-            "batch_size": 1,        # バッチサイズを最小化
-            "prefetch_tiles": 2,    # プリフェッチを大幅削減
-            "description": "Tesla T4 安定版（16GB VRAM、2K tiles）"
-        },
-        "l4": {
-            "tile_size": 4096,      # L4: 安定性重視（6144→4096）
-            "max_workers": min(8, sys_config["cpu_count"]),  # ワーカー数も調整
-            "padding": calculated_padding,
-            "vram_monitor": True,   # メモリ監視を維持
-            "batch_size": 2,        # バッチサイズを削減
-            "prefetch_tiles": 4,    # プリフェッチを半減
-            "description": "L4 安定版（24GB VRAM、4K tiles）"
-        },
-        "a100": {
-            "tile_size": 8192,      # A100は調整済みで問題なし
-            "max_workers": min(16, sys_config["cpu_count"]),
-            "padding": calculated_padding,
-            "vram_monitor": True,
-            "batch_size": 4,        # より多くのタイル同時処理
-            "prefetch_tiles": 8,    # 大量プリフェッチ
-            "description": "A100 超高速最適化（8K tiles + batch処理）"
-        }
+    # 既存の形式に変換（互換性のため）
+    config = {
+        "tile_size": preset["chunk_size"] * 2,  # tile_sizeはchunk_sizeの2倍として扱う
+        "max_workers": min(6, sys_config["cpu_count"]),
+        "padding": calculated_padding,
+        "vram_monitor": gpu_type != "a100",
+        "batch_size": 2 if gpu_type == "a100" else 1,
+        "prefetch_tiles": 4 if gpu_type == "a100" else 2,
+        "description": f"{preset.get('name', gpu_type.upper())} 最適化設定",
+        "system_info": sys_config,
     }
-    
-    config = configs.get(gpu_type, configs["rtx4070"])
-    config["system_info"] = sys_config
-    
-    # Google Colab環境での追加調整
-    if sys_config.get("is_colab", False):
-        if gpu_type == "t4":
-            config["tile_size"] = min(config["tile_size"], 2048)
-            config["batch_size"] = 1
-            print("⚠️ Google Colab T4環境: メモリ制限のため設定を調整")
-        elif gpu_type == "l4":
-            config["tile_size"] = min(config["tile_size"], 4096)
-            config["batch_size"] = min(config["batch_size"], 2)
-            print("⚠️ Google Colab L4環境: メモリ制限のため設定を調整")
     
     return config
 

@@ -28,6 +28,7 @@ import rioxarray as rxr
 from tqdm.auto import tqdm
 
 # アルゴリズムのインポート
+from ..config.gpu_config_manager import _gpu_config_manager
 from ..algorithms.dask_algorithms import ALGORITHMS, determine_optimal_radii, determine_optimal_sigmas
 
 # ロギング設定
@@ -37,21 +38,10 @@ logger = logging.getLogger(__name__)
 # 1. Dask‑CUDA クラスタ（改善版）
 ###############################################################################
 
-def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
-    """GPU メモリサイズに基づいて最適なチャンクサイズを計算"""
-    # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
-    base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 15)
-    # 512の倍数に丸める（COGブロックサイズとの整合性）
-    if 20 > gpu_memory_gb >= 10: # T4(16GB)
-        return 1024
-    elif 30 > gpu_memory_gb >= 20: # L4(24GB)
-        return 2048
-    elif 50 > gpu_memory_gb >= 30:  # A100(40GB)
-        return 8192
-    elif gpu_memory_gb >= 70: # Ultra-high-end(80GB and more)
-        return 16384
-    else:
-        return min(8192, (base_chunk // 512) * 512)
+def get_optimal_chunk_size(gpu_memory_gb: float = 40, gpu_name: str = "") -> int:
+    gpu_type = _gpu_config_manager.detect_gpu_type(gpu_memory_gb, gpu_name)
+    preset = _gpu_config_manager.get_preset(gpu_type)
+    return preset["chunk_size"]
     
 def get_rmm_cupy_allocator():
     """RMM CuPy allocatorを取得する共通関数"""
@@ -110,15 +100,22 @@ def _copy_crs_info(source_da: xr.DataArray, target_da: xr.DataArray) -> xr.DataA
 
 def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
     try:
-        # Google Colab環境の検出
-        is_colab = 'google.colab' in sys.modules
+        # 設定マネージャから環境設定を取得
+        config_mgr = _gpu_config_manager
         
+        # Colab環境の検出と設定の取得
+        is_colab = config_mgr.is_colab()
         if is_colab:
-            # Colabではより保守的な設定
-            memory_fraction = min(memory_fraction, 0.5)
+            env_config = config_mgr.get_environment_config("colab")
+            memory_fraction = min(memory_fraction, env_config.get("memory_fraction_limit", 0.5))
+            death_timeout = env_config.get("death_timeout", "60s")
+            interface = env_config.get("interface", "lo")
             logger.info("Google Colab環境を検出: メモリ設定を調整")
+        else:
+            death_timeout = "30s"
+            interface = None
         
-        # GPU情報を取得
+        # GPU情報を取得（gpu_config_managerを使用）
         try:
             gpus = GPUtil.getGPUs()
             if not gpus:
@@ -127,15 +124,19 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
                 try:
                     meminfo = cp.cuda.runtime.memGetInfo()
                     gpu_memory_gb = meminfo[1] / (1024**3)
+                    gpu_name = ""
                     logger.info(f"GPU memory detected via CuPy: {gpu_memory_gb:.1f} GB")
                 except:
                     gpu_memory_gb = 40  # 最終的なフォールバック
+                    gpu_name = ""
             else:
                 gpu_memory_gb = gpus[0].memoryTotal / 1024
-            logger.info(f"GPU detected: {gpus[0].name}, Memory: {gpu_memory_gb:.1f} GB")
+                gpu_name = gpus[0].name
+                logger.info(f"GPU detected: {gpu_name}, Memory: {gpu_memory_gb:.1f} GB")
         except Exception as e:
             logger.warning(f"GPU detection failed: {e}, using default configuration")
             gpu_memory_gb = 40  # デフォルトA100想定
+            gpu_name = ""
 
         # 実際に利用可能なメモリを確認
         try:
@@ -145,12 +146,11 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         except:
             available_gb = gpu_memory_gb * 0.8  # フォールバック
         
-        # RMMプールサイズを動的に調整
-        if gpu_memory_gb >= 40:  # A100
-            rmm_size = min(int(available_gb * 0.7), 20)  # 最大20GBに制限
-        else:
-            rmm_size = min(int(available_gb * 0.6), 12)  # より保守的に
-        
+        # プリセットを取得（Colab調整込み）
+        gpu_type = config_mgr.detect_gpu_type(gpu_memory_gb, gpu_name)
+        preset = config_mgr.get_preset(gpu_type)
+        rmm_size = preset["rmm_pool_size_gb"]
+
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
         dask_config.set({
@@ -174,14 +174,13 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         logging.getLogger("distributed.scheduler").setLevel(logging.CRITICAL)
 
         cluster = LocalCUDACluster(
-            device_memory_limit="0.95",  # 95%まで使用可能に
+            device_memory_limit="0.95",
             jit_unspill=True,
             threads_per_worker=1,
             silence_logs=logging.WARNING,
-            death_timeout="60s" if is_colab else "30s",
-            interface="lo" if is_colab else None,
+            death_timeout=death_timeout,
+            interface=interface,
             rmm_pool_size=f"{rmm_size}GB",
-            rmm_maximum_pool_size=f"{min(int(rmm_size * 1.1), int(available_gb * 0.9))}GB",
             enable_cudf_spill=True,
             local_directory='/tmp',
         )
@@ -594,6 +593,10 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
     """COG書き出し（メモリ容量に応じて自動選択）"""
     total_gb = data.nbytes / (1024**3)
     
+    # 設定マネージャから環境設定を取得
+    config_mgr = _gpu_config_manager
+    chunk_config = config_mgr.get_environment_config("chunk_threshold")
+
     # システムメモリに基づいて閾値を自動決定
     mem_info = psutil.virtual_memory()
     total_ram_gb = mem_info.total / (1024**3)
@@ -772,6 +775,110 @@ def run_pipeline(
     cluster, client = make_cluster(memory_fraction)
     
     try:
+        # ===== 統計ログの収集開始 ===== #
+        # GPU情報の取得
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                gpu_info = {
+                    "gpu_name": gpus[0].name,
+                    "gpu_memory_gb": round(gpus[0].memoryTotal / 1024, 1),
+                    "gpu_driver": gpus[0].driver
+                }
+            else:
+                meminfo = cp.cuda.runtime.memGetInfo()
+                gpu_info = {
+                    "gpu_name": "Unknown",
+                    "gpu_memory_gb": round(meminfo[1] / (1024**3), 1),
+                    "gpu_driver": "Unknown"
+                }
+        except:
+            gpu_info = {"gpu_name": "Unknown", "gpu_memory_gb": 0, "gpu_driver": "Unknown"}
+        
+        # GPU設定の取得
+        gpu_type = _gpu_config_manager.detect_gpu_type(
+            gpu_info["gpu_memory_gb"], 
+            gpu_info["gpu_name"]
+        )
+        gpu_preset = _gpu_config_manager.get_preset(gpu_type)
+        
+        # チャンクサイズの決定（実際に使用される値）
+        if chunk is None:
+            with rasterio.open(src_cog) as src:
+                total_pixels = src.width * src.height
+                total_gb = (total_pixels * 4) / (1024**3)
+                
+            # より細かい段階的な調整
+            if total_gb > 100:  # 100GB以上
+                actual_chunk = 1024
+            elif total_gb > 50:  # 50-100GB
+                actual_chunk = 1536
+            elif total_gb > 20:  # 20-50GB
+                actual_chunk = 2048
+            else:
+                actual_chunk = get_optimal_chunk_size(gpu_info["gpu_memory_gb"], gpu_info["gpu_name"])
+        else:
+            actual_chunk = chunk
+            
+        # 入力ファイル情報
+        with rasterio.open(src_cog) as src:
+            input_info = {
+                "width": src.width,
+                "height": src.height,
+                "crs": str(src.crs) if src.crs else "None",
+                "dtype": str(src.dtypes[0])
+            }
+        
+        # アルゴリズムパラメータの整理
+        algo_params_log = {
+            "algorithm": algorithm,
+            "agg": agg,
+            "auto_sigma": auto_sigma,
+            "auto_radii": auto_radii,
+            **{k: str(v) for k, v in algo_params.items()}  # 全パラメータを文字列化
+        }
+        if sigmas is not None:
+            algo_params_log["sigmas"] = str(sigmas)
+        if radii is not None:
+            algo_params_log["radii"] = str(radii)
+        
+        # 統計ログエントリの構築
+        import json
+        import datetime
+        
+        stats_log = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "env": {
+                "os": os.name,
+                "python": sys.version.split()[0],
+                "cpu_count": os.cpu_count(),
+                "ram_gb": round(mem.total / (1024**3), 1),
+                "ram_available_gb": round(mem.available / (1024**3), 1),
+                **gpu_info,
+                "gpu_type_detected": gpu_type,
+                "is_colab": _gpu_config_manager.is_colab()
+            },
+            "performance": {
+                "chunk_size": actual_chunk,
+                "memory_fraction": memory_fraction,
+                "rmm_pool_gb": gpu_preset["rmm_pool_size_gb"],
+                "rmm_pool_fraction": gpu_preset["rmm_pool_fraction"],
+                "preset_chunk_size": gpu_preset["chunk_size"]
+            },
+            "algorithm": algo_params_log,
+            "io": {
+                "input": os.path.basename(src_cog),
+                "output": os.path.basename(dst_cog),
+                "input_size": f"{input_info['width']}x{input_info['height']}",
+                "input_pixels": input_info['width'] * input_info['height'],
+                "input_gb": round((input_info['width'] * input_info['height'] * 4) / (1024**3), 2)
+            }
+        }
+        
+        # 1行のJSON形式でログ出力
+        logger.info(f"STATS_LOG: {json.dumps(stats_log, ensure_ascii=False)}")
+        # ===== 統計ログの収集終了 ===== #
+        
         # チャンクサイズの自動決定
         if chunk is None:
             with rasterio.open(src_cog) as src:

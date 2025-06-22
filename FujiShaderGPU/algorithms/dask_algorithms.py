@@ -9,6 +9,7 @@ import cupy as cp
 import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation
+from ..config.gpu_config_manager import _gpu_config_manager
 
 # ロギング設定
 logger = logging.getLogger(__name__)
@@ -21,26 +22,6 @@ class Constants:
     NAN_FILL_VALUE_POSITIVE = -1e6
     NAN_FILL_VALUE_NEGATIVE = 1e6
     EPSILON = 1e-8 # ゼロ除算防止用の小さな値
-
-    # アルゴリズムの複雑度係数
-    ALGORITHM_COMPLEXITY = {
-        'rvi': 1.2,                    # マルチスケール処理
-        'hillshade': 0.8,              # 単純な勾配計算
-        'slope': 0.8,                  # 単純な勾配計算
-        'specular': 1.5,               # ラフネス計算が重い
-        'atmospheric_scattering': 0.9,
-        'multiscale_terrain': 1.5,     # マルチスケール処理
-        'frequency_enhancement': 1.3,   # FFT処理
-        'curvature': 1.0,              # 2次微分
-        'visual_saliency': 1.4,        # マルチスケール特徴抽出
-        'npr_edges': 1.1,              # エッジ検出
-        'atmospheric_perspective': 0.9,
-        'ambient_occlusion': 2.0,      # 最も計算コストが高い
-        'tpi': 1.0,                    # 畳み込み処理
-        'lrm': 1.1,                    # ガウシアンフィルタ
-        'openness': 1.8,               # 多方向探索
-        'fractal_anomaly': 1.6,        # マルチスケール回帰計算
-    }
 
 # 1. より詳細な解像度分類関数（既存のclassify_resolutionを置き換え）
 def classify_resolution(pixel_size: float) -> str:
@@ -261,7 +242,7 @@ def determine_optimal_downsample_factor(
     base_factor = float(cp.sqrt(current_pixels / target_pixels))
     
     # アルゴリズムの複雑度で調整
-    complexity = Constants.ALGORITHM_COMPLEXITY.get(algorithm_name, 1.0)
+    complexity = _gpu_config_manager.get_algorithm_complexity(algorithm_name)
     adjusted_factor = base_factor * complexity
     
     # 整数化して範囲内に収める
