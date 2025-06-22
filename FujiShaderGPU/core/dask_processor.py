@@ -208,7 +208,6 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             silence_logs=logging.WARNING,
             death_timeout=death_timeout,
             interface=interface,
-            #rmm_pool_size=f"{rmm_size}GB",
             enable_cudf_spill=True,
             local_directory='/tmp',
         )
@@ -830,23 +829,27 @@ def run_pipeline(
         )
         gpu_preset = _gpu_config_manager.get_preset(gpu_type)
         
-        # チャンクサイズの決定（実際に使用される値）
+        # チャンクサイズの自動決定
         if chunk is None:
+            # まずGPUに応じた最適値を取得
+            optimal_chunk = get_optimal_chunk_size(gpu_info["gpu_memory_gb"], gpu_info["gpu_name"])
+            
             with rasterio.open(src_cog) as src:
                 total_pixels = src.width * src.height
                 total_gb = (total_pixels * 4) / (1024**3)
-                
-            # より細かい段階的な調整
-            if total_gb > 100:  # 100GB以上
-                actual_chunk = 1024
-            elif total_gb > 50:  # 50-100GB
-                actual_chunk = 1536
-            elif total_gb > 20:  # 20-50GB
-                actual_chunk = 2048
+            
+            # データサイズに応じて調整（ただし下方向のみ）
+            if total_gb > 100 and optimal_chunk > 2048:
+                # 非常に大きなデータの場合は控えめに
+                chunk = min(optimal_chunk, 2048)
+            elif total_gb > 50 and optimal_chunk > 3072:
+                chunk = min(optimal_chunk, 3072)
+            elif total_gb > 20 and optimal_chunk > 4096:
+                chunk = min(optimal_chunk, 4096)
             else:
-                actual_chunk = get_optimal_chunk_size(gpu_info["gpu_memory_gb"], gpu_info["gpu_name"])
-        else:
-            actual_chunk = chunk
+                # それ以外はGPUの最適値をそのまま使用
+                chunk = optimal_chunk
+            logger.info(f"Dataset size: {total_gb:.1f} GB, GPU optimal: {optimal_chunk}, using chunk size: {chunk}x{chunk}")
             
         # 入力ファイル情報
         with rasterio.open(src_cog) as src:
