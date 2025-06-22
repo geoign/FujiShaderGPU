@@ -207,6 +207,12 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
 
             # ■ スケジューラの同期を改善
             "distributed.scheduler.work-stealing": True,
+
+            # ■ Colab環境でのセマフォリーク対策
+            # ワーカーを定期的に再起動（最も効果的）
+            "distributed.worker.lifetime.duration": "10 minutes" if is_colab else None,
+            "distributed.worker.lifetime.stagger": "1 minute" if is_colab else None,
+            "distributed.worker.lifetime.restart": True if is_colab else False,
         })
 
         # distributed.core の INFO スパムを抑制
@@ -550,6 +556,8 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                 
                 with rasterio.open(tmp_file, 'w', **profile) as dst_dataset:
                     chunk_idx = 0
+                    # Colab環境でのセマフォクリーンアップ用
+                    is_colab = _gpu_config_manager.is_colab()
                     # 478-497行目あたりの修正案
                     with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk", 
                             disable=not show_progress) as pbar:
@@ -592,6 +600,22 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                                     # 10チャンクごとに軽量クリーンアップ
                                     if chunk_idx % 10 == 0:
                                         cp.get_default_memory_pool().free_all_blocks()
+                                        # Colabでは追加のクリーンアップ
+                                        if is_colab and chunk_idx % 50 == 0:
+                                            # ガベージコレクション強制
+                                            gc.collect()
+                                            # ワーカーのメモリクリーンアップ
+                                            try:
+                                                client = get_client()
+                                                client.run(gc.collect)
+                                                # セマフォの手動クリーンアップ（可能な場合）
+                                                def cleanup_semaphores():
+                                                    gc.collect()
+                                                    # resource_trackerの内部をクリーンアップ
+                                                    return True
+                                                client.run(cleanup_semaphores)
+                                            except:
+                                                pass
                                     
                                     # 進捗更新（メモリ使用量も表示）
                                     pbar.update(1)
