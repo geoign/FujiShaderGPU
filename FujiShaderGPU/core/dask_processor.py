@@ -151,6 +151,21 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
         preset = config_mgr.get_preset(gpu_type)
         rmm_size = preset["rmm_pool_size_gb"]
 
+        if is_colab:
+            # Colab環境ではより控えめに（利用可能メモリの50%）
+            max_rmm_size = int(available_gb * 0.5)
+            rmm_size = min(rmm_size, max_rmm_size)
+            logger.info(f"Colab environment: Limiting RMM pool to {rmm_size}GB (available: {available_gb:.1f}GB)")
+        else:
+            # 通常環境でも利用可能メモリの70%を上限とする
+            max_rmm_size = int(available_gb * 0.7)
+            if rmm_size > max_rmm_size:
+                rmm_size = max_rmm_size
+                logger.info(f"Adjusting RMM pool size to {rmm_size}GB based on available memory")
+
+        # 最小値も設定（最低2GB）
+        rmm_size = max(2, rmm_size)
+
         # Worker の terminate 閾値は Config で与える
         # ────────── メモリ管理パラメータを Config で一括設定 ──────────
         dask_config.set({
@@ -878,7 +893,7 @@ def run_pipeline(
         # 1行のJSON形式でログ出力
         logger.info(f"STATS_LOG: {json.dumps(stats_log, ensure_ascii=False)}")
         # ===== 統計ログの収集終了 ===== #
-        
+
         # チャンクサイズの自動決定
         if chunk is None:
             with rasterio.open(src_cog) as src:
