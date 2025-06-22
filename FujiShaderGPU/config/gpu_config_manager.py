@@ -88,6 +88,23 @@ class GPUConfigManager:
         
         return preset
     
+    def get_environment_config(self, env_type: str) -> Dict[str, Any]:
+        """環境別の設定を取得"""
+        env_configs = {
+            "colab": {
+                "memory_fraction_limit": 0.5,
+                "death_timeout": "60s",
+                "interface": "lo"
+            },
+            "chunk_threshold": {
+                "colab_min": 20,
+                "colab_max": 60,
+                "local_min": 30,
+                "local_max": 100
+            }
+        }
+        return env_configs.get(env_type, {})
+    
     def get_preset_for_unknown_gpu(self, vram_gb: float) -> Dict[str, Any]:
         """未知のGPU用の設定を動的に生成"""
         # 最も近い既知のGPUを基準にする
