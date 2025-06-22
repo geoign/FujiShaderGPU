@@ -49,6 +49,7 @@ dependencies = [
     "xarray; sys_platform == 'linux'",
     "rioxarray; sys_platform == 'linux'",
     "GPUtil; sys_platform == 'linux'",
+    "rmm-cu12; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -89,7 +90,7 @@ Issues = "https://github.com/geoign/FujiShaderGPU/issues"
 fujishadergpu = "FujiShaderGPU.__main__:main"
 
 [tool.setuptools.package-data]
-FujiShaderGPU = ["*.json", "*.yaml", "*.yml"]
+FujiShaderGPU = ["*.json", "*.yaml", "*.yml", "**/*.yaml", "**/*.yml", "**/*.json"]
 
 [tool.black]
 line-length = 120
