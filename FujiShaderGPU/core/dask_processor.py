@@ -204,8 +204,8 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
             "distributed.scheduler.work-stealing": True,
 
             # ■ Colab環境でのセマフォリーク対策（改善版）
-            "distributed.worker.lifetime.duration": "15 minutes" if is_colab else None,  # 10→15分に延長
-            "distributed.worker.lifetime.stagger": "2 minutes" if is_colab else None,   # 1→2分に延長
+            "distributed.worker.lifetime.duration": "60 minutes" if is_colab else None,  # 10→15分に延長
+            "distributed.worker.lifetime.stagger": "30 minutes" if is_colab else None,   # 1→2分に延長
             "distributed.worker.lifetime.restart": True if is_colab else False,
             
             # タスクの再配置を改善
