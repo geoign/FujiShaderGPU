@@ -388,11 +388,13 @@ def rvi_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float]:
     return (1.0, -1.0, 1.0)
 
 def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
-    """RVI用の正規化"""
+    """RVI用の正規化（改善版）"""
     std_global = stats[0]
     if std_global > 0:
-        normalized = block / (3 * std_global)
-        return cp.clip(normalized, -1, 1)
+        # 3倍から5倍に変更して、より広い範囲を保持
+        normalized = block / (5 * std_global)
+        # クリッピング範囲も広げる
+        return cp.clip(normalized, -2, 2)
     return cp.zeros_like(block)
 
 # FrequencyEnhancement用
@@ -457,12 +459,14 @@ def visual_saliency_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float
     """Visual Saliency用の統計量計算（ガンマ補正後）"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        low_p = float(cp.percentile(valid_data, 5))
-        high_p = float(cp.percentile(valid_data, 95))
+        # より広い範囲を使用（1%～99%）
+        low_p = float(cp.percentile(valid_data, 1))
+        high_p = float(cp.percentile(valid_data, 99))
         
-        if (high_p - low_p) < cp.std(valid_data) * 0.3:
-            low_p = float(cp.percentile(valid_data, 2))
-            high_p = float(cp.percentile(valid_data, 98))
+        # 動的な調整の閾値も緩める
+        if (high_p - low_p) < cp.std(valid_data) * 0.1:
+            low_p = float(cp.percentile(valid_data, 0.5))
+            high_p = float(cp.percentile(valid_data, 99.5))
         
         # テスト正規化とガンマ補正
         test_normalized = cp.linspace(0, 1, 100)
@@ -2083,12 +2087,17 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     # 標準偏差 = sqrt(E[X^2] - E[X]^2)
     roughness = cp.sqrt(cp.maximum(mean_sq_filter - mean_filter**2, 0))
     
-    # ラフネスを正規化（より適切な範囲に）
+    # ラフネスを正規化（パーセンタイルベースに変更）
     roughness_valid = roughness[~nan_mask] if nan_mask.any() else roughness
-    if len(roughness_valid) > 0 and cp.max(roughness_valid) > 0:
-        roughness = roughness / cp.max(roughness_valid)
-        # 最小値を設定して完全な鏡面反射を防ぐ
-        roughness = cp.clip(roughness, 0.1, 1.0)
+    if len(roughness_valid) > 0:
+        # パーセンタイルで正規化（外れ値の影響を減らす）
+        p95 = cp.percentile(roughness_valid, 95)
+        if p95 > 0:
+            roughness = roughness / p95
+            # より広い範囲で変化させる
+            roughness = cp.clip(roughness, 0.05, 1.5)
+        else:
+            roughness = cp.full_like(block, 0.5)
     else:
         roughness = cp.full_like(block, 0.5)
     
@@ -2121,8 +2130,9 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     diffuse = n_dot_l * 0.3  # ディフューズ成分を30%
     
     # 合成
-    result = diffuse + specular * 0.7
-    result = cp.clip(result, 0, 1)
+    result = diffuse * 0.4 + specular * 0.6
+    # ソフトクリッピング（tanh関数で滑らかに）
+    result = cp.tanh(result * 1.5) * 0.5 + 0.5
     
     # ガンマ補正（より明るくするため、ガンマ値を調整）
     result = cp.power(result, 0.7)  # Constants.DEFAULT_GAMMAの代わりに0.7を使用
@@ -2755,14 +2765,15 @@ def compute_fractal_dimension_block(block: cp.ndarray, *,
         if std_global > 1e-6:
             Z = (D - mean_global) / std_global
             
-            # より滑らかな正規化（tanh関数を使用）
-            Z = cp.tanh(Z / 2.0)  # より緩やかな変換
-            
-            # 階調性を保つためのガンママッピング
-            # より緩やかなガンマ値を使用
-            gamma_value = 1.0 / (Constants.DEFAULT_GAMMA * 1.5)  # ガンマを弱める
+            # 符号を保持したlog変換（ユーザー提案の実装）
             sign = cp.sign(Z)
-            result = sign * cp.power(cp.abs(Z), gamma_value)
+            # log10(1 + |Z|)で滑らかな変換
+            log_transformed = sign * cp.log10(1 + cp.abs(Z))
+            
+            # 結果を-1〜1の範囲に正規化
+            # log10(1+3) ≈ 0.6なので、3σで約0.6になるように調整
+            result = log_transformed / 0.6
+            result = cp.clip(result, -1, 1)
         else:
             result = cp.zeros_like(D)
     else:
