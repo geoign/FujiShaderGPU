@@ -387,15 +387,58 @@ def rvi_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float]:
         return (std, min_gamma, max_gamma)
     return (1.0, -1.0, 1.0)
 
-def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
-    """RVI用の正規化（改善版）"""
+def rvi_norm_func2(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
+    """RVI用の正規化（より強いlog変換）　"""
     std_global = stats[0]
     if std_global > 0:
-        # 3倍から5倍に変更して、より広い範囲を保持
-        normalized = block / (5 * std_global)
-        # クリッピング範囲も広げる
-        return cp.clip(normalized, -2, 2)
+        # 標準偏差で正規化
+        z_score = block / std_global
+        
+        
+        
+        
+        
+        return cp.clip(result, -1, 1)
     return cp.zeros_like(block)
+
+def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray,
+                  pixel_size: float = 1.0) -> cp.ndarray:
+    """RVI用の正規化（解像度考慮版）"""
+    std_global = stats[0]
+    
+    # 解像度に応じた基準スケールの設定
+    # 0.5m解像度: より小さな基準値（細かい起伏を見る）
+    # 10m解像度: より大きな基準値（大きな地形を見る）
+    if pixel_size <= 1.0:
+        reference_scale = max(0.5, std_global * 0.5)  # 細かい起伏重視
+    elif pixel_size <= 5.0:
+        reference_scale = std_global  # 標準的
+    else:
+        reference_scale = std_global * 2.0  # 大きな地形重視
+    
+    # -----------------------------------------------
+    # 圧縮関数の選択（実際の標高差値に対して適用）
+    # arcsinh: 滑らかな圧縮、物理的に自然
+    compressed = cp.arcsinh(block / reference_scale)  # 10mスケールで正規化
+
+    # # オプション1: 符号維持log10
+    # sign = cp.sign(block)
+    # compressed = sign * cp.log10(reference_scale + cp.abs(block))
+    
+    # # オプション2: 符号維持log10(sqrt)  
+    # sign = cp.sign(block)
+    # compressed = sign * cp.log10(1 + cp.sqrt(cp.abs(block)))
+    # -----------------------------------------------
+    
+    # スケーリング
+    normalized = compressed / 2.0
+    normalized = cp.clip(normalized, -1, 1)
+    
+    # NaN処理
+    if nan_mask is not None and nan_mask.any():
+        normalized = cp.where(nan_mask, cp.nan, normalized)
+    
+    return normalized
 
 # FrequencyEnhancement用
 def freq_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float, float]:
@@ -454,9 +497,8 @@ def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     return cp.zeros_like(block)
 
 # Visual Saliency用
-# 統計関数を修正してガンマ補正後の範囲を返すように
 def visual_saliency_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float, float, float]:
-    """Visual Saliency用の統計量計算（ガンマ補正後）"""
+    """Visual Saliency用の統計量計算"""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
         # より広い範囲を使用（1%～99%）
@@ -468,8 +510,8 @@ def visual_saliency_stat_func_with_gamma(data: cp.ndarray) -> Tuple[float, float
             low_p = float(cp.percentile(valid_data, 0.5))
             high_p = float(cp.percentile(valid_data, 99.5))
         
-        # テスト正規化とガンマ補正
-        test_normalized = cp.linspace(0, 1, 100)
+        # 反転を考慮した正規化とガンマ補正のシミュレーション
+        test_normalized = 1.0 - cp.linspace(0, 1, 100)  # 反転を考慮
         test_gamma = cp.power(test_normalized, Constants.DEFAULT_GAMMA)
         gamma_min = float(cp.min(test_gamma))
         gamma_max = float(cp.max(test_gamma))
@@ -1072,6 +1114,9 @@ def compute_visual_saliency_block(block: cp.ndarray, *, scales: List[float] = [2
                     result = cp.full_like(combined_saliency, 0.5)
             else:
                 result = cp.full_like(combined_saliency, 0.5)
+        
+        # 値を反転（白黒反転）
+        result = 1.0 - result  # この行を追加
         
         # ガンマ補正（正規化された場合のみ）
         result = cp.power(result, Constants.DEFAULT_GAMMA)
@@ -2134,6 +2179,9 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     # ソフトクリッピング（tanh関数で滑らかに）
     result = cp.tanh(result * 1.5) * 0.5 + 0.5
     
+    # ガンマ補正前に確実に0-1の範囲にクリップ
+    result = cp.clip(result, 0.0, 1.0)  # この行を追加
+    
     # ガンマ補正（より明るくするため、ガンマ値を調整）
     result = cp.power(result, 0.7)  # Constants.DEFAULT_GAMMAの代わりに0.7を使用
     
@@ -2765,15 +2813,21 @@ def compute_fractal_dimension_block(block: cp.ndarray, *,
         if std_global > 1e-6:
             Z = (D - mean_global) / std_global
             
-            # 符号を保持したlog変換（ユーザー提案の実装）
+            # より強い圧縮を行うlog変換（RVIの手法を参考に）
             sign = cp.sign(Z)
-            # log10(1 + |Z|)で滑らかな変換
-            log_transformed = sign * cp.log10(1 + cp.abs(Z))
             
-            # 結果を-1〜1の範囲に正規化
-            # log10(1+3) ≈ 0.6なので、3σで約0.6になるように調整
-            result = log_transformed / 0.6
+            # arcsinhを使用してより滑らかな圧縮（RVIと同様）
+            compressed = cp.arcsinh(cp.abs(Z) / 0.5)  # 0.5でスケーリング
+            
+            # 符号を復元
+            result = sign * compressed
+            
+            # -1〜1の範囲に正規化（より広い範囲を使用）
+            result = result / 3.0  # arcsinhの出力を適切にスケール
             result = cp.clip(result, -1, 1)
+            
+            # 値を反転（白黒反転）
+            result = -result  # この行を追加
         else:
             result = cp.zeros_like(D)
     else:
