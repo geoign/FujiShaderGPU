@@ -1,0 +1,263 @@
+Metadata-Version: 2.4
+Name: FujiShaderGPU
+Version: 0.2.1
+Summary: Lightning fast terrain shader for a big Cloud Optimized GeoTIFF
+Author-email: Fumihiko IKEGAMI <f.ikegami@gmail.com>
+Maintainer-email: Fumihiko IKEGAMI <f.ikegami@gmail.com>
+License: MIT
+Project-URL: Homepage, https://github.com/geoign/FujiShaderGPU
+Project-URL: Documentation, https://github.com/geoign/FujiShaderGPU
+Project-URL: Repository, https://github.com/geoign/FujiShaderGPU.git
+Project-URL: Issues, https://github.com/geoign/FujiShaderGPU/issues
+Keywords: DEM,terrain,visualization,GPU,CUDA,CuPy,shader,renderer,geospatial,COG,QGIS
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Science/Research
+Classifier: Topic :: Scientific/Engineering :: GIS
+Classifier: Topic :: Scientific/Engineering :: Visualization
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Operating System :: OS Independent
+Classifier: Environment :: GPU :: NVIDIA CUDA
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy>=1.21.0
+Requires-Dist: PyYAML>=6.0.0
+Requires-Dist: cupy-cuda12x>=13.4.0
+Requires-Dist: rasterio>=1.3.0
+Requires-Dist: psutil>=5.8.0
+Requires-Dist: GDAL>=3.0.0
+Requires-Dist: tqdm
+Provides-Extra: linux
+Requires-Dist: dask-cuda>=24.6; extra == "linux"
+Requires-Dist: dask[array]>=2024.4; extra == "linux"
+Requires-Dist: distributed>=2024.4; extra == "linux"
+Requires-Dist: zarr>=2.18; extra == "linux"
+Requires-Dist: xarray>=2024.1; extra == "linux"
+Requires-Dist: rioxarray>=0.15; extra == "linux"
+Requires-Dist: GPUtil>=1.4; extra == "linux"
+Requires-Dist: rmm-cu12>=25.6; extra == "linux"
+Provides-Extra: windows
+Requires-Dist: scipy>=1.7.0; extra == "windows"
+Provides-Extra: full
+Requires-Dist: scipy>=1.7.0; extra == "full"
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+Requires-Dist: black>=23.0.0; extra == "dev"
+Requires-Dist: flake8>=6.0.0; extra == "dev"
+Requires-Dist: mypy>=1.0.0; extra == "dev"
+Requires-Dist: isort>=5.12.0; extra == "dev"
+Requires-Dist: pre-commit>=3.0.0; extra == "dev"
+Provides-Extra: docs
+Requires-Dist: sphinx>=6.0.0; extra == "docs"
+Requires-Dist: sphinx-rtd-theme>=1.3.0; extra == "docs"
+Requires-Dist: sphinx-autodoc-typehints>=1.23.0; extra == "docs"
+Provides-Extra: benchmark
+Requires-Dist: pytest-benchmark>=4.0.0; extra == "benchmark"
+Requires-Dist: memory-profiler>=0.60.0; extra == "benchmark"
+Dynamic: license-file
+
+# FujiShaderGPU
+
+FujiShaderGPU is a GPU-accelerated terrain visualization/analysis toolkit for large DEM datasets.
+
+- Linux: Dask-CUDA distributed pipeline
+- Windows/macOS: tile-based local GPU pipeline
+- Output: COG and Zarr
+
+See architecture details in `ARCHITECTURE.md`.
+
+## Installation
+
+Base install:
+
+```bash
+pip install -e .
+```
+
+Linux Dask-CUDA runtime:
+
+```bash
+pip install -e ".[linux]"
+```
+
+Windows/macOS tile runtime:
+
+```bash
+pip install -e ".[windows]"
+```
+
+Development tools:
+
+```bash
+pip install -e ".[dev]"
+```
+
+## Run
+
+Entry point:
+
+```bash
+python -m FujiShaderGPU --help
+```
+
+Installed script:
+
+```bash
+fujishadergpu --help
+```
+
+## Input / Output
+
+- Input:
+  - COG (`.tif`, `.tiff`) on all paths
+  - Zarr (`.zarr`) on Dask path
+- Output:
+  - COG by default
+  - Zarr when output path ends with `.zarr` (Dask path)
+
+## Algorithms (Dask Registry)
+
+Current Dask algorithms:
+
+- `rvi`
+- `hillshade`
+- `slope`
+- `specular`
+- `atmospheric_scattering`
+- `multiscale_terrain`
+- `curvature`
+- `visual_saliency`
+- `npr_edges`
+- `ambient_occlusion`
+- `lrm`
+- `openness`
+- `fractal_anomaly`
+- `scale_space_surprise`
+- `multi_light_uncertainty`
+
+Windows/macOS tile path uses the same canonical algorithm names as Dask:
+
+- `rvi`
+- `hillshade`
+- `slope`
+- `specular`
+- `atmospheric_scattering`
+- `multiscale_terrain`
+- `curvature`
+- `visual_saliency`
+- `npr_edges`
+- `ambient_occlusion`
+- `lrm`
+- `openness`
+- `fractal_anomaly`
+- `scale_space_surprise`
+- `multi_light_uncertainty`
+
+The tile backend calls tile-native modules where available and uses a Dask-shared bridge for the remaining algorithms.
+
+Current list can always be checked with:
+
+```bash
+python -m FujiShaderGPU --help
+```
+
+## Examples
+
+Default run:
+
+```bash
+fujishadergpu input.tif output.tif
+```
+
+Run hillshade:
+
+```bash
+fujishadergpu input.tif output.tif --algorithm hillshade
+```
+
+Run multiscale hillshade with common radii/weights parameters:
+
+```bash
+fujishadergpu input.tif output.tif --algorithm hillshade --multiscale --radii 2,4,8,16 --weights 0.4,0.3,0.2,0.1
+```
+
+Run spatial-mode slope (radius-integrated):
+
+```bash
+fujishadergpu input.tif output.tif --algorithm slope --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
+```
+
+Run spatial-mode curvature (radius-integrated):
+
+```bash
+fujishadergpu input.tif output.tif --algorithm curvature --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
+```
+
+Dask/Tile path RVI with explicit radii:
+
+```bash
+fujishadergpu input.tif output.tif --algorithm rvi --radii 4,16,64 --weights 0.5,0.3,0.2
+```
+
+RVI radii behavior:
+
+- `--radii` is interpreted in pixels.
+- `--weights` is optional; if omitted, uniform weighting is used.
+- If `--radii` is omitted, RVI auto-derives radii from terrain characteristics.
+
+Dask path with Zarr output:
+
+```bash
+fujishadergpu input.tif output.zarr --algorithm scale_space_surprise
+```
+
+## Development Checks
+
+```bash
+python -m compileall FujiShaderGPU tests
+ruff check FujiShaderGPU tests
+pytest -q -o addopts='' tests
+python -m pip check
+```
+
+## Repository Structure (Summary)
+
+- `FujiShaderGPU/algorithms/`
+  - `dask_registry.py`
+  - `dask_shared.py`
+  - `tile_shared.py`
+  - `common/kernels.py`
+  - `common/auto_params.py`
+  - `dask/*.py`
+  - `tile/*.py`
+- `FujiShaderGPU/core/`
+  - `dask_processor.py`
+  - `dask_cluster.py`
+  - `dask_io.py`
+  - `tile_processor.py`
+  - `tile_io.py`
+  - `tile_compute.py`
+
+## Notes
+
+- Old monolithic algorithm compatibility layers were removed.
+- Legacy algorithm aliases (`rvi_gaussian`, `composite_terrain`) were removed.
+- The modular `algorithms/dask/*.py` and `algorithms/tile/*.py` layout is canonical.
+- Local/spatial mode is unified across these algorithms:
+  - `hillshade`
+  - `slope`
+  - `specular`
+  - `atmospheric_scattering`
+  - `curvature`
+  - `ambient_occlusion`
+  - `openness`
+  - `multi_light_uncertainty`
+  - `--mode local` (adjacent-pixel computation)
+  - `--mode spatial --radii ... --weights ...` (multi-radius spatial integration)

@@ -1,0 +1,2 @@
+[console_scripts]
+fujishadergpu = FujiShaderGPU.__main__:main
