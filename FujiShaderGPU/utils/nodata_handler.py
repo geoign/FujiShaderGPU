@@ -1,45 +1,71 @@
-"""
-FujiShaderGPU/utils/nodata_handler.py
-"""
+﻿"""NoData preprocessing helpers for tile-based computation."""
+
+from __future__ import annotations
+
+import logging
 import numpy as np
 
-# scipyのインポート（フル活用）
+logger = logging.getLogger(__name__)
+
 try:
-    from scipy.ndimage import gaussian_filter, distance_transform_edt, uniform_filter
-    from scipy import ndimage
+    from scipy.ndimage import distance_transform_edt, gaussian_filter
+
     SCIPY_AVAILABLE = True
-except ImportError:
+except Exception:
     SCIPY_AVAILABLE = False
-    print("警告: scipyが利用できません。一部の機能で代替処理を使用します。")
+    logger.warning(
+        "scipy is not available; using fallback CPU NoData filling."
+    )
+
 
 def _handle_nodata_ultra_fast(dem_tile: np.ndarray, mask_nodata: np.ndarray) -> np.ndarray:
-    """
-    超高速NoData処理
+    """Fill NoData temporarily for neighborhood filters, then mask is restored later.
+
+    Strategy:
+    1) nearest-neighbor virtual fill for masked cells
+    2) weighted smoothing only on the virtual area for boundary stability
+    3) fallback to valid-cell mean when scipy is unavailable
     """
     dem_processed = dem_tile.copy()
-    nodata_ratio = np.count_nonzero(mask_nodata) / mask_nodata.size
-    
-    if nodata_ratio < 0.1:
-        # 高速ゼロ置換
+
+    if mask_nodata is None or not np.any(mask_nodata):
+        return dem_processed
+
+    valid_data = dem_tile[~mask_nodata]
+    if valid_data.size == 0:
         dem_processed[mask_nodata] = 0.0
-    elif nodata_ratio < 0.5 and SCIPY_AVAILABLE:
-        # Scipy高速補間
+        return dem_processed
+
+    fallback_value = float(np.mean(valid_data))
+
+    if SCIPY_AVAILABLE:
         try:
-            indices = distance_transform_edt(mask_nodata, return_distances=False, return_indices=True)
-            dem_processed[mask_nodata] = dem_tile[tuple(indices[:, mask_nodata])]
-        except Exception:
-            # フォールバック
-            valid_data = dem_tile[~mask_nodata]
-            if len(valid_data) > 0:
-                dem_processed[mask_nodata] = np.mean(valid_data)
-            else:
-                dem_processed[mask_nodata] = 0.0
-    else:
-        # 高速平均値補間
-        valid_data = dem_tile[~mask_nodata]
-        if len(valid_data) > 0:
-            dem_processed[mask_nodata] = np.mean(valid_data)
-        else:
-            dem_processed[mask_nodata] = 0.0
-    
+            # Fill NoData cells by nearest valid neighbors.
+            nearest_idx = distance_transform_edt(
+                mask_nodata, return_distances=False, return_indices=True
+            )
+            dem_processed[mask_nodata] = dem_tile[tuple(nearest_idx[:, mask_nodata])]
+
+            # Smooth virtual region with valid-data weighted blur to avoid sharp boundary artifacts.
+            valid_mask = (~mask_nodata).astype(np.float32)
+            nodata_ratio = float(np.count_nonzero(mask_nodata) / mask_nodata.size)
+            sigma = float(min(8.0, max(1.5, 2.0 + nodata_ratio * 8.0)))
+
+            smooth_values = gaussian_filter(
+                dem_processed * valid_mask, sigma=sigma, mode="nearest"
+            )
+            smooth_weights = gaussian_filter(valid_mask, sigma=sigma, mode="nearest")
+            smooth_filled = np.full_like(dem_processed, fallback_value, dtype=np.float32)
+            np.divide(
+                smooth_values,
+                smooth_weights,
+                out=smooth_filled,
+                where=smooth_weights > 1e-6,
+            )
+            dem_processed[mask_nodata] = smooth_filled[mask_nodata]
+            return dem_processed
+        except Exception as exc:
+            logger.debug("NoData virtual fill fallback triggered: %s", exc)
+
+    dem_processed[mask_nodata] = fallback_value
     return dem_processed

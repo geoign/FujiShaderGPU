@@ -4,6 +4,9 @@ FujiShaderGPU/io/cog_validator.py
 import os
 from osgeo import gdal
 
+# Keep current non-exception behavior and silence GDAL 4.0 future warning.
+gdal.DontUseExceptions()
+
 def _validate_cog_for_qgis(cog_path: str):
     """
     QGIS最適化COG検証
@@ -13,7 +16,7 @@ def _validate_cog_for_qgis(cog_path: str):
     try:
         ds = gdal.Open(cog_path, gdal.GA_ReadOnly)
         if ds is None:
-            print("❌ COGファイルを開けません")
+            print("[ERROR] COGファイルを開けません")
             return False
         
         # 基本情報
@@ -21,7 +24,7 @@ def _validate_cog_for_qgis(cog_path: str):
         height = ds.RasterYSize
         bands = ds.RasterCount
         
-        print(f"📊 COG基本情報:")
+        print("[INFO] COG基本情報:")
         print(f"   サイズ: {width} x {height}")
         print(f"   バンド数: {bands}")
         
@@ -30,22 +33,22 @@ def _validate_cog_for_qgis(cog_path: str):
         block_x, block_y = band.GetBlockSize()
         
         if block_x == width and block_y == 1:
-            print("❌ ストライプ形式（タイル化されていません）")
+            print("[ERROR] ストライプ形式（タイル化されていません）")
             tiled = False
         else:
-            print(f"✅ タイル形式: {block_x} x {block_y}")
+            print(f"[OK] タイル形式: {block_x} x {block_y}")
             tiled = True
         
         # オーバービュー確認
         overview_count = band.GetOverviewCount()
-        print(f"📈 オーバービュー数: {overview_count}")
+        print(f"[INFO] オーバービュー数: {overview_count}")
         
         if overview_count == 0:
-            print("❌ オーバービューがありません - QGISで表示が遅くなります")
+            print("[ERROR] オーバービューがありません - QGISで表示が遅くなります")
         elif overview_count < 4:
-            print("⚠️  オーバービューが少ないです - より多くのレベルが推奨")
+            print("[WARN] オーバービューが少ないです - より多くのレベルが推奨")
         else:
-            print("✅ 十分なオーバービューがあります")
+            print("[OK] 十分なオーバービューがあります")
             
         # オーバービューサイズ表示
         for i in range(overview_count):
@@ -57,22 +60,22 @@ def _validate_cog_for_qgis(cog_path: str):
         
         # 圧縮確認
         compression = ds.GetMetadata().get('COMPRESSION', 'なし')
-        print(f"🗜️  圧縮: {compression}")
+        print(f"[INFO]  圧縮: {compression}")
         
         # COG準拠確認
         metadata = ds.GetMetadata()
         layout = metadata.get('LAYOUT', '不明')
         
         if 'COG' in layout.upper() or tiled:
-            print("✅ COG形式準拠")
+            print("[OK] COG形式準拠")
             cog_compliant = True
         else:
-            print("❌ COG形式非準拠")
+            print("[ERROR] COG形式非準拠")
             cog_compliant = False
         
         # ファイルサイズ
         file_size_mb = os.path.getsize(cog_path) / (1024 * 1024)
-        print(f"💾 ファイルサイズ: {file_size_mb:.1f} MB")
+        print(f"[INFO] ファイルサイズ: {file_size_mb:.1f} MB")
         
         # QGIS最適化スコア
         score = 0
@@ -84,20 +87,20 @@ def _validate_cog_for_qgis(cog_path: str):
         if 512 <= block_x <= 1024:  # QGIS最適ブロックサイズ
             score += 10
         
-        print(f"\n🎯 QGIS最適化スコア: {score}/100")
+        print(f"\n[INFO] QGIS最適化スコア: {score}/100")
         
         if score >= 80:
-            print("✅ 優秀 - QGISで高速表示されます")
+            print("[OK] 優秀 - QGISで高速表示されます")
         elif score >= 60:
-            print("⚠️  良好 - 通常速度で表示されます")
+            print("[WARN] 良好 - 通常速度で表示されます")
         elif score >= 40:
-            print("⚠️  要改善 - 表示が遅い可能性があります")
+            print("[WARN] 要改善 - 表示が遅い可能性があります")
         else:
-            print("❌ 不良 - QGISで表示が非常に遅くなります")
+            print("[ERROR] 不良 - QGISで表示が非常に遅くなります")
         
         # 改善提案
         if score < 80:
-            print("\n💡 改善提案:")
+            print("\n[TIP] 改善提案:")
             if not tiled:
                 print("   - ファイルをタイル化してください")
             if overview_count < 6:
@@ -110,5 +113,5 @@ def _validate_cog_for_qgis(cog_path: str):
         return score >= 60
         
     except Exception as e:
-        print(f"❌ COG検証エラー: {e}")
+        print(f"[ERROR] COG検証エラー: {e}")
         return False

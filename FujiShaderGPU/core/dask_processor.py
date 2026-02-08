@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 FujiShaderGPU/core/dask_processor.py
 Dask-CUDA地形解析処理のコア実装
@@ -9,164 +9,89 @@ Dask-CUDA地形解析処理のコア実装
 ###############################################################################
 from __future__ import annotations
 
-import os, sys, time, subprocess, gc, warnings, logging, rasterio, psutil, GPUtil, tempfile
+import gc
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+import time
+
+import psutil
+import rasterio
 from pathlib import Path
 from typing import List, Tuple, Optional
 from osgeo import gdal
 import cupy as cp
-import numpy as np
 import dask.array as da
-from dask_cuda import LocalCUDACluster
 from dask import config as dask_config
 from dask.callbacks import Callback
 from dask.diagnostics import ProgressBar
 from dask.distributed import progress
-from distributed import Client, get_client
+from distributed import get_client
 import xarray as xr
-import rioxarray as rxr
 from tqdm.auto import tqdm
 
 
 # アルゴリズムのインポート
 try:
-    from ..algorithms.dask_algorithms import ALGORITHMS
+    from ..algorithms.dask_registry import ALGORITHMS
 except ImportError:
-    # algorithms/dask_algorithms.py が存在しない場合の仮の定義
+    # algorithms registry が存在しない場合の仮の定義
     ALGORITHMS = {}
-    logging.warning("dask_algorithms module not found. No algorithms available.")
+    logging.warning("dask registry module not found. No algorithms available.")
+
+from ..algorithms.common.auto_params import (
+    determine_optimal_radii as determine_optimal_radii_shared,
+)
+from ..io.raster_info import metric_pixel_scales_from_metadata
+from .dask_cluster import (
+    get_optimal_chunk_size as _cluster_optimal_chunk_size,
+    make_cluster as _cluster_make_cluster,
+)
+from .dask_io import (
+    is_zarr_path as _io_is_zarr_path,
+    load_input_dataarray as _io_load_input_dataarray,
+    write_zarr_output as _io_write_zarr_output,
+)
 
 # ロギング設定
 logger = logging.getLogger(__name__)
 
+
+def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, float, float, bool, Optional[float]]:
+    """Detect signed x/y metric pixel scales from an xarray+rioxarray DataArray."""
+    try:
+        transform = dem.rio.transform()
+        bounds = dem.rio.bounds()
+        crs = dem.rio.crs
+        sx, sy, mean_m, is_geo, lat = metric_pixel_scales_from_metadata(
+            transform=transform, crs=crs, bounds=bounds
+        )
+        return float(sx), float(sy), float(mean_m), bool(is_geo), lat
+    except Exception:
+        try:
+            x_res = abs(float(dem.rio.resolution()[0]))
+            y_res = abs(float(dem.rio.resolution()[1]))
+            mean_m = 0.5 * (x_res + y_res)
+            return float(x_res), float(y_res), float(mean_m), False, None
+        except Exception:
+            return 1.0, 1.0, 1.0, False, None
+
 ###############################################################################
-# 1. Dask‑CUDA クラスタ（改善版）
+# 1. Dask-CUDA クラスタ（改善版）
 ###############################################################################
 
 def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
-    """GPU メモリサイズに基づいて最適なチャンクサイズを計算"""
-    # 経験的な計算式：利用可能メモリの約1/10をチャンクに割り当て
-    base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 15)
-    # 512の倍数に丸める（COGブロックサイズとの整合性）
-    if 20 > gpu_memory_gb >= 10: # T4(16GB)
-        return 1024
-    elif 30 > gpu_memory_gb >= 20: # L4(24GB)
-        return 2048
-    elif 50 > gpu_memory_gb >= 30:  # A100(40GB)
-        return 8192
-    elif gpu_memory_gb >= 70: # Ultra-high-end(80GB and more)
-        return 16384
-    else:
-        return min(8192, (base_chunk // 512) * 512)
+    """Return recommended chunk size from GPU memory."""
+    return _cluster_optimal_chunk_size(gpu_memory_gb)
 
-def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
-    try:
-        # Google Colab環境の検出
-        is_colab = 'google.colab' in sys.modules
-        
-        if is_colab:
-            # Colabではより保守的な設定
-            memory_fraction = min(memory_fraction, 0.5)
-            logger.info("Google Colab環境を検出: メモリ設定を調整")
-        
-        # GPU情報を取得
-        gpus = GPUtil.getGPUs()
-        if gpus:
-            gpu_memory_gb = gpus[0].memoryTotal / 1024
-            logger.info(f"GPU detected: {gpus[0].name}, Memory: {gpu_memory_gb:.1f} GB")
-        else:
-            gpu_memory_gb = 40  # デフォルトA100想定
-
-        # 実際に利用可能なメモリを確認
-        try:
-            meminfo = cp.cuda.runtime.memGetInfo()
-            available_gb = meminfo[0] / (1024**3)
-            logger.info(f"Available GPU memory: {available_gb:.1f} GB")
-        except:
-            available_gb = gpu_memory_gb * 0.8  # フォールバック
-        
-        # RMMプールサイズを動的に調整
-        if gpu_memory_gb >= 40:  # A100
-            rmm_size = min(int(available_gb * 0.7), 20)  # 最大20GBに制限
-        else:
-            rmm_size = min(int(available_gb * 0.6), 12)  # より保守的に
-        
-        # Worker の terminate 閾値は Config で与える
-        # ────────── メモリ管理パラメータを Config で一括設定 ──────────
-        dask_config.set({
-            # ■ メモリしきい値
-            "distributed.worker.memory.target":     0.70,  # 70 % で spill 開始
-            "distributed.worker.memory.spill":      0.75,  # 75 % でディスク spill
-            "distributed.worker.memory.pause":      0.85,  # 85 % でタスク一時停止
-            "distributed.worker.memory.terminate":  0.95,  # 95 % でワーカ kill
-
-            # ■ イベントループ警告を 15 s まで黙らせる
-            "distributed.admin.tick.limit": "15s",
-        })
-
-        # ────────── distributed.core の INFO スパムを抑制 ──────────
-        logging.getLogger("distributed.core").setLevel(logging.WARNING)
-
-        cluster = LocalCUDACluster(
-            device_memory_limit="0.95",  # 95%まで使用可能に
-            jit_unspill=True,
-            rmm_pool_size=f"{rmm_size}GB",
-            threads_per_worker=1,
-            silence_logs=logging.WARNING,
-            death_timeout="60s" if is_colab else "30s",
-            interface="lo" if is_colab else None,
-            rmm_maximum_pool_size=f"{int(rmm_size * 1.2)}GB",  # より控えめに
-            enable_cudf_spill=True,
-            local_directory='/tmp',
-        )
-
-        client = Client(cluster)
-        try:
-            import rmm, cupy as cp
-            rmm.reinitialize(
-                pool_allocator=True,
-                managed_memory=False,
-                initial_pool_size=f"{rmm_size}GB",
-            )
-            # --- RMM ≥22.12 では allocator の import パスが変更 ---
-            try:
-                from rmm.allocators.cupy import rmm_cupy_allocator
-            except ImportError:                    # 旧バージョン fallback
-                rmm_cupy_allocator = getattr(rmm, "rmm_cupy_allocator", None)
-            if rmm_cupy_allocator is None:
-                raise RuntimeError(
-                    "RMM のバージョンが古いかインストールが不完全です。"
-                    "  'pip install --extra-index-url https://pypi.nvidia.com rmm-cu12==25.06.*' "
-                    "で再インストールしてください。"
-                )
-            cp.cuda.set_allocator(rmm_cupy_allocator)
-
-            def _enable_rmm_on_worker():
-                import rmm, cupy as _cp
-                rmm.reinitialize(pool_allocator=True, managed_memory=False)
-                
-                # 新しいRMM APIに対応
-                try:
-                    from rmm.allocators.cupy import rmm_cupy_allocator
-                except ImportError:
-                    rmm_cupy_allocator = getattr(rmm, "rmm_cupy_allocator", None)
-                
-                if rmm_cupy_allocator:
-                    _cp.cuda.set_allocator(rmm_cupy_allocator)
-
-            client.run(_enable_rmm_on_worker)
-
-            logger.info("CuPy allocator switched to RMM – GPU memory is now managed by Dask")
-        except ImportError:
-            logger.warning("rmm not found – falling back to default CuPy allocator")
-
-        logger.info(f"Dask dashboard: {client.dashboard_link}")
-        return cluster, client
-    except Exception as e:
-        logger.error(f"Failed to create cluster: {e}")
-        raise
+def make_cluster(memory_fraction: float = 0.6):
+    """Create Dask-CUDA cluster via core/dask_cluster.py."""
+    return _cluster_make_cluster(memory_fraction)
 
 ###############################################################################
-# 3. 地形解析によるsigma自動決定
+# 3. 地形解析による自動パラメータ決定
 ###############################################################################
 
 def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01, 
@@ -254,111 +179,17 @@ def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.0
         stats['dominant_scales'] = []
         stats['dominant_freqs'] = []
         stats['mean_curvature'] = 0.0
+    # auto-parameter 推定の共通指標
+    stats["complexity_score"] = float(stats["mean_slope"] * stats["std_dev"])
     return stats
 
+
 def determine_optimal_radii(terrain_stats: dict) -> Tuple[List[int], List[float]]:
-    """地形統計に基づいて最適な半径を決定"""
-    pixel_size = terrain_stats.get('pixel_size', 1.0)
-    mean_slope = terrain_stats['mean_slope']
-    std_dev = terrain_stats['std_dev']
-    
-    # 地形の複雑さ
-    complexity = mean_slope * std_dev
-    
-    # 基本的な実世界距離（メートル）
-    if complexity < 0.1:
-        # 平坦な地形：大きめのスケール
-        base_distances = [10, 40, 160, 640]
-    elif complexity < 0.3:
-        # 緩やかな地形：中程度のスケール
-        base_distances = [5, 20, 80, 320]
-    else:
-        # 複雑な地形：細かいスケール
-        base_distances = [2.5, 10, 40, 160]
-    
-    # ピクセル単位の半径に変換
-    radii = []
-    for dist in base_distances:
-        radius = int(dist / pixel_size)
-        # 現実的な範囲に制限（2-256ピクセル）
-        radius = max(2, min(radius, 256))
-        radii.append(radius)
-    
-    # 重複削除とソート
-    radii = sorted(list(set(radii)))
-    
-    # 最大4つまでに制限
-    if len(radii) > 4:
-        # 対数的に分布
-        indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
-        radii = [radii[int(i)] for i in indices]
-    
-    # 重みの決定（小さいスケールを重視）
-    weights = []
-    for i, r in enumerate(radii):
-        weight = 1.0 / (i + 1)  # 1, 1/2, 1/3, 1/4
-        weights.append(weight)
-    
-    # 正規化
-    total = sum(weights)
-    weights = [w / total for w in weights]
-    
-    return radii, weights
-
-def determine_optimal_sigmas(terrain_stats: dict, pixel_size: float = 1.0) -> List[float]:
-    """地形統計に基づいて最適なsigma値を決定"""
-    sigmas_set = set()  # setを使って重複を確実に排除
-    
-    # 1. 標高レンジと勾配に基づく基本スケール
-    elev_range = terrain_stats['elevation_range']
-    mean_slope = terrain_stats['mean_slope']
-    
-    # 地形の複雑さの指標
-    terrain_complexity = mean_slope * terrain_stats['std_dev'] / (elev_range + 1e-6)
-    
-    # 基本スケール（地形の複雑さに応じて調整）
-    if terrain_complexity < 0.1:  # 平坦な地形
-        # base_scales = [100, 200, 400]  # この行を削除
-        base_scales = [50, 100, 150]  # より小さい値に制限
-    elif terrain_complexity < 0.3:  # 緩やかな地形
-        base_scales = [50, 100, 200]
-    else:  # 複雑な地形
-        base_scales = [25, 50, 100, 200]
-    
-    # 2. FFT解析から得られたスケールを追加
-    if terrain_stats.get('dominant_scales', []):
-        for scale in terrain_stats['dominant_scales']:
-            if 10 < scale < 500:  # 現実的な範囲のスケールのみ
-                # Gaussianフィルタのsigmaは、検出されたスケールの約1/4
-                sigma_candidate = round(scale / 4, 0)  # 整数に丸める
-                # if 5 <= sigma_candidate <= 500:  # この行を削除
-                if 5 <= sigma_candidate <= 150:  # 最大値を150に制限
-                    sigmas_set.add(sigma_candidate)
-    
-    # 3. 曲率に基づく微細スケール
-    mean_curv = terrain_stats['mean_curvature']
-    if mean_curv > 0.01:  # 曲率が高い場合は細かいスケールも追加
-        sigmas_set.add(10)
-    
-    # 基本スケールを追加
-    for scale in base_scales:
-        # if 5 <= scale <= 500:  # この行を削除
-        if 5 <= scale <= 150:  # 最大値を150に制限
-            sigmas_set.add(scale)
-    
-    # setをリストに変換してソート
-    sigmas = sorted(list(sigmas_set))
-    
-    # 最大3つまでに制限（メモリ効率のため、5→3に削減）
-    if len(sigmas) > 3:
-        indices = cp.linspace(0, len(sigmas)-1, 3).astype(int)
-        sigmas = [sigmas[i] for i in indices]
-    
-    return [float(s) for s in sigmas]
-
+    """共通モジュール経由で最適半径を決定。"""
+    return determine_optimal_radii_shared(terrain_stats)
 
 ###############################################################################
-# 4. 直接 COG 出力 (GDAL ≥ 3.8) - 改善版
+# 4. 直接 COG 出力 (GDAL >= 3.8) - 改善版
 ###############################################################################
 
 def get_cog_options(dtype: str) -> dict:
@@ -415,10 +246,10 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                         def _start(self, dsk):
                             self.tqdm = tqdm(total=len(dsk), desc='Computing', unit='tasks')
                             
-                        def _posttask(self, key, result, dsk, state, worker_id):
+                        def _posttask(self, key, result, dsk, _state, _worker_id):
                             self.tqdm.update(1)
                             
-                        def _finish(self, dsk, state, failed):
+                        def _finish(self, dsk, _state, _failed):
                             self.tqdm.close()
                     
                     with TqdmCallback():
@@ -448,7 +279,7 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                 )
             
             size_mb = os.path.getsize(dst) / 2**20
-            logger.info(f"✔ COG written: {dst} ({size_mb:.1f} MB)")
+            logger.info(f"[OK] COG written: {dst} ({size_mb:.1f} MB)")
             
         except Exception as e:
             logger.warning(f"COG driver failed: {e}, falling back to gdal_translate")
@@ -475,7 +306,7 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         try:
             client = get_client()
             client.run(lambda: gc.collect())
-        except:
+        except Exception:
             pass
 
     # DRAMの空き容量を確認してプリフェッチを有効化
@@ -538,10 +369,6 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                                 y_end = y_start + chunk_height
                                 x_end = x_start + chunk_width
                                 
-                                # 座標のスライスを作成
-                                y_slice = slice(y_start, y_end)
-                                x_slice = slice(x_start, x_end)
-                                
                                 # チャンクをDataArrayとして作成
                                 chunk_da = xr.DataArray(
                                     chunk_data,
@@ -602,7 +429,7 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             
             # GDALの進捗コールバック
             pbar = tqdm(total=100, desc="COG conversion", unit="%")
-            def gdal_progress_callback(complete, message, cb_data):
+            def gdal_progress_callback(complete, _message, _cb_data):
                 pbar.n = int(complete * 100)
                 pbar.refresh()
                 if complete >= 1.0:
@@ -661,7 +488,7 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
         vram_free_gb = meminfo[0] / (1024**3)
         vram_total_gb = meminfo[1] / (1024**3)
         logger.info(f"GPU VRAM: {vram_total_gb:.1f}GB total, {vram_free_gb:.1f}GB free")
-    except:
+    except Exception:
         pass
     
     # データサイズと閾値の比較
@@ -754,28 +581,32 @@ def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
 # 6. メインパイプライン
 ###############################################################################
 
-def validate_inputs(src_cog: str, sigmas: Optional[List[float]] = None):
+def validate_inputs(src_cog: str):
     """入力パラメータの検証"""
     if not Path(src_cog).exists():
         raise FileNotFoundError(f"Input file not found: {src_cog}")
-    
-    if sigmas is not None:
-        if not sigmas:
-            raise ValueError("At least one sigma value must be provided")
-        
-        if any(s <= 0 for s in sigmas):
-            raise ValueError("All sigma values must be positive")
+
+
+def _is_zarr_path(path: str) -> bool:
+    return _io_is_zarr_path(path)
+
+
+def _load_input_dataarray(src_path: str, chunk: int) -> xr.DataArray:
+    return _io_load_input_dataarray(src_path, chunk)
+
+
+def _write_zarr_output(data: xr.DataArray, dst: Path, show_progress: bool = True):
+    logger.info("Writing output as Zarr: %s", dst)
+    _io_write_zarr_output(data, dst, show_progress=show_progress)
 
 def run_pipeline(
     src_cog: str,
     dst_cog: str,
     algorithm: str = "rvi",
-    sigmas: Optional[List[float]] = None,
     radii: Optional[List[int]] = None,
     agg: str = "mean",
     chunk: Optional[int] = None,
     show_progress: bool = True,
-    auto_sigma: bool = False,
     auto_radii: bool = True,
     **algo_params
 ):
@@ -786,8 +617,8 @@ def run_pipeline(
     
     algo = ALGORITHMS[algorithm]
     
-    # 入力検証（sigmasはNoneでもOK）
-    validate_inputs(src_cog, sigmas)
+    # 入力検証
+    validate_inputs(src_cog)
     
     # メモリ状況の確認
     mem = psutil.virtual_memory()
@@ -801,9 +632,16 @@ def run_pipeline(
     try:
         # チャンクサイズの自動決定
         if chunk is None:
-            with rasterio.open(src_cog) as src:
-                total_pixels = src.width * src.height
+            if _is_zarr_path(src_cog):
+                dem_probe = _load_input_dataarray(src_cog, 1024)
+                height = dem_probe.sizes[dem_probe.dims[-2]]
+                width = dem_probe.sizes[dem_probe.dims[-1]]
+                total_pixels = height * width
                 total_gb = (total_pixels * 4) / (1024**3)
+            else:
+                with rasterio.open(src_cog) as src:
+                    total_pixels = src.width * src.height
+                    total_gb = (total_pixels * 4) / (1024**3)
                 
             # より細かい段階的な調整
             if total_gb > 100:  # 100GB以上
@@ -817,24 +655,13 @@ def run_pipeline(
             
             logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
         
-        # 6‑1) DEM 遅延ロード
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
-            dem: xr.DataArray = (
-                rxr.open_rasterio(
-                    src_cog, 
-                    masked=True, 
-                    chunks={"y": chunk, "x": chunk},
-                    lock=False,  # 並列読み込みを許可
-                )
-                .squeeze()
-                .astype("float32")
-            )
+        # 6-1) DEM 遅延ロード (COG または Zarr)
+        dem: xr.DataArray = _load_input_dataarray(src_cog, chunk)
         
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
         
-        # 6‑2) CuPy 配列へ変換（改善：メタデータ指定）
+        # 6-2) CuPy 配列へ変換（改善：メタデータ指定）
         gpu_arr: da.Array = dem.data.map_blocks(
             cp.asarray, 
             dtype=cp.float32,
@@ -851,24 +678,27 @@ def run_pipeline(
             'show_progress': show_progress,
             'agg': agg
         }
+
+        # Inject anisotropic pixel scales (simple geographic DEM support).
+        px_m_x, px_m_y, pixel_size_m, is_geo, lat_center = _detect_metric_scales_from_dataarray(dem)
+        params['pixel_size'] = float(pixel_size_m)
+        params.setdefault('pixel_scale_x', float(px_m_x))
+        params.setdefault('pixel_scale_y', float(px_m_y))
+        if is_geo:
+            ratio = abs(px_m_y) / max(abs(px_m_x), 1e-9)
+            logger.info(
+                "Geographic DEM approximation enabled: "
+                f"lat={lat_center:.3f}, dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m, dy/dx={ratio:.4f}"
+            )
+        else:
+            logger.info(f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m")
         
-        # 6‑2.5) 自動決定（RVIアルゴリズムの場合）
+        # 6-2.5) 自動決定（RVIアルゴリズムの場合）
         if algorithm == "rvi":
-            # ピクセルサイズを先に取得（座標系から）
-            try:
-                x_res = abs(float(dem.rio.resolution()[0]))
-                y_res = abs(float(dem.rio.resolution()[1]))
-                pixel_size = (x_res + y_res) / 2
-                logger.info(f"Detected pixel size: {pixel_size:.2f}")
-            except:
-                pixel_size = 1.0  # デフォルト
-                logger.warning("Could not determine pixel size, using 1.0")
-            
-            # パラメータに設定
-            params['pixel_size'] = pixel_size
+            pixel_size = float(params.get('pixel_size', 1.0))
             
             # 新しい効率的なモードをデフォルトに
-            if radii is None and sigmas is None and auto_radii:
+            if radii is None and auto_radii:
                 logger.info("Analyzing terrain for automatic radii determination...")
                 
                 # 地形解析
@@ -878,7 +708,7 @@ def run_pipeline(
                 # 最適な半径を決定
                 radii, weights = determine_optimal_radii(terrain_stats)
                 
-                logger.info(f"Terrain analysis results:")
+                logger.info("Terrain analysis results:")
                 logger.info(f"  - Elevation range: {terrain_stats['elevation_range']:.1f} m")
                 logger.info(f"  - Mean slope: {terrain_stats['mean_slope']:.3f}")
                 logger.info(f"  - Auto-determined radii: {radii} pixels")
@@ -889,34 +719,6 @@ def run_pipeline(
                 params['radii'] = radii
                 params['weights'] = weights
                 
-            elif sigmas is not None or (sigmas is None and auto_sigma):
-                # 従来のsigmaモード（互換性）
-                params['mode'] = 'sigma'
-                
-                if sigmas is not None:
-                    params['sigmas'] = sigmas
-                    params['agg'] = agg
-                    logger.warning("Using legacy sigma mode. Consider switching to radius mode for better performance.")
-                else:
-                    # auto_sigmaがTrueの場合
-                    logger.info("Analyzing terrain for automatic sigma determination...")
-                    
-                    # 地形解析
-                    terrain_stats = analyze_terrain_characteristics(gpu_arr, pixel_size, include_fft=True)
-                    
-                    # 最適なsigmaを決定
-                    sigmas = determine_optimal_sigmas(terrain_stats, pixel_size)
-                    
-                    logger.info(f"Terrain analysis results:")
-                    logger.info(f"  - Elevation range: {terrain_stats['elevation_range']:.1f} m")
-                    logger.info(f"  - Mean slope: {terrain_stats['mean_slope']:.3f}")
-                    logger.info(f"  - Detected scales: {terrain_stats.get('dominant_scales', [])}")
-                    logger.info(f"  - Auto-determined sigmas: {sigmas}")
-                    
-                    # パラメータに設定
-                    params['sigmas'] = sigmas
-                    params['agg'] = agg
-                
             elif radii is not None:
                 # 手動指定の半径モード
                 params['mode'] = 'radius'
@@ -924,18 +726,12 @@ def run_pipeline(
                 params['weights'] = algo_params.get('weights', None)
             
             else:
-                raise ValueError("Either provide radii/sigmas or enable auto_radii/auto_sigma")
+                raise ValueError("Either provide radii or enable auto_radii")
 
         # 多くのアルゴリズムでピクセルサイズが必要（RVI以外の場合）
         elif algorithm != "rvi" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
-            try:
-                x_res = abs(float(dem.rio.resolution()[0]))
-                y_res = abs(float(dem.rio.resolution()[1]))
-                params['pixel_size'] = (x_res + y_res) / 2
-                logger.info(f"Detected pixel size: {params['pixel_size']:.2f}")
-            except:
-                params['pixel_size'] = 1.0
-                logger.warning("Could not determine pixel size, using 1.0")
+            # Already injected above; keep this branch as a no-op for compatibility.
+            params['pixel_size'] = float(params.get('pixel_size', 1.0))
 
         # 追加：fractal_anomaly用のradii処理
         if algorithm == "fractal_anomaly" and radii is not None:
@@ -968,10 +764,10 @@ def run_pipeline(
             else:
                 result_cpu = result_cpu.persist()
         else:
-            logger.info(f"Large dataset ({total_gb:.1f} GB) – skip persist; "
+            logger.info(f"Large dataset ({total_gb:.1f} GB) - skip persist; "
                         "chunked writer will stream-compute each tile")
     
-        # 6‑5) xarray ラップ（改善：座標構築の簡略化）
+        # 6-5) xarray ラップ（改善：座標構築の簡略化）
         if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
             dims = ("scale", *dem.dims)
             coords = {"scale": params['sigmas'], **dem.coords}
@@ -1001,8 +797,8 @@ def run_pipeline(
                 "unit": unit,
                 "data_type": "float32"
             }
-        elif algorithm in ['tpi', 'lrm', 'rvi']:
-            # TPI、LRM、RVIは-1から+1
+        elif algorithm in ['lrm', 'rvi']:
+            # LRM、RVIは-1から+1
             attrs = {
                 **dem.attrs,
                 "algorithm": algorithm,
@@ -1030,12 +826,16 @@ def run_pipeline(
             name=algorithm.upper(),
         )
         
-        # CRS情報を元のDEMから引き継ぐ
+        # CRS情報を元のDEMから引き継ぐ（COG入力時）
         if hasattr(dem, 'rio') and dem.rio.crs is not None:
             result_da.rio.write_crs(dem.rio.crs, inplace=True)
         
-        # 6‑6) 出力 (直接 COG)
-        write_cog_da_chunked(result_da, Path(dst_cog), show_progress=show_progress)
+        # 6-6) 出力 (COG または Zarr)
+        dst_path = Path(dst_cog)
+        if _is_zarr_path(str(dst_path)):
+            _write_zarr_output(result_da, dst_path, show_progress=show_progress)
+        else:
+            write_cog_da_chunked(result_da, dst_path, show_progress=show_progress)
         logger.info("Pipeline completed successfully!")
         gc.collect()
         
@@ -1077,3 +877,4 @@ def run_pipeline(
         
         # 最終的なGC
         gc.collect()
+

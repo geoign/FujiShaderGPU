@@ -1,11 +1,16 @@
-"""
+﻿"""
 FujiShaderGPU/cli/linux_cli.py
 Linux環境用CLI - Dask-CUDA処理の実装
 """
 from typing import List, Optional
-import os, argparse, rasterio, GPUtil
+import argparse
+import os
+
+import GPUtil
 import numpy as np
+import rasterio
 from .base import BaseCLI
+from ..algorithms.dask_registry import ALGORITHMS as DASK_ALGORITHMS
 
 class LinuxCLI(BaseCLI):
     """Linux環境向けCLI実装（Dask-CUDA処理）"""
@@ -17,7 +22,8 @@ class LinuxCLI(BaseCLI):
 Cloud-Optimized GeoTIFF として書き出します。"""
     
     def get_epilog(self) -> str:
-        return """
+        algos = ", ".join(self.get_supported_algorithms())
+        return f"""
     使用例:
     # RVI: 地形を解析して半径を自動決定（推奨・高速）
     fujishadergpu input.tif output.tif
@@ -25,31 +31,19 @@ Cloud-Optimized GeoTIFF として書き出します。"""
     # RVI: 手動で半径を指定（新方式・高速）
     fujishadergpu input.tif output.tif --radii 4,16,64,256
     
-    # RVI: 従来のsigma指定（互換性のため残存）
-    fujishadergpu input.tif output.tif --sigma 10,20,40 --use-sigma-mode
-    
-    # その他のアルゴリズムは変更なし
+    # その他のアルゴリズム
     fujishadergpu input.tif output.tif --algo hillshade
     
     # 大きなチャンクサイズを指定
     fujishadergpu input.tif output.tif --algo rvi --chunk 4096
 
     利用可能な全アルゴリズム:
-    rvi, hillshade, slope, tpi, lrm, openness, specular,
-    atmospheric_scattering, multiscale_terrain, frequency_enhancement,
-    curvature, visual_saliency, npr_edges, atmospheric_perspective,
-    ambient_occlusion, fractal_anomaly
+    {algos}
     """
     
     def get_supported_algorithms(self) -> List[str]:
         """Linux環境でサポートされているアルゴリズム（全て）"""
-        return [
-            "rvi", "hillshade", "slope", "tpi", "lrm", "openness",
-            "specular", "atmospheric_scattering", "multiscale_terrain",
-            "frequency_enhancement", "curvature", "visual_saliency",
-            "npr_edges", "atmospheric_perspective", "ambient_occlusion",
-            "fractal_anomaly"
-        ]
+        return list(DASK_ALGORITHMS.keys())
     
     def _add_platform_specific_args(self, parser: argparse.ArgumentParser):
         """Linux固有の引数を追加"""
@@ -64,14 +58,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             "--memory-fraction",
             type=float,
             default=0.4,  # より保守的なデフォルト値に変更
-            help="GPU メモリ使用率 (default: 0.5)"  # ヘルプテキストも更新
-        )
-
-        parser.add_argument(
-            "--pixel_size",
-            type=float,
-            default=1.0,
-            help="ピクセルサイズ（メートル単位, default: 1.0）"
+            help="GPU メモリ使用率 (default: 0.4)"  # ヘルプテキストも更新
         )
 
         parser.add_argument(
@@ -86,6 +73,13 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             choices=["mean", "min", "max", "sum", "stack"],
             default="mean",
             help="複数スケールの集約方法 (default: mean)"
+        )
+
+        parser.add_argument(
+            "--mode",
+            choices=["local", "spatial"],
+            default="local",
+            help="空間モード (default: local)"
         )
         
         # RVI固有
@@ -112,12 +106,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             "--no-auto-radii",
             action="store_true",
             help="半径自動決定を無効化 (RVIのみ)"
-        )
-        
-        parser.add_argument(
-            "--use-sigma-mode",
-            action="store_true",
-            help="従来のsigmaベースモードを使用 (RVIのみ, 非推奨)"
         )
         
         # Hillshade固有
@@ -148,12 +136,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             help="マルチスケールHillshadeを実行"
         )
 
-        parser.add_argument(
-            "--sigmas",
-            type=str,
-            help="マルチスケールHillshadeのsigma値。カンマ区切り (例: 1,2,4,8)"
-        )
-        
         # Slope固有
         parser.add_argument(
             "--unit",
@@ -170,7 +152,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             help="曲率の種類 (default: mean)"
         )
         
-        # TPI/Openness共通
+        # Openness/Ambient Occlusion共通
         parser.add_argument(
             "--radius",
             type=int,
@@ -206,28 +188,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             type=int,
             default=50,
             help="最大探索距離 (ピクセル, default: 50)"
-        )
-
-        # Frequency Enhancement固有
-        parser.add_argument(
-            "--target-frequency",
-            type=float,
-            default=0.1,
-            help="強調する周波数 (0-0.5の範囲, default: 0.1)"
-        )
-
-        parser.add_argument(
-            "--bandwidth",
-            type=float,
-            default=0.05,
-            help="周波数帯域幅 (default: 0.05)"
-        )
-
-        parser.add_argument(
-            "--enhancement",
-            type=float,
-            default=2.0,
-            help="強調の強度 (default: 2.0)"
         )
 
         # Specular固有
@@ -329,21 +289,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             help="エッジ検出の上限閾値 (default: 0.5)"
         )
 
-        # Atmospheric Perspective固有
-        parser.add_argument(
-            "--depth-scale",
-            type=float,
-            default=1000.0,
-            help="深度スケール (default: 1000.0)"
-        )
-
-        parser.add_argument(
-            "--haze-strength",
-            type=float,
-            default=0.7,
-            help="ヘイズの強度 (default: 0.7)"
-        )
-
         # Ambient Occlusion固有（num-samplesのみ追加）
         parser.add_argument(
             "--num-samples",
@@ -378,6 +323,32 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             type=float,
             default=1.0,
             help="効果の強度 (default: 1.0, 複数のアルゴリズムで使用)"
+        )
+
+        # Scale-Space Surprise
+        parser.add_argument(
+            "--surprise-scales",
+            type=str,
+            help="Scale-Space Surprise のスケール。カンマ区切り (例: 1,2,4,8,16)"
+        )
+        parser.add_argument(
+            "--surprise-enhancement",
+            type=float,
+            default=2.0,
+            help="Scale-Space Surprise の強調係数 (default: 2.0)"
+        )
+
+        # Multi-light Uncertainty
+        parser.add_argument(
+            "--ml-azimuths",
+            type=str,
+            help="Multi-light の方位角。カンマ区切り (例: 315,45,135,225)"
+        )
+        parser.add_argument(
+            "--uncertainty-weight",
+            type=float,
+            default=0.7,
+            help="Multi-light uncertainty の重み (default: 0.7)"
         )
 
     def parse_args(self, args: Optional[List[str]] = None) -> argparse.Namespace:
@@ -429,15 +400,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         else:
             parsed_args.vs_scales_list = None
 
-        # sigmasのパース（Hillshade用）
-        if hasattr(parsed_args, 'sigmas') and parsed_args.sigmas and parsed_args.algorithm == 'hillshade':
-            try:
-                parsed_args.sigmas_list = [float(s.strip()) for s in parsed_args.sigmas.split(",")]
-            except ValueError:
-                self.parser.error("無効なsigmas形式です。カンマ区切りの数値を指定してください: 1,2,4,8")
-        else:
-            parsed_args.sigmas_list = None
-
         # fractal_radiiのパース（fractal_anomaly用）
         if hasattr(parsed_args, 'fractal_radii') and parsed_args.fractal_radii:
             try:
@@ -447,6 +409,22 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         else:
             parsed_args.fractal_radii_list = None
 
+        if hasattr(parsed_args, 'surprise_scales') and parsed_args.surprise_scales:
+            try:
+                parsed_args.surprise_scales_list = [float(s.strip()) for s in parsed_args.surprise_scales.split(",")]
+            except ValueError:
+                self.parser.error("無効なsurprise-scales形式です。カンマ区切りの数値を指定してください: 1,2,4,8,16")
+        else:
+            parsed_args.surprise_scales_list = None
+
+        if hasattr(parsed_args, 'ml_azimuths') and parsed_args.ml_azimuths:
+            try:
+                parsed_args.ml_azimuths_list = [float(a.strip()) for a in parsed_args.ml_azimuths.split(",")]
+            except ValueError:
+                self.parser.error("無効なml-azimuths形式です。カンマ区切りの数値を指定してください: 315,45,135,225")
+        else:
+            parsed_args.ml_azimuths_list = None
+
         return parsed_args
     
     def _validate_platform_args(self, args: argparse.Namespace):
@@ -454,10 +432,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         if hasattr(args, 'auto_radii') and hasattr(args, 'no_auto_radii'):
             args.auto_radii = args.auto_radii and not args.no_auto_radii
         
-        # auto-sigmaフラグの処理（互換性）
-        if hasattr(args, 'auto_sigma') and hasattr(args, 'no_auto_sigma'):
-            args.auto_sigma = args.auto_sigma and not args.no_auto_sigma
-
         # use_global_statsフラグの処理
         if hasattr(args, 'use_global_stats') and hasattr(args, 'no_global_stats'):
             args.use_global_stats = args.use_global_stats and not args.no_global_stats
@@ -466,22 +440,10 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         if hasattr(args, 'auto_fractal_radii') and hasattr(args, 'no_auto_fractal_radii'):
             args.auto_fractal_radii = args.auto_fractal_radii and not args.no_auto_fractal_radii
         
-        # RVIでradii/sigmaが未指定かつ自動決定も無効の場合エラー
+        # RVIでradiiが未指定かつ自動決定も無効の場合エラー
         if args.algorithm == "rvi":
-            # use_sigma_modeのデフォルト値を設定
-            if not hasattr(args, 'use_sigma_mode'):
-                args.use_sigma_mode = False
-                
-            if args.use_sigma_mode:
-                # 従来モード
-                # sigma_listはbase.pyのparse_argsで設定されるので、そちらを使用
-                if not getattr(args, 'sigma_list', None) and not getattr(args, 'auto_sigma', False):
-                    self.parser.error("sigmaモードではsigmaを指定するか、--auto-sigmaを有効にしてください")
-            else:
-                # 新モード（デフォルト）
-                # radiiが指定されているかチェック（radii_listはまだ存在しない）
-                if not getattr(args, 'radii', None) and not getattr(args, 'auto_radii', True):
-                    self.parser.error("radiiを指定するか、--auto-radiiを有効にしてください")
+            if not getattr(args, 'radii', None) and not getattr(args, 'auto_radii', True):
+                self.parser.error("radiiを指定するか、--auto-radiiを有効にしてください")
 
     def execute(self, args: argparse.Namespace):
         """Dask-CUDA処理を実行"""
@@ -550,25 +512,21 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                         if units and units.lower() != 'metre' and units.lower() != 'meter':
                             self.logger.warning(f"座標系の単位が'{units}'です。メートル単位として扱います。")
                     
-                    args.pixel_size = pixel_size_x
+                    args.pixel_size = (pixel_size_x + pixel_size_y) / 2
                     self.logger.info(f"投影座標系: ピクセルサイズ {args.pixel_size:.2f}m")
         else:
             # ユーザーが明示的に指定した場合
             self.logger.info(f"ユーザー指定のピクセルサイズ: {args.pixel_size}m")
 
         # ログ出力
-        self.logger.info(f"=== Dask-CUDA地形解析 ===")
+        self.logger.info("=== Dask-CUDA地形解析 ===")
         self.logger.info(f"入力: {args.input}")
         self.logger.info(f"出力: {args.output}")
         self.logger.info(f"アルゴリズム: {args.algorithm}")
         
         # デフォルト値の設定
-        if not hasattr(args, 'use_sigma_mode'):
-            args.use_sigma_mode = False
         if not hasattr(args, 'auto_radii'):
             args.auto_radii = True
-        if not hasattr(args, 'auto_sigma'):
-            args.auto_sigma = False
         if not hasattr(args, 'radii'):
             args.radii = None
         if not hasattr(args, 'radii_list'):
@@ -600,8 +558,10 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 algo_params['z_factor'] = args.z_factor
             if hasattr(args, 'multiscale'):
                 algo_params['multiscale'] = args.multiscale
-            if hasattr(args, 'sigmas_list') and args.sigmas_list:
-                algo_params['sigmas'] = args.sigmas_list
+            if hasattr(args, 'radii_list') and args.radii_list:
+                algo_params['radii'] = args.radii_list
+            if hasattr(args, 'weights_list') and args.weights_list:
+                algo_params['weights'] = args.weights_list
 
         # Slope固有
         elif args.algorithm == 'slope':
@@ -612,11 +572,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         elif args.algorithm == 'curvature':
             if hasattr(args, 'curvature_type'):
                 algo_params['curvature_type'] = args.curvature_type
-
-        # TPI固有
-        elif args.algorithm == 'tpi':
-            if hasattr(args, 'radius'):
-                algo_params['radius'] = args.radius
 
         # LRM固有
         elif args.algorithm == 'lrm':
@@ -641,15 +596,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'radius'):
                 algo_params['radius'] = args.radius
         
-        # Frequency Enhancement固有
-        elif args.algorithm == 'frequency_enhancement':
-            if hasattr(args, 'target_frequency'):
-                algo_params['target_frequency'] = args.target_frequency
-            if hasattr(args, 'bandwidth'):
-                algo_params['bandwidth'] = args.bandwidth
-            if hasattr(args, 'enhancement'):
-                algo_params['enhancement'] = args.enhancement
-
         # Specular固有
         elif args.algorithm == 'specular':
             if hasattr(args, 'roughness_scale'):
@@ -693,67 +639,54 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'threshold_high'):
                 algo_params['threshold_high'] = args.threshold_high
 
-        # Atmospheric Perspective固有
-        elif args.algorithm == 'atmospheric_perspective':
-            if hasattr(args, 'depth_scale'):
-                algo_params['depth_scale'] = args.depth_scale
-            if hasattr(args, 'haze_strength'):
-                algo_params['haze_strength'] = args.haze_strength
-
         # Fractal Anomaly固有
         elif args.algorithm == 'fractal_anomaly':
             if hasattr(args, 'fractal_radii_list') and args.fractal_radii_list:
                 algo_params['radii'] = args.fractal_radii_list
+        elif args.algorithm == 'scale_space_surprise':
+            if hasattr(args, 'surprise_scales_list') and args.surprise_scales_list:
+                algo_params['scales'] = args.surprise_scales_list
+            if hasattr(args, 'surprise_enhancement'):
+                algo_params['enhancement'] = args.surprise_enhancement
+        elif args.algorithm == 'multi_light_uncertainty':
+            if hasattr(args, 'ml_azimuths_list') and args.ml_azimuths_list:
+                algo_params['azimuths'] = args.ml_azimuths_list
+            if hasattr(args, 'altitude'):
+                algo_params['altitude'] = args.altitude
+            if hasattr(args, 'z_factor'):
+                algo_params['z_factor'] = args.z_factor
+            if hasattr(args, 'uncertainty_weight'):
+                algo_params['uncertainty_weight'] = args.uncertainty_weight
 
-        # RVI用ログ出力
-        if args.algorithm == "rvi":
-            if args.use_sigma_mode:
-                # Sigmaモード
-                rvi_params = {
-                    'mode': 'sigma',
-                    'sigmas': params['sigma_list'],
-                    'radii': None,
-                    'weights': None,
-                    'auto_sigma': getattr(args, 'auto_sigma', False),
-                    'auto_radii': False,
-                    'agg': getattr(args, 'agg', 'mean'),
-                }
-            else:
-                # Radiusモード（デフォルト）
-                rvi_params = {
-                    'mode': 'radius',
-                    'sigmas': None,
-                    'radii': args.radii_list,
-                    'weights': args.weights_list,
-                    'auto_sigma': False,
-                    'auto_radii': args.radii_list is None,
-                    'agg': getattr(args, 'agg', 'mean'),
-                }
-        
+        spatial_mode_algorithms = {
+            "rvi",
+            "hillshade",
+            "slope",
+            "specular",
+            "atmospheric_scattering",
+            "curvature",
+            "ambient_occlusion",
+            "openness",
+            "multi_light_uncertainty",
+        }
+        if args.algorithm in spatial_mode_algorithms:
+            algo_params['mode'] = getattr(args, 'mode', 'local')
+            if getattr(args, 'radii_list', None):
+                algo_params['radii'] = args.radii_list
+            if getattr(args, 'weights_list', None):
+                algo_params['weights'] = args.weights_list
+
         # 処理の実行
         try:
             from ..core.dask_processor import run_pipeline
             
             # RVIパラメータの安全な処理
             if args.algorithm == "rvi":
-                if args.use_sigma_mode:
-                    # Sigmaモード
-                    rvi_params = {
-                        'sigmas': params['sigma_list'],
-                        'radii': None,
-                        'weights': None,
-                        'auto_sigma': getattr(args, 'auto_sigma', False),
-                        'auto_radii': False,
-                    }
-                else:
-                    # Radiusモード（デフォルト）
-                    rvi_params = {
-                        'sigmas': None,
-                        'radii': args.radii_list,  # 手動指定がある場合のみ
-                        'weights': args.weights_list,
-                        'auto_sigma': False,
-                        'auto_radii': args.radii_list is None,  # radiiが指定されていない場合は自動決定
-                    }
+                rvi_params = {
+                    'radii': args.radii_list,  # 手動指定がある場合のみ
+                    'weights': args.weights_list,
+                    'auto_radii': args.radii_list is None,  # radiiが指定されていない場合は自動決定
+                }
             else:
                 # RVI以外のアルゴリズム
                 rvi_params = {}

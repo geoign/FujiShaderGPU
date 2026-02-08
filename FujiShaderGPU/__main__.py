@@ -1,51 +1,59 @@
-"""
+﻿"""
 FujiShaderGPU/__main__.py
-統一エントリーポイント - OS環境を自動検出して適切な処理系を選択
+Entry point that selects platform CLI implementation.
 """
 import sys
 import platform
 import warnings
 
 
-def main():
-    """統一エントリーポイント"""
-    # OS検出
+def _configure_stdio_safely() -> None:
+    """Avoid crashes when stdout/stderr cannot encode some log characters."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="backslashreplace", line_buffering=True, write_through=True)
+            except Exception:
+                pass
+
+
+def main() -> None:
+    _configure_stdio_safely()
+
     system = platform.system().lower()
-    
+
     if system == "linux":
-        # Linux環境: Dask-CUDA処理系を使用
         try:
             from .cli.linux_cli import LinuxCLI
             cli = LinuxCLI()
         except ImportError as e:
-            print(f"エラー: Linux環境用の依存関係が不足しています: {e}")
-            print("以下のコマンドでインストールしてください:")
+            print(f"Error: Linux dependencies are not available: {e}")
+            print("Install them with:")
             print("pip install FujiShaderGPU[linux]")
             sys.exit(1)
-    
+
     elif system == "windows":
-        # Windows環境: タイルベース処理系を使用
         from .cli.windows_cli import WindowsCLI
         cli = WindowsCLI()
-    
+
     elif system == "darwin":
-        # macOS: 現時点ではWindowsと同じ処理系を使用
-        warnings.warn("macOS環境は実験的サポートです。一部機能が制限される可能性があります。")
+        warnings.warn(
+            "macOS support is experimental. Windows tile pipeline is used as fallback."
+        )
         from .cli.windows_cli import WindowsCLI
         cli = WindowsCLI()
-    
+
     else:
-        print(f"エラー: サポートされていないOS: {system}")
+        print(f"Error: Unsupported OS: {system}")
         sys.exit(1)
-    
-    # CLIの実行
+
     try:
         cli.run()
     except KeyboardInterrupt:
-        print("\n処理が中断されました")
+        print("\nInterrupted")
         sys.exit(1)
     except Exception as e:
-        print(f"エラーが発生しました: {e}")
+        print(f"Execution failed: {e}")
         sys.exit(1)
 
 

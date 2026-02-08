@@ -1,4 +1,4 @@
-"""
+﻿"""
 FujiShaderGPU/cli/windows_cli.py
 Windows環境用CLI - タイルベース処理の実装
 """
@@ -6,6 +6,7 @@ import os
 from typing import List
 import argparse
 from .base import BaseCLI
+from ..core.tile_processor import DEFAULT_ALGORITHMS
 
 
 class WindowsCLI(BaseCLI):
@@ -23,8 +24,8 @@ class WindowsCLI(BaseCLI):
   # Hillshade計算
   fujishadergpu input.tif output.tif --algorithm hillshade
   
-  # マルチスケールRVI
-  fujishadergpu input.tif output.tif --sigma 50,100,200
+  # Spatial RVI（半径を手動指定）
+  fujishadergpu input.tif output.tif --algorithm rvi --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
   
   # GPUタイプを指定
   fujishadergpu input.tif output.tif --gpu-type rtx4070
@@ -32,21 +33,13 @@ class WindowsCLI(BaseCLI):
   # COG生成のみ（既存タイルから）
   fujishadergpu dummy.tif output.tif --cog-only --tmp-dir existing_tiles
 
-注意: Windows環境では一部のアルゴリズムが利用できません。
-      Linux環境ではより多くのアルゴリズムと高速な処理が可能です。
+注意: 現在は Windows/Linux とも同一のアルゴリズム名を利用できます。
+      主な違いはバックエンド実装（Windows: タイル処理 / Linux: Dask-CUDA）です。
 """
     
     def get_supported_algorithms(self) -> List[str]:
         """Windows環境でサポートされているアルゴリズム"""
-        return [
-            "rvi_gaussian",
-            "hillshade",
-            "atmospheric_scattering",
-            "composite_terrain",
-            "curvature",
-            "frequency_enhancement",
-            "visual_saliency"
-        ]
+        return list(DEFAULT_ALGORITHMS.keys())
     
     def _add_platform_specific_args(self, parser: argparse.ArgumentParser):
         """Windows固有の引数を追加"""
@@ -96,6 +89,25 @@ class WindowsCLI(BaseCLI):
             action="store_true",
             help="自動スケール分析を無効化"
         )
+
+        parser.add_argument(
+            "--mode",
+            choices=["local", "spatial"],
+            default="local",
+            help="空間モード (default: local)"
+        )
+
+        parser.add_argument(
+            "--radii",
+            type=str,
+            help="Spatial radii in pixels (comma-separated, e.g. 4,16,64)"
+        )
+
+        parser.add_argument(
+            "--weights",
+            type=str,
+            help="Spatial weights (comma-separated, e.g. 0.5,0.3,0.2)"
+        )
         
         # アルゴリズム固有パラメータの追加
         parser.add_argument(
@@ -111,6 +123,13 @@ class WindowsCLI(BaseCLI):
             default=45.0,
             help="太陽の高度角 (度, default: 45, Hillshadeで使用)"
         )
+
+        parser.add_argument(
+            "--z-factor",
+            type=float,
+            default=None,
+            help="Hillshade vertical exaggeration (default: 1.0)"
+        )
         
         parser.add_argument(
             "--color-mode",
@@ -124,6 +143,30 @@ class WindowsCLI(BaseCLI):
             action="store_true",
             help="既存タイルからCOG生成のみ実行"
         )
+
+        # Experimental algorithms
+        parser.add_argument(
+            "--surprise-scales",
+            type=str,
+            help="Scale-Space Surprise のスケール。カンマ区切り (例: 1,2,4,8,16)"
+        )
+        parser.add_argument(
+            "--surprise-enhancement",
+            type=float,
+            default=2.0,
+            help="Scale-Space Surprise の強調係数 (default: 2.0)"
+        )
+        parser.add_argument(
+            "--ml-azimuths",
+            type=str,
+            help="Multi-lightの方位角。カンマ区切り (例: 315,45,135,225)"
+        )
+        parser.add_argument(
+            "--uncertainty-weight",
+            type=float,
+            default=0.7,
+            help="Multi-light uncertainty の重み (default: 0.7)"
+        )
     
     def _validate_platform_args(self, args: argparse.Namespace):
         """Windows固有の引数検証"""
@@ -135,10 +178,8 @@ class WindowsCLI(BaseCLI):
             args._skip_input_check = True
         
         # アルゴリズム固有の検証
-        if args.algorithm == "rvi_gaussian":
-            # RVIの場合、sigmaが未指定なら自動決定モードとする
-            if not args.sigma_list and not hasattr(args, 'no_auto_scale'):
-                self.logger.info("sigmaが未指定のため、地形解析による自動決定を行います")
+        if args.algorithm == "rvi" and not hasattr(args, 'no_auto_scale'):
+            self.logger.info("radii未指定時は地形解析による自動スケール決定を行います")
     
     def execute(self, args: argparse.Namespace):
         """タイルベース処理を実行"""
@@ -171,8 +212,6 @@ class WindowsCLI(BaseCLI):
             self.logger.info(f"出力: {args.output}")
             self.logger.info(f"アルゴリズム: {args.algorithm}")
             self.logger.info(f"モード: {'マルチスケール' if params['multiscale_mode'] else 'シングルスケール'}")
-            if args.sigma_list:
-                self.logger.info(f"Sigma値: {args.sigma_list}")
         
         # 処理の実行
         try:
@@ -181,6 +220,19 @@ class WindowsCLI(BaseCLI):
             # COG生成のみモードの場合、入力パスを調整
             if args.cog_only:
                 params['input_path'] = params['input_path'] if os.path.exists(params['input_path']) else "dummy_input.tif"
+
+            radii_list = None
+            weights_list = None
+            if getattr(args, "radii", None):
+                try:
+                    radii_list = [int(v.strip()) for v in args.radii.split(",") if v.strip()]
+                except ValueError:
+                    self.parser.error("Invalid --radii format. Use comma-separated integers: 4,16,64")
+            if getattr(args, "weights", None):
+                try:
+                    weights_list = [float(v.strip()) for v in args.weights.split(",") if v.strip()]
+                except ValueError:
+                    self.parser.error("Invalid --weights format. Use comma-separated numbers: 0.5,0.3,0.2")
             
             # アルゴリズム固有パラメータの準備
             algo_params = {}
@@ -189,7 +241,23 @@ class WindowsCLI(BaseCLI):
                     'azimuth': args.azimuth,
                     'altitude': args.altitude,
                     'color_mode': args.color_mode,
+                    'z_factor': args.z_factor,
                 })
+            elif args.algorithm == "scale_space_surprise":
+                if args.surprise_scales:
+                    algo_params['scales'] = [float(s.strip()) for s in args.surprise_scales.split(",")]
+                algo_params['enhancement'] = args.surprise_enhancement
+            elif args.algorithm == "multi_light_uncertainty":
+                if args.ml_azimuths:
+                    algo_params['azimuths'] = [float(a.strip()) for a in args.ml_azimuths.split(",")]
+                algo_params['altitude'] = args.altitude
+                algo_params['uncertainty_weight'] = args.uncertainty_weight
+
+            algo_params['mode'] = args.mode
+            if radii_list:
+                algo_params['radii'] = radii_list
+            if weights_list:
+                algo_params['weights'] = weights_list
             
             process_dem_tiles(
                 input_cog_path=params['input_path'],
@@ -198,7 +266,7 @@ class WindowsCLI(BaseCLI):
                 algorithm=params['algorithm'],  # アルゴリズムを追加
                 tile_size=params['tile_size'],
                 padding=params['padding'],
-                sigma=params['sigma_list'][0] if params['sigma_list'] else 10.0,
+                sigma=10.0,
                 max_workers=params['max_workers'],
                 nodata_threshold=params['nodata_threshold'],
                 gpu_type=params['gpu_type'],

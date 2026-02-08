@@ -2,9 +2,14 @@
 FujiShaderGPU/io/cog_builder.py
 """
 from ..config.gdal_config import _configure_gdal_ultra_performance
-import os, glob, shutil
+import glob
+import os
+import shutil
 from typing import List
 from osgeo import gdal
+
+# Keep current non-exception behavior and silence GDAL 4.0 future warning.
+gdal.DontUseExceptions()
 
 def _create_vrt_command_line_ultra(tile_files: List[str], vrt_path: str):
     """
@@ -57,7 +62,7 @@ def _create_qgis_optimized_overviews(tiff_path: str):
             tiff_path
         ] + overview_levels
         
-        result = subprocess.run(overview_cmd, check=True, capture_output=True, text=True)
+        subprocess.run(overview_cmd, check=True, capture_output=True, text=True)
         print(f"オーバービュー生成完了: {len(overview_levels)}レベル")
         
     except subprocess.CalledProcessError as e:
@@ -172,12 +177,10 @@ def _create_cog_ultra_fast(vrt_path: str, output_cog_path: str, gpu_config: dict
         "NUM_THREADS=ALL_CPUS",
         "OVERVIEW_RESAMPLING=AVERAGE",  # 高品質リサンプリング（NEAREST→AVERAGE）
         "OVERVIEW_COUNT=8",             # 十分なオーバービュー数（3→8）
-        "OVERVIEW_LEVELS=2,4,8,16,32,64,128,256",  # 多段階ピラミッド
         "ALIGNED_LEVELS=4",             # アライメント最適化
-        "TILING_SCHEME=GoogleMapsCompatible",  # 標準タイリング
     ]
     
-    def progress_callback(complete, message, cb_data):
+    def progress_callback(complete, _message, _cb_data):
         if int(complete * 100) % 10 == 0:
             print(f"COG変換: {complete*100:.0f}%完了")
         return 1
@@ -233,7 +236,7 @@ def _create_cog_gtiff_ultra_fast(vrt_path: str, output_cog_path: str, gpu_config
 
         vrt_ds = gdal.Open(vrt_path, gdal.GA_ReadOnly)
         if vrt_ds is None:
-            raise ValueError(f"VRT読み込み失敗")
+            raise ValueError("VRT読み込み失敗")
         
         temp_result = gdal.Translate(
             temp_tiff_path,

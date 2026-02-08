@@ -7,15 +7,15 @@ import cupyx.scipy.ndimage as cpx_ndimage
 import rasterio
 from rasterio.windows import Window
 from typing import Tuple, List
+import logging
 
 # scipyのインポート（フル活用）
 try:
-    from scipy.ndimage import gaussian_filter, distance_transform_edt, uniform_filter
-    from scipy import ndimage
+    from scipy.ndimage import gaussian_filter
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
-    print("警告: scipyが利用できません。一部の機能で代替処理を使用します。")
+    logging.getLogger(__name__).warning("scipy が利用できません。一部の CPU フォールバックに切り替えます。")
 
 def _analyze_scale_variances_scipy_fast(dem_2d: np.ndarray, candidate_distances: List[float], pixel_size: float) -> List[float]:
     """
@@ -40,7 +40,8 @@ def analyze_terrain_scales(input_cog_path: str, pixel_size: float, sample_size: 
     """
     地形スケール分析（超高速化版）
     """
-    print("=== 地形スケール超高速分析開始 ===")
+    logger = logging.getLogger(__name__)
+    logger.info("=== 地形スケール超高速分析開始 ===")
     
     try:
         with rasterio.open(input_cog_path) as src:
@@ -53,7 +54,10 @@ def analyze_terrain_scales(input_cog_path: str, pixel_size: float, sample_size: 
             sample_w = min(sample_size, width - sample_x)
             sample_h = min(sample_size, height - sample_y)
             
-            print(f"分析サンプル領域: {sample_w}x{sample_h}ピクセル")
+            logger.debug(
+                "サンプル範囲: x=%d, y=%d, w=%d, h=%d",
+                sample_x, sample_y, sample_w, sample_h,
+            )
             
             window = Window(sample_x, sample_y, sample_w, sample_h)
             dem_sample = src.read(1, window=window, out_dtype=np.float32)
@@ -77,17 +81,18 @@ def analyze_terrain_scales(input_cog_path: str, pixel_size: float, sample_size: 
             scale_variances = _analyze_scale_variances_ultra_fast(dem_sample, candidate_distances, pixel_size)
             optimal_scales, optimal_weights = _select_optimal_scales_enhanced(candidate_distances, scale_variances)
             
-            print(f"超高速分析完了: {len(optimal_scales)}スケール選択")
+            logger.info(f"[OK] スケール分析完了: {len(optimal_scales)}スケール選択")
             return optimal_scales, optimal_weights
             
     except Exception as e:
-        print(f"地形分析エラー: {e}")
+        logger.info(f"地形分析エラー: {e}")
         return _get_default_scales()
 
 def _analyze_scale_variances_ultra_fast(dem_sample: np.ndarray, candidate_distances: List[float], pixel_size: float) -> List[float]:
     """
     GPU バッチ処理による超高速スケール分析
     """
+    logger = logging.getLogger(__name__)
     sample_size = int(np.sqrt(len(dem_sample)))
     dem_2d = dem_sample[:sample_size*sample_size].reshape(sample_size, sample_size)
     
@@ -113,7 +118,7 @@ def _analyze_scale_variances_ultra_fast(dem_sample: np.ndarray, candidate_distan
         return variances
         
     except Exception as e:
-        print(f"GPU分析失敗、scipy高速CPUにフォールバック: {e}")
+        logger.info(f"GPU分析失敗、scipy高速CPUにフォールバック: {e}")
         return _analyze_scale_variances_scipy_fast(dem_2d, candidate_distances, pixel_size)
 
 

@@ -37,27 +37,37 @@ requires-python = ">=3.8"
 
 dependencies = [
     "numpy>=1.21.0",
-    "cupy-cuda12x>=13.4.0",  # または cupy-cuda12x for CUDA 12
+    "PyYAML>=6.0.0",
+    "cupy-cuda12x>=13.4.0",  # 縺ｾ縺溘・ cupy-cuda12x for CUDA 12
     "rasterio>=1.3.0",
     "psutil>=5.8.0",
     "GDAL>=3.0.0",
     "tqdm",
-
-    # Linux 環境でのみ dask-cuda を含める
-    "dask-cuda; sys_platform == 'linux'",
-    "dask[complete]>=2024.4; sys_platform == 'linux'",
-    "xarray; sys_platform == 'linux'",
-    "rioxarray; sys_platform == 'linux'",
-    "GPUtil; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
-# 高度な地形分析機能用
-full = [
-    "scipy>=1.7.0",
-    "scikit-image>=0.19.0",
+# Linux/Dask-CUDA 螳溯｡檎腸蠅・
+linux = [
+    "dask-cuda>=24.6",
+    "dask[array]>=2024.4",
+    "distributed>=2024.4",
+    "zarr>=2.18",
+    "xarray>=2024.1",
+    "rioxarray>=0.15",
+    "GPUtil>=1.4",
+    "rmm-cu12>=25.6",
 ]
-# 開発用
+# Windows/macOS 繧ｿ繧､繝ｫ蜃ｦ逅・ｮ溯｡檎腸蠅・
+windows = [
+    "dask[array]>=2024.4",
+    "scipy>=1.7.0",
+]
+# 鬮伜ｺｦ縺ｪ蝨ｰ蠖｢蛻・梵讖溯・逕ｨ
+full = [
+    "dask[array]>=2024.4",
+    "scipy>=1.7.0",
+]
+# 髢狗匱逕ｨ
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -67,13 +77,13 @@ dev = [
     "isort>=5.12.0",
     "pre-commit>=3.0.0",
 ]
-# ドキュメント生成用
+# 繝峨く繝･繝｡繝ｳ繝育函謌千畑
 docs = [
     "sphinx>=6.0.0",
     "sphinx-rtd-theme>=1.3.0",
     "sphinx-autodoc-typehints>=1.23.0",
 ]
-# ベンチマーク用
+# 繝吶Φ繝√・繝ｼ繧ｯ逕ｨ
 benchmark = [
     "pytest-benchmark>=4.0.0",
     "memory-profiler>=0.60.0",
@@ -89,7 +99,7 @@ Issues = "https://github.com/geoign/FujiShaderGPU/issues"
 fujishadergpu = "FujiShaderGPU.__main__:main"
 
 [tool.setuptools.package-data]
-FujiShaderGPU = ["*.json", "*.yaml", "*.yml"]
+FujiShaderGPU = ["*.json", "*.yaml", "*.yml", "**/*.yaml", "**/*.yml", "**/*.json"]
 
 [tool.black]
 line-length = 120
@@ -97,7 +107,7 @@ target-version = ['py38', 'py39', 'py310', 'py311']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
-  # デフォルトの除外設定
+  # 繝・ヵ繧ｩ繝ｫ繝医・髯､螟冶ｨｭ螳・
   \.eggs
   | \.git
   | \.hg
@@ -155,7 +165,7 @@ exclude_lines = [
     "if TYPE_CHECKING:",
 ]
 
-# パッケージ設定の詳細
+# 繝代ャ繧ｱ繝ｼ繧ｸ險ｭ螳壹・隧ｳ邏ｰ
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["FujiShaderGPU*"]

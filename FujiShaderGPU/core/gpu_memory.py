@@ -1,7 +1,8 @@
 """
 FujiShaderGPU/core/gpu_memory.py
 """
-import contextlib, threading
+import contextlib
+import threading
 import cupy as cp
 
 # スレッドローカルなGPUコンテキスト管理（改良版）
