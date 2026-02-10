@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "FujiShaderGPU"
-version = "0.2.1"
+version = "0.2.5"
 description = "Lightning fast terrain shader for a big Cloud Optimized GeoTIFF"
 readme = "README.md"
 license = {text = "MIT"}
@@ -41,7 +41,7 @@ dependencies = [
     "cupy-cuda12x>=13.4.0",  # 縺ｾ縺溘・ cupy-cuda12x for CUDA 12
     "rasterio>=1.3.0",
     "psutil>=5.8.0",
-    "GDAL>=3.0.0",
+    'GDAL>=3.0.0; platform_system != "Windows"',
     "tqdm",
 ]
 

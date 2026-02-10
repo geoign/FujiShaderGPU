@@ -78,6 +78,14 @@ def _normalize_rvi_radii_and_weights(
 
 def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma: float, multiscale_mode: bool,
                        target_distances, weights, pixel_size: float, algo_params: Dict[str, Any]):
+    elevation_scale = float(algo_params.get("elevation_scale", 1.0) or 1.0)
+    if not math.isfinite(elevation_scale) or elevation_scale <= 0:
+        elevation_scale = 1.0
+    if abs(elevation_scale - 1.0) > 1e-9:
+        dem_in = dem_gpu * cp.float32(elevation_scale)
+    else:
+        dem_in = dem_gpu
+
     if algorithm == 'rvi':
         radii, rvi_weights = _normalize_rvi_radii_and_weights(
             target_distances=target_distances,
@@ -96,17 +104,17 @@ def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma
         for key in ("global_stats", "downsample_factor"):
             if key in algo_params and algo_params[key] is not None:
                 params[key] = algo_params[key]
-        return algo_instance.process(dem_gpu, **params)
+        return algo_instance.process(dem_in, **params)
 
     if algorithm == 'scale_space_surprise':
         # Avoid per-tile percentile normalization (causes seam artifacts).
         # Tile pipeline will apply one global normalization pass afterwards.
         params = {'sigma': sigma, 'pixel_size': pixel_size, **algo_params}
         params['normalize'] = False
-        return algo_instance.process(dem_gpu, **params)
+        return algo_instance.process(dem_in, **params)
 
     params = {'sigma': sigma, 'pixel_size': pixel_size, **algo_params}
-    return algo_instance.process(dem_gpu, **params)
+    return algo_instance.process(dem_in, **params)
 
 
 def apply_nodata_mask(result_gpu: cp.ndarray, mask_nodata, nodata):

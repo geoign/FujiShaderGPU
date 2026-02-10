@@ -40,9 +40,21 @@ Input DEM (COG or Zarr)
 
 - `common/spatial_mode.py`
   - Shared local/spatial execution helpers:
-    - spatial radii auto-derivation
+    - spatial radii/weights auto-derivation from YAML presets
     - NaN-aware radius smoothing
     - multi-radius weighted aggregation
+
+- `config/spatial_presets.yaml`
+  - Spatial auto presets keyed by pixel-size bins (meters).
+  - Current bins:
+    - `<5`
+    - `5~25`
+    - `25~50`
+    - `50~250`
+    - `250~1250`
+    - `1250~5000`
+    - `>5000`
+  - Each bin defines default `radii` and `weights` used when user does not pass `--radii/--weights`.
 
 - `dask/*.py`
   - One file per Dask algorithm module.
@@ -156,6 +168,8 @@ Otherwise output is written through COG flow.
   - local mode: adjacent-pixel computation
   - spatial mode: multi-radius integration (`radii` + `weights`)
 - Hillshade multiscale path also uses the same `radii`/`weights` parameter structure.
+- Spatial safety fallback:
+  - If `--mode spatial` is requested without explicit `--radii/--weights` and input DEM has any side `<= 1024 px`, processor warns and falls back to `local` mode.
 - Clear separation:
   - algorithm math
   - orchestration

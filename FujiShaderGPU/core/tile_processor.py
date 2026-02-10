@@ -66,8 +66,38 @@ NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges"}
 SIGNED_NORMALIZATION_ALGOS = {"rvi", "lrm", "fractal_anomaly"}
 
 
+def _nodata_is_nan(nodata: Optional[float]) -> bool:
+    if nodata is None:
+        return False
+    try:
+        return bool(np.isnan(float(nodata)))
+    except Exception:
+        return False
+
+
+def _build_nodata_mask(data: np.ndarray, nodata: Optional[float]) -> Optional[np.ndarray]:
+    """Build nodata mask supporting both numeric nodata and nodata=NaN."""
+    if nodata is None:
+        return None
+    if _nodata_is_nan(nodata):
+        return np.isnan(data)
+    return np.isclose(data, float(nodata), rtol=0.0, atol=1e-6)
+
+
+def _replace_nodata_with_nan(data: np.ndarray, nodata: Optional[float]) -> np.ndarray:
+    """Return a copy-like array where nodata cells are converted to NaN."""
+    mask = _build_nodata_mask(data, nodata)
+    if mask is None:
+        return data
+    return np.where(mask, np.nan, data)
+
+
 def _is_global_stats_required(algorithm: str, mode: str) -> bool:
     mode_norm = str(mode or "local").lower()
+    # Specular uses internal tone mapping + global roughness scale only.
+    # Disable generic global output normalization to avoid end clipping.
+    if algorithm == "specular":
+        return False
     if mode_norm == "spatial":
         return algorithm not in NO_NORMALIZATION_ALGOS
     if mode_norm == "local":
@@ -79,6 +109,8 @@ def _normalization_target_range(algorithm: str) -> str:
     """Return output normalization policy: 'none' | 'unit' | 'signed'."""
     if algorithm in NO_NORMALIZATION_ALGOS:
         return "none"
+    if algorithm == "specular":
+        return "unit_specular"
     if algorithm == "scale_space_surprise":
         return "unit_surprise"
     if algorithm in SIGNED_NORMALIZATION_ALGOS:
@@ -164,10 +196,10 @@ def _required_padding_for_algorithm(
         radii = algo_params.get("radii")
         if not radii:
             try:
-                from ..algorithms.common.spatial_mode import determine_spatial_radii
-                radii = determine_spatial_radii(pixel_size=float(pixel_size))
+                from ..algorithms.common.spatial_mode import determine_spatial_profile
+                radii, _ = determine_spatial_profile(pixel_size=float(pixel_size))
             except Exception:
-                radii = [5, 20, 80, 320]
+                radii = [2, 4, 16, 64]
         try:
             max_radius = max(int(round(float(r))) for r in radii if float(r) > 0)
         except Exception:
@@ -177,6 +209,118 @@ def _required_padding_for_algorithm(
 
     # Keep alignment with current tiling preferences.
     return max(32, ((required + 31) // 32) * 32)
+
+
+def _estimate_scale_count(
+    algorithm: str,
+    algo_params: dict,
+    pixel_size: float,
+    target_distances: Optional[List[float]],
+) -> int:
+    """Estimate multi-scale fan-out count for rough cost warning."""
+    try:
+        if algorithm == "rvi":
+            radii, _ = _normalize_rvi_radii_and_weights(
+                target_distances=target_distances,
+                weights=algo_params.get("weights"),
+                pixel_size=pixel_size,
+                manual_radii=algo_params.get("radii"),
+                manual_weights=algo_params.get("weights"),
+            )
+            return max(1, len(radii))
+
+        if algorithm in {"multiscale_terrain", "scale_space_surprise"}:
+            scales = algo_params.get("scales")
+            if isinstance(scales, (list, tuple)) and len(scales) > 0:
+                return len(scales)
+            return 4 if algorithm == "multiscale_terrain" else 5
+
+        if algorithm in {"visual_saliency", "fractal_anomaly"}:
+            scales = algo_params.get("scales") if algorithm == "visual_saliency" else algo_params.get("radii")
+            if isinstance(scales, (list, tuple)) and len(scales) > 0:
+                return len(scales)
+            return 4 if algorithm == "visual_saliency" else 5
+
+        mode = str(algo_params.get("mode", "local")).lower()
+        if mode == "spatial":
+            radii = algo_params.get("radii")
+            if not radii:
+                try:
+                    from ..algorithms.common.spatial_mode import determine_spatial_profile
+                    radii, _ = determine_spatial_profile(pixel_size=float(pixel_size))
+                except Exception:
+                    radii = [2, 4, 16, 64]
+            return max(1, len(radii))
+    except Exception:
+        pass
+    return 1
+
+
+def _warn_if_compute_cost_high(
+    *,
+    algorithm: str,
+    width: int,
+    height: int,
+    tile_size: int,
+    padding: int,
+    pixel_size: float,
+    algo_params: dict,
+    target_distances: Optional[List[float]],
+    gpu_config: dict,
+) -> None:
+    """
+    Emit a heuristic cost warning when workload is likely too high for interactive runs.
+    This does not change behavior; it only warns with actionable guidance.
+    """
+    px_size = float(pixel_size) if pixel_size and pixel_size > 0 else 1.0
+    scale_count = _estimate_scale_count(
+        algorithm=algorithm,
+        algo_params=algo_params,
+        pixel_size=px_size,
+        target_distances=target_distances,
+    )
+
+    effective_span = float(tile_size + 2 * padding)
+    halo_factor = max(1.0, (effective_span * effective_span) / float(tile_size * tile_size))
+    total_pixels = float(width) * float(height)
+
+    algo_factor_map = {
+        "specular": 1.8,
+        "ambient_occlusion": 1.8,
+        "fractal_anomaly": 1.6,
+        "visual_saliency": 1.4,
+        "multiscale_terrain": 1.3,
+        "rvi": 1.2,
+    }
+    algo_factor = float(algo_factor_map.get(algorithm, 1.0))
+
+    adjusted_gpix = (total_pixels * scale_count * halo_factor * algo_factor) / 1e9
+    resolution_factor_vs_1m = 1.0 / max(px_size * px_size, 1e-6)
+
+    try:
+        vram_gb = float(gpu_config.get("system_info", {}).get("vram_gb", 0.0))
+    except Exception:
+        vram_gb = 0.0
+
+    # Tuned as warning-only thresholds; calibrated to 8GB-class GPUs.
+    high_threshold = 18.0 if vram_gb >= 12 else 10.0
+    medium_threshold = 9.0 if vram_gb >= 12 else 5.0
+
+    if adjusted_gpix >= high_threshold:
+        logger.warning(
+            "[COST] Estimated heavy workload: "
+            f"{adjusted_gpix:.1f} Gpix-equivalent "
+            f"(algo={algorithm}, scales={scale_count}, halo={halo_factor:.2f}x, "
+            f"pixel_size={px_size:.3f}m, vs1m={resolution_factor_vs_1m:.2f}x). "
+            "Consider larger pixel size, local mode, smaller radii, or smaller tile/padding."
+        )
+    elif adjusted_gpix >= medium_threshold:
+        logger.info(
+            "[COST] Estimated workload is high: "
+            f"{adjusted_gpix:.1f} Gpix-equivalent "
+            f"(algo={algorithm}, scales={scale_count}, halo={halo_factor:.2f}x, "
+            f"pixel_size={px_size:.3f}m, vs1m={resolution_factor_vs_1m:.2f}x)."
+        )
 
 
 def _percentile_minmax_np(data: np.ndarray, pmin: float = 1.0, pmax: float = 99.0) -> Optional[Tuple[float, float]]:
@@ -203,6 +347,12 @@ def _normalize_by_global_stats(
         mn, mx = float(stats[0]), float(stats[1])
         if np.isfinite(mn) and np.isfinite(mx) and mx > mn:
             src = arr.astype(np.float32, copy=False)
+            if target_range == "unit_specular":
+                # Keep flat areas near middle-gray while expanding subtle contrast globally.
+                center = 0.5 * (mn + mx)
+                half = max(0.5 * (mx - mn), 1e-6)
+                out = 0.5 + 0.45 * np.tanh((src - center) / (0.75 * half))
+                return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
             if target_range == "unit_surprise":
                 # Match legacy visual feel with a global (tile-stable) curve.
                 out = np.clip((src - mn) / (mx - mn), 0.0, 1.0)
@@ -221,6 +371,29 @@ def _normalize_by_global_stats(
         gamma_hint = float(stats[2])
         if np.isfinite(mn) and np.isfinite(mx) and mx > mn:
             src = arr.astype(np.float32, copy=False)
+            if target_range == "unit_specular":
+                # Specular-specific global remap using robust quantiles:
+                # stats = (p10, p50, p90). Keep p50 bright enough for plains.
+                p10 = mn
+                p50 = mx
+                p90 = gamma_hint
+                if np.isfinite(p10) and np.isfinite(p50) and np.isfinite(p90) and p90 > p10:
+                    lo_span = max(p50 - p10, 1e-6)
+                    hi_span = max(p90 - p50, 1e-6)
+                    out = np.empty_like(src, dtype=np.float32)
+
+                    lo_mask = src <= p50
+                    lo_t = np.clip((src[lo_mask] - p10) / lo_span, 0.0, 1.0)
+                    # Map lower half to [0.12, 0.65], slightly lifted near plains.
+                    out[lo_mask] = 0.12 + 0.53 * np.power(lo_t, 0.75)
+
+                    hi_mask = ~lo_mask
+                    hi_t = np.clip((src[hi_mask] - p50) / hi_span, 0.0, 1.0)
+                    # Map upper half to [0.65, 0.95], stronger roll-off near highlights.
+                    out[hi_mask] = 0.65 + 0.30 * np.power(hi_t, 1.08)
+
+                    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+                return src
             if target_range == "unit_surprise":
                 # Keep low-end latitude: avoid hard floor clipping at mn.
                 # Use a partial floor subtraction to suppress noise while preserving gradation.
@@ -332,7 +505,7 @@ def _compute_global_hillshade_z_factor(input_cog_path: str, pixel_size: float) -
         nodata = src.nodata
 
     if nodata is not None:
-        valid = sample[sample != nodata]
+        valid = sample[~_build_nodata_mask(sample, nodata)]
     else:
         valid = sample.reshape(-1)
 
@@ -352,6 +525,7 @@ def _compute_global_rvi_stats(
     target_distances: Optional[List[float]],
     weights: Optional[List[float]],
     algo_params: dict,
+    elevation_scale: float = 1.0,
 ) -> Optional[Tuple[float]]:
     """Estimate global RVI normalization stats from an overview sample once."""
     try:
@@ -376,7 +550,7 @@ def _compute_global_rvi_stats(
             sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
 
         if nodata is not None:
-            sample = np.where(np.isclose(sample, nodata), np.nan, sample)
+            sample = _replace_nodata_with_nan(sample, nodata)
 
         sample_pixel_size = float(pixel_size * scale)
         radii, rvi_weights = _normalize_rvi_radii_and_weights(
@@ -389,7 +563,7 @@ def _compute_global_rvi_stats(
         if not radii:
             return None
 
-        sample_gpu = cp.asarray(sample, dtype=cp.float32)
+        sample_gpu = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
         rvi_sample = compute_rvi_efficient_block(sample_gpu, radii=radii, weights=rvi_weights)
         stats = rvi_stat_func(rvi_sample)
         if not stats:
@@ -408,6 +582,7 @@ def _compute_global_multiscale_terrain_stats(
     nodata: Optional[float],
     scales: Optional[List[float]],
     weights: Optional[List[float]],
+    elevation_scale: float = 1.0,
 ) -> Optional[Tuple[float, float]]:
     """Estimate global normalization stats for multiscale_terrain once."""
     try:
@@ -432,7 +607,7 @@ def _compute_global_multiscale_terrain_stats(
             sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
 
         if nodata is not None:
-            sample = np.where(np.isclose(sample, nodata), np.nan, sample)
+            sample = _replace_nodata_with_nan(sample, nodata)
 
         use_scales = list(scales) if scales else [1, 10, 50, 100]
         if not use_scales:
@@ -492,6 +667,7 @@ def _compute_global_visual_saliency_stats(
     nodata: Optional[float],
     pixel_size: float,
     scales: Optional[List[float]],
+    elevation_scale: float = 1.0,
 ) -> Optional[Tuple[float, float]]:
     """Estimate global normalization stats for visual_saliency once."""
     try:
@@ -514,10 +690,10 @@ def _compute_global_visual_saliency_stats(
             )
 
         if nodata is not None:
-            sample = np.where(sample == nodata, np.nan, sample)
+            sample = _replace_nodata_with_nan(sample, nodata)
 
         use_scales = list(scales) if scales else [2, 4, 8, 16]
-        sample_gpu = cp.asarray(sample, dtype=cp.float32)
+        sample_gpu = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
         saliency = compute_visual_saliency_block(
             sample_gpu,
             scales=use_scales,
@@ -543,6 +719,7 @@ def _compute_global_lrm_scale(
     nodata: Optional[float],
     pixel_size: float,
     kernel_size: int,
+    elevation_scale: float = 1.0,
 ) -> Optional[Tuple[float]]:
     """Estimate global robust LRM scale once."""
     try:
@@ -567,9 +744,9 @@ def _compute_global_lrm_scale(
             sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
 
         if nodata is not None:
-            sample = np.where(np.isclose(sample, nodata), np.nan, sample)
+            sample = _replace_nodata_with_nan(sample, nodata)
 
-        sample_gpu = cp.asarray(sample, dtype=cp.float32)
+        sample_gpu = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
         lrm_raw = compute_lrm_block(
             sample_gpu,
             kernel_size=max(3, int(kernel_size / max(scale_factor, 1.0))),
@@ -598,6 +775,7 @@ def _compute_global_fractal_stats(
     despeckle_threshold: float = 0.35,
     despeckle_alpha_max: float = 0.30,
     detail_boost: float = 0.35,
+    elevation_scale: float = 1.0,
 ) -> Optional[Tuple[float, float, float, float]]:
     """Estimate global fractal stats once for stable tile normalization."""
     try:
@@ -627,12 +805,12 @@ def _compute_global_fractal_stats(
             sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
 
         if nodata is not None:
-            sample = np.where(np.isclose(sample, nodata), np.nan, sample)
+            sample = _replace_nodata_with_nan(sample, nodata)
 
         if not radii:
             radii = FractalAnomalyAlgorithm()._determine_optimal_radii(float(pixel_size * scale_factor))
 
-        sample_gpu = cp.asarray(sample, dtype=cp.float32)
+        sample_gpu = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
         fractal_raw = compute_fractal_dimension_block(
             sample_gpu,
             radii=radii,
@@ -677,6 +855,7 @@ def _compute_global_scale_space_surprise_stats(
     nodata: Optional[float],
     scales: Optional[List[float]],
     enhancement: float = 2.0,
+    elevation_scale: float = 1.0,
 ) -> Optional[Tuple[float, float, float]]:
     """Estimate global SSS normalization range once (legacy-style tone curve)."""
     try:
@@ -701,9 +880,9 @@ def _compute_global_scale_space_surprise_stats(
             sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
 
         if nodata is not None:
-            sample = np.where(np.isclose(sample, nodata), np.nan, sample)
+            sample = _replace_nodata_with_nan(sample, nodata)
 
-        sample_gpu = cp.asarray(sample, dtype=cp.float32)
+        sample_gpu = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
         raw = kernel_scale_space_surprise(
             sample_gpu,
             scales=scales or [1.0, 2.0, 4.0, 8.0, 16.0],
@@ -724,6 +903,72 @@ def _compute_global_scale_space_surprise_stats(
         logger.warning(
             f"Failed to compute global scale_space_surprise stats; fallback to generic stats: {exc}"
         )
+        return None
+
+
+def _compute_global_specular_roughness_scale(
+    input_cog_path: str,
+    nodata: Optional[float],
+    roughness_scale: float,
+    elevation_scale: float = 1.0,
+) -> Optional[float]:
+    """Estimate a global roughness reference for tile-stable specular shading."""
+    try:
+        from cupyx.scipy.ndimage import uniform_filter
+    except Exception as exc:
+        logger.warning(f"Specular roughness helper unavailable: {exc}")
+        return None
+
+    try:
+        with rasterio.open(input_cog_path, "r") as src:
+            sample_max = 2048
+            scale_factor = max(src.width / sample_max, src.height / sample_max, 1.0)
+            sample_w = max(256, int(src.width / scale_factor))
+            sample_h = max(256, int(src.height / scale_factor))
+            sample_ma = src.read(
+                1,
+                out_shape=(sample_h, sample_w),
+                resampling=Resampling.nearest,
+                out_dtype=np.float32,
+                masked=True,
+            )
+            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
+
+        if nodata is not None:
+            sample = _replace_nodata_with_nan(sample, nodata)
+
+        block = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
+        nan_mask = cp.isnan(block)
+        if nan_mask.all():
+            return None
+
+        k = max(3, int(round(float(roughness_scale) / max(scale_factor, 1.0))))
+        if k % 2 == 0:
+            k += 1
+
+        if nan_mask.any():
+            filled = cp.where(nan_mask, 0, block)
+            valid = (~nan_mask).astype(cp.float32)
+            mean_values = uniform_filter(filled * valid, size=k, mode="constant")
+            mean_weights = uniform_filter(valid, size=k, mode="constant")
+            mean_filter = cp.where(mean_weights > 1e-6, mean_values / mean_weights, 0)
+            sq_values = uniform_filter((filled ** 2) * valid, size=k, mode="constant")
+            mean_sq_filter = cp.where(mean_weights > 1e-6, sq_values / mean_weights, 0)
+        else:
+            mean_filter = uniform_filter(block, size=k, mode="constant")
+            mean_sq_filter = uniform_filter(block ** 2, size=k, mode="constant")
+
+        roughness = cp.sqrt(cp.maximum(mean_sq_filter - mean_filter ** 2, 0))
+        valid_roughness = roughness[~nan_mask] if nan_mask.any() else roughness
+        if valid_roughness.size == 0:
+            return None
+
+        p95 = float(cp.percentile(valid_roughness, 95))
+        if not np.isfinite(p95) or p95 <= 1e-9:
+            return None
+        return p95
+    except Exception as exc:
+        logger.warning(f"Failed to compute global specular roughness scale: {exc}")
         return None
 
 
@@ -755,7 +1000,7 @@ def _compute_generic_global_algorithm_stats(
             sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
 
         if nodata is not None:
-            sample = np.where(np.isclose(sample, nodata), np.nan, sample)
+            sample = _replace_nodata_with_nan(sample, nodata)
 
         dem_gpu = cp.asarray(sample, dtype=cp.float32)
         algo_instance = _load_algorithm(algorithm)
@@ -774,6 +1019,18 @@ def _compute_generic_global_algorithm_stats(
         )
         result = cp.asnumpy(probe_result)
         if result.ndim == 2:
+            if algorithm == "specular":
+                valid = result[np.isfinite(result)]
+                if valid.size == 0:
+                    return None
+                p10 = float(np.percentile(valid, 10.0))
+                p50 = float(np.percentile(valid, 50.0))
+                p90 = float(np.percentile(valid, 90.0))
+                if not (np.isfinite(p10) and np.isfinite(p50) and np.isfinite(p90)):
+                    return None
+                if p90 <= p10:
+                    return None
+                return (p10, p50, p90)
             return _percentile_minmax_np(result, pmin=1.0, pmax=99.0)
         if result.ndim == 3:
             stats: List[Tuple[float, float]] = []
@@ -798,19 +1055,27 @@ def _format_algorithm_output(
     algo_params: dict,
     nodata: Optional[float],
 ) -> Tuple[np.ndarray, Optional[float]]:
-    """Normalize dtype/band format per algorithm."""
+    """Normalize dtype/band format per algorithm (all outputs float32)."""
     if algorithm == "hillshade":
         color_mode = str(algo_params.get("color_mode", "grayscale")).lower()
         arr = result_core
         if color_mode == "grayscale" and arr.ndim == 3:
             arr = arr[:, :, 0]
-        arr = np.clip(arr, 0.0, 1.0)
-        arr = np.rint(arr * 255.0).astype(np.uint8, copy=False)
-        return arr, 0
+        arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+        # Keep hillshade as single-band float output with NaN nodata.
+        if arr.ndim == 3:
+            arr = arr[:, :, 0]
+        return arr, np.nan
 
     if algorithm in SIGNED_NORMALIZATION_ALGOS:
         # Signed outputs use 0 as valid signal; avoid nodata=0 collisions.
         return result_core.astype(np.float32, copy=False), np.nan
+
+    if algorithm == "specular":
+        # Preserve detected/explicit nodata (e.g., -9999) in output metadata.
+        if nodata is None:
+            return result_core.astype(np.float32, copy=False), np.nan
+        return result_core.astype(np.float32, copy=False), nodata
 
     return result_core.astype(np.float32, copy=False), nodata
 
@@ -858,6 +1123,47 @@ def _infer_nodata_zero_from_border(src: rasterio.io.DatasetReader) -> Optional[f
     if zero_ratio >= 0.6 or (zero_ratio >= 0.3 and nonzero_present):
         return 0.0
     return None
+
+
+def _warn_implicit_nodata_candidates(
+    src: rasterio.io.DatasetReader,
+    threshold_ratio: float = 0.01,
+) -> None:
+    """Warn when likely implicit nodata values exist but nodata metadata is absent."""
+    try:
+        sample_w = int(min(2048, src.width))
+        sample_h = int(min(2048, src.height))
+        sample = src.read(
+            1,
+            out_shape=(sample_h, sample_w),
+            out_dtype=np.float32,
+            masked=False,
+            resampling=Resampling.nearest,
+        )
+        if sample.size == 0:
+            return
+        # Explicit NaN in data already works as nodata signal in many paths.
+        if np.isnan(sample).any():
+            return
+
+        candidates = [0.0, -9999.0, 9999.0, -32768.0, 32768.0]
+        hits = []
+        total = float(sample.size)
+        for v in candidates:
+            mask = np.isclose(sample, v, rtol=0.0, atol=1e-6)
+            ratio = float(np.count_nonzero(mask) / total)
+            if ratio >= threshold_ratio:
+                hits.append((v, ratio))
+
+        if hits:
+            detail = ", ".join([f"{int(v) if v.is_integer() else v}:{r*100:.2f}%" for v, r in hits])
+            logger.warning(
+                "[NoData] NoData metadata is undefined, but possible implicit nodata values were detected "
+                f"(>= {threshold_ratio*100:.1f}%): {detail}. "
+                "Consider specifying --nodata explicitly."
+            )
+    except Exception as exc:
+        logger.debug(f"Implicit nodata candidate scan skipped: {exc}")
 
 
 def _resolve_writable_tmp_dir(
@@ -939,7 +1245,7 @@ def process_single_tile(
     multiscale_mode: bool = True,
     pixel_size: float = 0.5,
     target_distances: Optional[List[float]] = None,
-    weights: Optional[List[float]] = None,
+    rvi_weights: Optional[List[float]] = None,
     **algo_params
 ) -> TileResult:
     """
@@ -956,17 +1262,21 @@ def process_single_tile(
             # NoData処理とスキップ判定（最適化）
             mask_nodata = None
             if nodata is not None:
-                mask_nodata = (dem_tile == nodata)
+                mask_nodata = _build_nodata_mask(dem_tile, nodata)
                 nodata_ratio = np.count_nonzero(mask_nodata) / mask_nodata.size
                 
                 if nodata_ratio >= nodata_threshold:
                     return TileResult(
                         ty, tx, False,
-                        skipped_reason=f"NoDataが{nodata_ratio:.1%}を占める（閾値:{nodata_threshold:.1%}）"
+                        skipped_reason=(
+                            f"NoData covers {nodata_ratio:.1%} "
+                            f"(threshold: {nodata_threshold:.1%})"
+                        ),
                     )
                 
                 if nodata_ratio > 0.8:
-                    logger.warning(f"タイル({ty}, {tx}) NoData率が高いです: {nodata_ratio:.1%}")
+                    # Avoid flooding IDLE socket with thousands of warnings on huge rasters.
+                    logger.debug(f"Tile({ty}, {tx}) has high NoData ratio: {nodata_ratio:.1%}")
 
                 if algorithm in {"rvi", "fractal_anomaly"}:
                     # RVI uses NaN-aware filters. Keep NoData as NaN to avoid boundary
@@ -983,10 +1293,31 @@ def process_single_tile(
 
             # アルゴリズム選択と実行
             algo_instance = _load_algorithm(algorithm)
-            if algorithm == "hillshade":
-                # Respect geotransform orientation (e.g., dx=1, dy=-1) for light direction.
-                algo_params.setdefault("pixel_scale_x", float(src_transform.a))
-                algo_params.setdefault("pixel_scale_y", float(src_transform.e))
+            # Build per-tile params so geographic DEMs can use local latitude scaling.
+            tile_algo_params = dict(algo_params)
+            if src_crs is not None and getattr(src_crs, "is_geographic", False):
+                try:
+                    # Use core tile center latitude for local meter conversion.
+                    core_window = Window(core_x, core_y, core_w, core_h)
+                    b_left, b_bottom, b_right, b_top = rasterio.windows.bounds(core_window, src_transform)
+                    lat_center_tile = 0.5 * (float(b_bottom) + float(b_top))
+                    meters_per_degree_lat = 111_320.0
+                    meters_per_degree_lon = meters_per_degree_lat * max(
+                        1e-6, abs(math.cos(math.radians(lat_center_tile)))
+                    )
+                    sx_deg = float(src_transform.a)
+                    sy_deg = float(src_transform.e)
+                    px_m_x = math.copysign(abs(sx_deg) * meters_per_degree_lon, sx_deg if sx_deg != 0 else 1.0)
+                    px_m_y = math.copysign(abs(sy_deg) * meters_per_degree_lat, sy_deg if sy_deg != 0 else -1.0)
+                    px_m_mean = max(0.5 * (abs(px_m_x) + abs(px_m_y)), 1e-6)
+
+                    # Keep anisotropy in x/y while avoiding double meter conversion in gradient.
+                    tile_algo_params["pixel_scale_x"] = float(px_m_x / px_m_mean)
+                    tile_algo_params["pixel_scale_y"] = float(px_m_y / px_m_mean)
+                    tile_algo_params["elevation_scale"] = float(1.0 / px_m_mean)
+                except Exception:
+                    # Fallback to globally prepared params if local conversion fails.
+                    pass
 
             result_gpu = run_tile_algorithm(
                 algo_instance,
@@ -995,9 +1326,9 @@ def process_single_tile(
                 sigma,
                 multiscale_mode,
                 target_distances,
-                weights,
+                rvi_weights,
                 pixel_size,
-                algo_params,
+                tile_algo_params,
             )
 
             # NoData復元（必要時のみ）
@@ -1018,7 +1349,7 @@ def process_single_tile(
                 core_y_in_win : core_y_in_win + core_h,
                 core_x_in_win : core_x_in_win + core_w,
             ]
-            if algo_params.get("_apply_global_stats_post", False):
+            if tile_algo_params.get("_apply_global_stats_post", False):
                 core_mask_nodata = None
                 if mask_nodata is not None:
                     core_mask_nodata = mask_nodata[
@@ -1027,8 +1358,8 @@ def process_single_tile(
                     ]
                 result_core = _normalize_by_global_stats(
                     result_core,
-                    algo_params.get("global_stats"),
-                    target_range=algo_params.get("_output_norm_range", "unit"),
+                    tile_algo_params.get("global_stats"),
+                    target_range=tile_algo_params.get("_output_norm_range", "unit"),
                 )
                 if core_mask_nodata is not None:
                     fill_val = output_nodata_for_mask
@@ -1039,7 +1370,7 @@ def process_single_tile(
             result_core, output_nodata = _format_algorithm_output(
                 result_core=result_core,
                 algorithm=algorithm,
-                algo_params=algo_params,
+                algo_params=tile_algo_params,
                 nodata=nodata,
             )
 
@@ -1087,6 +1418,9 @@ def process_dem_tiles(
     pixel_size: Optional[float] = None,
     auto_scale_analysis: bool = True,
     cog_only: bool = False,
+    nodata_override: Optional[float] = None,
+    cog_backend: str = "internal",
+    gdal_bin_dir: Optional[str] = None,
     **algo_params  # アルゴリズム固有のパラメータ
 ):
     """
@@ -1100,7 +1434,9 @@ def process_dem_tiles(
             gpu_type, 
             sigma, 
             multiscale_mode, 
-            pixel_size or 0.5
+            pixel_size or 0.5,
+            cog_backend,
+            gdal_bin_dir,
         )
         return
     
@@ -1126,6 +1462,7 @@ def process_dem_tiles(
 
     # GPU設定取得
     gpu_config = get_gpu_config(gpu_type, sigma, multiscale_mode, pixel_size, target_distances)
+    user_padding_provided = padding is not None
     
     # パラメータ最適化
     if tile_size is None:
@@ -1146,15 +1483,47 @@ def process_dem_tiles(
         logger.info(
             f"Fractal required halo: {required_padding}px (current padding: {padding}px)"
         )
-    if padding < required_padding:
+    if not user_padding_provided:
+        if padding != required_padding:
+            logger.info(
+                f"Padding auto-adjusted for {algorithm}: {padding} -> {required_padding} "
+                f"(algorithm-required halo)"
+            )
+        padding = required_padding
+    elif padding < required_padding:
         logger.info(
             f"Padding auto-expanded for {algorithm}: {padding} -> {required_padding} "
             f"(required halo to avoid tile seams)"
         )
         padding = required_padding
     
-    logger.info(f"処理設定: {gpu_config['description']}")
-    logger.info(f"タイルサイズ: {tile_size}x{tile_size}, パディング: {padding}, ワーカー数: {max_workers}")
+    # Avoid GPU starvation / apparent stalls on very large effective windows.
+    # Effective window per tile includes halo on both sides.
+    effective_span = int(tile_size + 2 * padding)
+    try:
+        gpu_detected = bool(gpu_config.get("system_info", {}).get("gpu_detected", False))
+    except Exception:
+        gpu_detected = True
+    if gpu_detected:
+        recommended_workers = max_workers
+        if effective_span >= 2400:
+            recommended_workers = min(recommended_workers, 1)
+        elif effective_span >= 2000:
+            recommended_workers = min(recommended_workers, 2)
+        elif effective_span >= 1600:
+            recommended_workers = min(recommended_workers, 3)
+        if recommended_workers < max_workers:
+            logger.info(
+                "Worker auto-throttled for stability: "
+                f"{max_workers} -> {recommended_workers} (effective tile={effective_span}px)"
+            )
+            max_workers = recommended_workers
+
+    logger.info(f"Processing profile: {gpu_config['description']}")
+    logger.info(
+        f"Tile size: {tile_size}x{tile_size}, padding: {padding}, "
+        f"effective: {effective_span}x{effective_span}, workers: {max_workers}"
+    )
 
     # 一時ディレクトリ準備 (Windows pythonw/IDLE環境を含む書き込み不可CWDに対応)
     tmp_tile_dir = _resolve_writable_tmp_dir(tmp_tile_dir, output_cog_path, input_cog_path)
@@ -1164,12 +1533,35 @@ def process_dem_tiles(
             width = src.width
             height = src.height
             profile = src.profile.copy()
-            nodata = src.nodata
+            requested_mode = str(algo_params.get("mode", "local")).lower()
+            user_radii_specified = ("radii" in algo_params) and (algo_params.get("radii") is not None)
+            user_weights_specified = ("weights" in algo_params) and (algo_params.get("weights") is not None)
+            # Spatial preset may include large radii (up to 512px). For small rasters,
+            # force local mode unless the user explicitly provided radii/weights.
+            if (
+                requested_mode == "spatial"
+                and not user_radii_specified
+                and not user_weights_specified
+                and min(int(width), int(height)) <= 1024
+            ):
+                algo_params["mode"] = "local"
+                logger.warning(
+                    "[MODE] Input DEM is small (<=1024px on one side) and no --radii/--weights were provided. "
+                    "Falling back from --mode spatial to --mode local to avoid oversized auto-radius presets."
+                )
+            nodata = nodata_override if nodata_override is not None else src.nodata
+            if nodata_override is not None:
+                if _nodata_is_nan(nodata_override):
+                    logger.info("NoData override applied from CLI: NaN")
+                else:
+                    logger.info(f"NoData override applied from CLI: {float(nodata_override):g}")
             if nodata is None:
                 inferred = _infer_nodata_zero_from_border(src)
                 if inferred is not None:
                     nodata = inferred
                     logger.info("NoData metadata missing; inferred nodata=0 from raster border.")
+                else:
+                    _warn_implicit_nodata_candidates(src, threshold_ratio=0.01)
             src_transform = src.transform
             src_crs = src.crs
             try:
@@ -1187,22 +1579,39 @@ def process_dem_tiles(
                 is_geo = False
                 lat_center = None
 
-            # Inject anisotropic pixel scales for all algorithms (simple geographic support).
-            algo_params.setdefault("pixel_scale_x", float(px_m_x))
-            algo_params.setdefault("pixel_scale_y", float(px_m_y))
+            # Inject anisotropic pixel scales for all algorithms.
+            elevation_scale = 1.0
             if is_geo:
                 ratio = abs(px_m_y) / max(abs(px_m_x), 1e-9)
+                elevation_scale = 1.0 / max(float(px_m_mean), 1e-6)
+                # Geographic DEM:
+                # - scale z by mean meter/pixel
+                # - normalize x/y steps by the same mean to preserve dy/dx anisotropy
+                #   without applying meter conversion twice in gradients.
+                algo_params["pixel_scale_x"] = float(px_m_x / max(px_m_mean, 1e-6))
+                algo_params["pixel_scale_y"] = float(px_m_y / max(px_m_mean, 1e-6))
+                algo_params["elevation_scale"] = elevation_scale
                 logger.info(
                     "Geographic DEM approximation enabled: "
-                    f"lat={lat_center:.3f}, dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m, dy/dx={ratio:.4f}"
+                    f"lat={lat_center:.3f}, dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m, "
+                    f"dy/dx={ratio:.4f}, z_scale={elevation_scale:.8f}"
                 )
+                algo_params["is_geographic_dem"] = True
             else:
+                algo_params["pixel_scale_x"] = float(px_m_x)
+                algo_params["pixel_scale_y"] = float(px_m_y)
+                algo_params["elevation_scale"] = 1.0
+                algo_params["is_geographic_dem"] = False
                 logger.info(
                     f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m"
                 )
 
             mode = str(algo_params.get("mode", "local")).lower()
             global_stats_required = _is_global_stats_required(algorithm, mode)
+            if algorithm == "specular" and bool(algo_params.get("is_geographic_dem", False)):
+                # Geographic specular uses per-tile local meter scaling.
+                # A single center-lat global tone stat causes bias (flat areas darkening).
+                global_stats_required = False
             output_norm_range = _normalization_target_range(algorithm)
 
             if algorithm == "rvi":
@@ -1213,6 +1622,7 @@ def process_dem_tiles(
                     target_distances=target_distances,
                     weights=weights,
                     algo_params=algo_params,
+                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
                 if global_rvi_stats is not None:
                     algo_params["global_stats"] = global_rvi_stats
@@ -1226,6 +1636,7 @@ def process_dem_tiles(
                     nodata=nodata,
                     scales=algo_params.get("scales"),
                     weights=algo_params.get("weights"),
+                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
                 if global_ms_stats is not None:
                     algo_params["global_stats"] = global_ms_stats
@@ -1239,6 +1650,7 @@ def process_dem_tiles(
                     nodata=nodata,
                     pixel_size=float(pixel_size),
                     scales=algo_params.get("scales"),
+                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
                 if global_vs_stats is not None:
                     algo_params["global_stats"] = global_vs_stats
@@ -1252,6 +1664,7 @@ def process_dem_tiles(
                     nodata=nodata,
                     pixel_size=float(pixel_size),
                     kernel_size=int(algo_params.get("kernel_size", 25)),
+                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
                 if global_lrm_stats is not None:
                     algo_params["global_stats"] = global_lrm_stats
@@ -1269,6 +1682,7 @@ def process_dem_tiles(
                     despeckle_threshold=float(algo_params.get("despeckle_threshold", 0.35)),
                     despeckle_alpha_max=float(algo_params.get("despeckle_alpha_max", 0.30)),
                     detail_boost=float(algo_params.get("detail_boost", 0.35)),
+                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
                 if global_fractal_stats is not None:
                     algo_params["global_stats"] = global_fractal_stats
@@ -1282,6 +1696,7 @@ def process_dem_tiles(
                     nodata=nodata,
                     scales=algo_params.get("scales"),
                     enhancement=float(algo_params.get("enhancement", 2.0)),
+                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
                 if global_sss_stats is not None:
                     algo_params["global_stats"] = global_sss_stats
@@ -1289,6 +1704,19 @@ def process_dem_tiles(
                         "Scale-space surprise global normalization stats fixed for all tiles: "
                         f"min={global_sss_stats[0]:.6f}, max={global_sss_stats[1]:.6f}, "
                         f"gamma={global_sss_stats[2]:.3f}"
+                    )
+            elif algorithm == "specular":
+                global_roughness_scale = _compute_global_specular_roughness_scale(
+                    input_cog_path=input_cog_path,
+                    nodata=nodata,
+                    roughness_scale=float(algo_params.get("roughness_scale", 50.0)),
+                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
+                )
+                if global_roughness_scale is not None:
+                    algo_params["roughness_norm_scale"] = global_roughness_scale
+                    logger.info(
+                        "Specular global roughness scale fixed for all tiles: "
+                        f"p95={global_roughness_scale:.6f}"
                     )
 
             # Unified fallback: enforce global normalization for all required algorithms.
@@ -1322,6 +1750,18 @@ def process_dem_tiles(
             n_tiles_x = math.ceil(width / tile_size)
             n_tiles_y = math.ceil(height / tile_size)
             total_tiles = n_tiles_x * n_tiles_y
+
+            _warn_if_compute_cost_high(
+                algorithm=algorithm,
+                width=width,
+                height=height,
+                tile_size=tile_size,
+                padding=padding,
+                pixel_size=float(pixel_size),
+                algo_params=algo_params,
+                target_distances=target_distances,
+                gpu_config=gpu_config,
+            )
 
             logger.info(f"処理タイル数: {n_tiles_x} x {n_tiles_y} = {total_tiles}")
 
@@ -1367,15 +1807,19 @@ def process_dem_tiles(
                     result = future.result()
                     completed_count += 1
                     progress = completed_count / total_tiles * 100
-                    
+
                     if result.success:
                         processed_tiles.append(result)
-                        if completed_count % 10 == 0:
-                            logger.info(f"[OK] 処理完了: {completed_count}/{total_tiles} ({progress:.1f}%)")
                     elif result.skipped_reason:
                         skipped_tiles.append(result)
                     else:
                         error_tiles.append(result)
+
+                    if completed_count % 10 == 0:
+                        logger.info(
+                            f"[OK] Progress: {completed_count}/{total_tiles} ({progress:.1f}%) "
+                            f"[success={len(processed_tiles)}, skipped={len(skipped_tiles)}, error={len(error_tiles)}]"
+                        )
 
             logger.info(f"処理結果: 成功{len(processed_tiles)}, スキップ{len(skipped_tiles)}, エラー{len(error_tiles)}")
 
@@ -1388,7 +1832,13 @@ def process_dem_tiles(
                 raise ValueError("処理されたタイルがありません")
 
         # COG生成
-        _build_vrt_and_cog_ultra_fast(tmp_tile_dir, output_cog_path, gpu_config)
+        _build_vrt_and_cog_ultra_fast(
+            tmp_tile_dir,
+            output_cog_path,
+            gpu_config,
+            backend=cog_backend,
+            gdal_bin_dir=gdal_bin_dir,
+        )
         
         # COG品質検証
         _validate_cog_for_qgis(output_cog_path)
@@ -1410,7 +1860,9 @@ def resume_cog_generation(
     gpu_type: str = "auto",
     sigma: float = 10.0,
     multiscale_mode: bool = True,
-    pixel_size: float = 0.5
+    pixel_size: float = 0.5,
+    cog_backend: str = "internal",
+    gdal_bin_dir: Optional[str] = None,
 ):
     """
     既存のタイルからCOG生成のみを実行する関数
@@ -1448,7 +1900,13 @@ def resume_cog_generation(
     
     # COG生成実行
     try:
-        _build_vrt_and_cog_ultra_fast(tmp_tile_dir, output_cog_path, gpu_config)
+        _build_vrt_and_cog_ultra_fast(
+            tmp_tile_dir,
+            output_cog_path,
+            gpu_config,
+            backend=cog_backend,
+            gdal_bin_dir=gdal_bin_dir,
+        )
         _validate_cog_for_qgis(output_cog_path)
         logger.info("[OK] COG生成完了")
         

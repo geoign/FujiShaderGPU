@@ -1,0 +1,40 @@
+spatial_presets:
+  - name: lt_5m
+    max_pixel_size_m: 5.0
+    radii: [2, 8, 32, 128, 512]
+    weights: [0.3, 0.3, 0.2, 0.1, 0.1]
+
+  - name: m5_to_25
+    min_pixel_size_m: 5.0
+    max_pixel_size_m: 25.0
+    radii: [2, 8, 32, 128, 512]
+    weights: [0.3, 0.3, 0.2, 0.1, 0.1]
+
+  - name: m25_to_50
+    min_pixel_size_m: 25.0
+    max_pixel_size_m: 50.0
+    radii: [2, 8, 32, 128, 512]
+    weights: [0.3, 0.3, 0.2, 0.1, 0.1]
+
+  - name: m50_to_250
+    min_pixel_size_m: 50.0
+    max_pixel_size_m: 250.0
+    radii: [2, 8, 32, 128, 512]
+    weights: [0.3, 0.3, 0.2, 0.1, 0.1]
+
+  - name: m250_to_1250
+    min_pixel_size_m: 250.0
+    max_pixel_size_m: 1250.0
+    radii: [2, 8, 32, 128, 512]
+    weights: [0.3, 0.3, 0.2, 0.1, 0.1]
+
+  - name: m1250_to_5000
+    min_pixel_size_m: 1250.0
+    max_pixel_size_m: 5000.0
+    radii: [2, 8, 32, 128, 512]
+    weights: [0.3, 0.3, 0.2, 0.1, 0.1]
+
+  - name: gt_5000m
+    min_pixel_size_m: 5000.0
+    radii: [2, 8, 32, 128, 512]
+    weights: [0.3, 0.3, 0.2, 0.1, 0.1]

@@ -7,12 +7,12 @@ from abc import ABC, abstractmethod
 import cupy as cp
 import numpy as np
 import dask.array as da
-from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation, median_filter
+from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, maximum_filter, minimum_filter, convolve, binary_dilation, median_filter, zoom
 from .common.kernels import (
     scale_space_surprise as kernel_scale_space_surprise,
     multi_light_uncertainty as kernel_multi_light_uncertainty,
 )
-from .common.spatial_mode import determine_spatial_radii
+from .common.spatial_mode import determine_spatial_radii, determine_spatial_profile
 
 class Constants:
     DEFAULT_GAMMA = 1/2.2
@@ -139,11 +139,13 @@ def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0,
     else:
         filled = block
     
-    step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
-    step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
-    if abs(step_y) < 1e-9:
+    # Use metric spacing magnitude only. Sign carries geotransform orientation,
+    # which can unintentionally flip illumination direction in shading algorithms.
+    step_y = abs(float(pixel_scale_y if pixel_scale_y is not None else pixel_size))
+    step_x = abs(float(pixel_scale_x if pixel_scale_x is not None else pixel_size))
+    if step_y < 1e-9:
         step_y = float(pixel_size if pixel_size else 1.0)
-    if abs(step_x) < 1e-9:
+    if step_x < 1e-9:
         step_x = float(pixel_size if pixel_size else 1.0)
     dy, dx = cp.gradient(filled * scale, step_y, step_x, edge_order=2)
     return dy, dx, nan_mask
@@ -171,6 +173,33 @@ def _normalize_spatial_radii(radii: Optional[List[int]], pixel_size: float) -> L
             seen.add(v)
             ordered.append(v)
     return ordered
+
+
+def _resolve_spatial_radii_weights(
+    radii: Optional[List[int]],
+    weights: Optional[List[float]],
+    pixel_size: float,
+) -> Tuple[List[int], Optional[List[float]]]:
+    """Resolve radii/weights with YAML presets when user values are omitted."""
+    if radii is None:
+        auto_radii, auto_weights = determine_spatial_profile(pixel_size=pixel_size)
+        return auto_radii, auto_weights if weights is None else weights
+
+    resolved_radii = _normalize_spatial_radii(radii, pixel_size)
+    if not isinstance(weights, (list, tuple)) or len(weights) != len(resolved_radii):
+        return resolved_radii, None
+
+    cleaned: List[float] = []
+    for w in weights:
+        try:
+            fv = float(w)
+        except (TypeError, ValueError):
+            return resolved_radii, None
+        cleaned.append(fv if np.isfinite(fv) and fv > 0 else 0.0)
+    s = float(sum(cleaned))
+    if s <= 0:
+        return resolved_radii, None
+    return resolved_radii, [v / s for v in cleaned]
 
 
 def _combine_multiscale_dask(
@@ -207,14 +236,111 @@ def _combine_multiscale_dask(
     return da.mean(stacked, axis=0)
 
 
-def _smooth_for_radius(block: cp.ndarray, radius: float) -> cp.ndarray:
+def _smooth_for_radius(
+    block: cp.ndarray,
+    radius: float,
+    *,
+    pixel_size: float = 1.0,
+    algorithm_name: str = "default",
+) -> cp.ndarray:
     """NaN-aware gaussian smoothing controlled by spatial radius."""
     r = max(1.0, float(radius))
     if r <= 1.0:
         return block
-    sigma = max(0.5, r / 2.0)
-    smoothed, _ = handle_nan_with_gaussian(block, sigma=sigma, mode="nearest")
-    return smoothed
+    factor = _radius_to_downsample_factor(
+        r,
+        block_shape=block.shape,
+        pixel_size=pixel_size,
+        algorithm_name=algorithm_name,
+    )
+    if factor <= 1:
+        sigma = max(0.5, r / 2.0)
+        smoothed, _ = handle_nan_with_gaussian(block, sigma=sigma, mode="nearest")
+        return smoothed
+
+    reduced = _downsample_nan_aware(block, factor)
+    sigma_small = max(0.5, (r / factor) / 2.0)
+    smoothed_small, _ = handle_nan_with_gaussian(reduced, sigma=sigma_small, mode="nearest")
+    return _upsample_to_shape(smoothed_small, block.shape)
+
+
+def _radius_to_downsample_factor(
+    radius: float,
+    *,
+    block_shape: Optional[Tuple[int, int]] = None,
+    pixel_size: float = 1.0,
+    algorithm_name: str = "default",
+    base_radius: float = 24.0,
+    max_factor: int = 16,
+) -> int:
+    """
+    Dynamic downsample factor from radius + workload context.
+    Returns power-of-two factors: 1,2,4,8,...
+    """
+    r = max(1.0, float(radius))
+    px = max(1e-3, float(pixel_size) if pixel_size else 1.0)
+
+    algo_factor_map = {
+        "rvi": 1.15,
+        "hillshade": 1.0,
+        "slope": 1.0,
+        "specular": 1.4,
+        "atmospheric_scattering": 1.05,
+        "curvature": 1.1,
+        "ambient_occlusion": 1.5,
+        "openness": 1.4,
+        "multi_light_uncertainty": 1.25,
+    }
+    algo_factor = float(algo_factor_map.get(str(algorithm_name), 1.0))
+
+    block_factor = 1.0
+    if block_shape is not None and len(block_shape) >= 2:
+        h = max(1, int(block_shape[0]))
+        w = max(1, int(block_shape[1]))
+        block_pixels = float(h * w)
+        # Mild scaling by block area to avoid over-aggressive shrink on small chunks.
+        block_factor = max(1.0, (block_pixels / 1_000_000.0) ** 0.5)
+
+    # 0.5m should be somewhat more aggressive than 1m.
+    resolution_factor = max(1.0, 1.0 / px)
+
+    score = (r / max(1.0, base_radius)) * algo_factor * block_factor * (resolution_factor ** 0.35)
+    if score <= 1.0:
+        return 1
+
+    # Convert to power-of-two scaling for stable kernels.
+    factor = 2 ** int(np.floor(np.log2(score)))
+    factor = int(max(1, min(factor, max_factor)))
+    return factor
+
+
+def _downsample_nan_aware(block: cp.ndarray, factor: int) -> cp.ndarray:
+    if factor <= 1:
+        return block
+    nan_mask = cp.isnan(block)
+    h, w = block.shape[:2]
+    out_h = max(1, (int(h) + int(factor) - 1) // int(factor))
+    out_w = max(1, (int(w) + int(factor) - 1) // int(factor))
+    if nan_mask.any():
+        fill = cp.nanmean(block)
+        fill = cp.where(cp.isfinite(fill), fill, 0.0)
+        work = cp.where(nan_mask, fill, block).astype(cp.float32)
+    else:
+        work = block.astype(cp.float32, copy=False)
+    sy = out_h / max(1, h)
+    sx = out_w / max(1, w)
+    return zoom(work, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
+
+
+def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int]) -> cp.ndarray:
+    th, tw = int(target_shape[0]), int(target_shape[1])
+    h, w = block.shape[:2]
+    if h == th and w == tw:
+        return block.astype(cp.float32, copy=False)
+    sy = th / max(1, h)
+    sx = tw / max(1, w)
+    out = zoom(block, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
+    return out[:th, :tw]
     
 def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
     """NaN菴咲ｽｮ繧貞ｾｩ蜈・"""
@@ -516,7 +642,8 @@ def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
 
 def compute_rvi_efficient_block(block: cp.ndarray, *, 
                                radii: List[int] = [4, 16, 64], 
-                               weights: Optional[List[float]] = None) -> cp.ndarray:
+                               weights: Optional[List[float]] = None,
+                               pixel_size: float = 1.0) -> cp.ndarray:
     """蜉ｹ邇・噪縺ｪRVI險育ｮ暦ｼ医Γ繝｢繝ｪ譛驕ｩ蛹也沿・・"""
     nan_mask = cp.isnan(block)
     
@@ -532,7 +659,21 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
     rvi_combined = None
     
     for i, (radius, weight) in enumerate(zip(radii, weights)):
-        if radius <= 1:
+        ds_factor = _radius_to_downsample_factor(
+            float(radius),
+            block_shape=block.shape,
+            pixel_size=pixel_size,
+            algorithm_name="rvi",
+        )
+        if ds_factor > 1:
+            small = _downsample_nan_aware(block, ds_factor)
+            r_small = max(1, int(round(float(radius) / ds_factor)))
+            if r_small <= 1:
+                mean_small, _ = handle_nan_with_gaussian(small, sigma=1.0, mode='nearest')
+            else:
+                mean_small, _ = handle_nan_with_uniform(small, size=2 * r_small + 1, mode='reflect')
+            mean_elev = _upsample_to_shape(mean_small, block.shape)
+        elif radius <= 1:
             mean_elev, _ = handle_nan_with_gaussian(block, sigma=1.0, mode='nearest')
         else:
             kernel_size = 2 * radius + 1
@@ -557,7 +698,8 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
 
 def multiscale_rvi(gpu_arr: da.Array, *, 
                    radii: List[int], 
-                   weights: Optional[List[float]] = None) -> da.Array:
+                   weights: Optional[List[float]] = None,
+                   pixel_size: float = 1.0) -> da.Array:
     """蜉ｹ邇・噪縺ｪ繝槭Ν繝√せ繧ｱ繝ｼ繝ｫRVI・・ask迚茨ｼ・"""
     
     if not radii:
@@ -575,7 +717,8 @@ def multiscale_rvi(gpu_arr: da.Array, *,
         dtype=cp.float32,
         meta=cp.empty((0, 0), dtype=cp.float32),
         radii=radii,
-        weights=weights
+        weights=weights,
+        pixel_size=pixel_size,
     )
     
     return result
@@ -594,7 +737,7 @@ class RVIAlgorithm(DaskAlgorithm):
             pixel_size = params.get('pixel_size', 1.0)
             radii = self._determine_optimal_radii(pixel_size)
         max_radius = max(radii)
-        rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights)
+        rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights, pixel_size=pixel_size)
         
         # Prefer externally supplied global stats (tile backend computes once).
         stats = params.get("global_stats", None)
@@ -610,7 +753,7 @@ class RVIAlgorithm(DaskAlgorithm):
                     rvi,
                     rvi_stat_func,
                     compute_rvi_efficient_block,
-                    {'radii': radii, 'weights': weights},
+                    {'radii': radii, 'weights': weights, 'pixel_size': pixel_size},
                     params.get('downsample_factor', None),
                     depth=max_radius * 2 + 1
                 )
@@ -687,27 +830,53 @@ def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = Constants.DEF
         pixel_scale_y=pixel_scale_y,
     )
     
-    # 蜍ｾ驟阪→蛯ｾ譁懆ｧ・
-    slope = cp.arctan(cp.sqrt(dx**2 + dy**2))
-    
-    # 繧｢繧ｹ繝壹け繝茨ｼ域万髱｢譁ｹ菴搾ｼ・
-    aspect = cp.arctan2(-dy, dx)  # 蛹励ｒ0ﾂｰ縺ｨ縺吶ｋ蠎ｧ讓咏ｳｻ
-    
-    # 蜈画ｺ舌・繧ｯ繝医Ν縺ｨ縺ｮ隗貞ｺｦ蟾ｮ
-    aspect_diff = aspect - azimuth_rad
-    
-    # Hillshade險育ｮ暦ｼ・ambertian reflectance model・・
-    hillshade = cp.cos(altitude_rad) * cp.cos(slope) + \
-                cp.sin(altitude_rad) * cp.sin(slope) * cp.cos(aspect_diff)
-    
-    # 0-255縺ｮ遽・峇縺ｫ豁｣隕丞喧・・illshade縺ｯ萓句､也噪縺ｫ0-255蜃ｺ蜉幢ｼ・
-    hillshade = cp.clip(hillshade, -1, 1)
-    hillshade = ((hillshade + 1) / 2 * 255).astype(cp.float32)
+    # Pixel axis direction (from geotransform sign) -> world EN components.
+    sign_x = 1.0 if (pixel_scale_x is None or float(pixel_scale_x) >= 0.0) else -1.0
+    sign_y = 1.0 if (pixel_scale_y is None or float(pixel_scale_y) >= 0.0) else -1.0
+    dz_d_east = dx * sign_x
+    dz_d_north = dy * sign_y
+
+    # World normal in ENU frame.
+    normal = cp.stack([-dz_d_east, -dz_d_north, cp.ones_like(dx)], axis=-1)
+    normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
+
+    # Light direction from compass azimuth (0=north, clockwise) and altitude.
+    light_dir = cp.array([
+        cp.sin(azimuth_rad) * cp.cos(altitude_rad),  # east
+        cp.cos(azimuth_rad) * cp.cos(altitude_rad),  # north
+        cp.sin(altitude_rad),                        # up
+    ])
+
+    hillshade = cp.sum(normal * light_dir.reshape(1, 1, 3), axis=-1)
+    hillshade = cp.clip(hillshade, 0.0, 1.0).astype(cp.float32)
     
     # NaN蜃ｦ逅・
     hillshade = restore_nan(hillshade, nan_mask)
     
     return hillshade
+
+
+def compute_hillshade_spatial_block(
+    block: cp.ndarray,
+    *,
+    azimuth: float = Constants.DEFAULT_AZIMUTH,
+    altitude: float = Constants.DEFAULT_ALTITUDE,
+    z_factor: float = 1.0,
+    pixel_size: float = 1.0,
+    pixel_scale_x: float = None,
+    pixel_scale_y: float = None,
+    radius: float = 4.0,
+) -> cp.ndarray:
+    smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="hillshade")
+    return compute_hillshade_block(
+        smoothed,
+        azimuth=azimuth,
+        altitude=altitude,
+        z_factor=z_factor,
+        pixel_size=pixel_size,
+        pixel_scale_x=pixel_scale_x,
+        pixel_scale_y=pixel_scale_y,
+    )
 
 class HillshadeAlgorithm(DaskAlgorithm):
     """Hillshade繧｢繝ｫ繧ｴ繝ｪ繧ｺ繝"""
@@ -726,7 +895,9 @@ class HillshadeAlgorithm(DaskAlgorithm):
         mode = str(params.get("mode", "local")).lower()
 
         if mode == "spatial":
-            radii = _normalize_spatial_radii(radii, pixel_size)
+            radii, auto_weights = _resolve_spatial_radii_weights(radii, weights, pixel_size)
+            if weights is None:
+                weights = auto_weights
             multiscale = True
         else:
             if not isinstance(radii, (list, tuple)) or len(radii) == 0:
@@ -734,28 +905,14 @@ class HillshadeAlgorithm(DaskAlgorithm):
             radii = [max(1.0, float(r)) for r in radii]
             multiscale = bool(multiscale or len(radii) > 1)
 
-        if multiscale and len(radii) > 1:
+        if mode == "spatial" or (multiscale and len(radii) > 1):
             # 繝槭Ν繝√せ繧ｱ繝ｼ繝ｫHillshade
             results = []
             for radius in radii:
-                sigma = max(0.5, float(radius) / 3.0)
-                # 縺ｾ縺壹せ繝繝ｼ繧ｸ繝ｳ繧ｰ
-                if sigma > 1:
-                    depth = int(4 * sigma)
-                    smoothed = gpu_arr.map_overlap(
-                        lambda x, *, sigma=sigma: gaussian_filter(x, sigma=sigma, mode='nearest'),
-                        depth=depth,
-                        boundary='reflect',
-                        dtype=cp.float32,
-                        meta=cp.empty((0, 0), dtype=cp.float32)
-                    )
-                else:
-                    smoothed = gpu_arr
-                
-                # Hillshade險育ｮ・
-                hs = smoothed.map_overlap(
-                    compute_hillshade_block,
-                    depth=1,
+                depth = max(2, int(float(radius) * 2 + 1))
+                hs = gpu_arr.map_overlap(
+                    compute_hillshade_spatial_block,
+                    depth=depth,
                     boundary='reflect',
                     dtype=cp.float32,
                     meta=cp.empty((0, 0), dtype=cp.float32),
@@ -765,6 +922,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
                     pixel_size=pixel_size,
                     pixel_scale_x=pixel_scale_x,
                     pixel_scale_y=pixel_scale_y,
+                    radius=float(radius),
                 )
                 results.append(hs)
             
@@ -1306,6 +1464,39 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     return result.astype(cp.float32)
 
 
+def compute_ambient_occlusion_spatial_block(
+    block: cp.ndarray,
+    *,
+    num_samples: int = 16,
+    radius: float = 10.0,
+    intensity: float = 1.0,
+    pixel_size: float = 1.0,
+) -> cp.ndarray:
+    ds_factor = _radius_to_downsample_factor(
+        float(radius),
+        block_shape=block.shape,
+        pixel_size=pixel_size,
+        algorithm_name="ambient_occlusion",
+    )
+    if ds_factor <= 1:
+        return compute_ambient_occlusion_block(
+            block,
+            num_samples=num_samples,
+            radius=radius,
+            intensity=intensity,
+            pixel_size=pixel_size,
+        )
+    small = _downsample_nan_aware(block, ds_factor)
+    result_small = compute_ambient_occlusion_block(
+        small,
+        num_samples=num_samples,
+        radius=max(1.0, float(radius) / float(ds_factor)),
+        intensity=intensity,
+        pixel_size=float(pixel_size) * float(ds_factor),
+    )
+    return _upsample_to_shape(result_small, block.shape)
+
+
 class AmbientOcclusionAlgorithm(DaskAlgorithm):
     """迺ｰ蠅・・驕ｮ阡ｽ繧｢繝ｫ繧ｴ繝ｪ繧ｺ繝"""
     
@@ -1315,8 +1506,11 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         intensity = params.get('intensity', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
         mode = str(params.get("mode", "local")).lower()
-        radii = _normalize_spatial_radii(params.get("radii"), pixel_size)
-        weights = params.get("weights", None)
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"),
+            params.get("weights", None),
+            pixel_size,
+        )
         agg = params.get("agg", "mean")
 
         if mode == "spatial":
@@ -1325,7 +1519,7 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
                 r_use = float(max(1, int(round(float(r)))))
                 responses.append(
                     gpu_arr.map_overlap(
-                        compute_ambient_occlusion_block,
+                        compute_ambient_occlusion_spatial_block,
                         depth=int(r_use + 1),
                         boundary='reflect',
                         dtype=cp.float32,
@@ -1522,6 +1716,39 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     
     return result.astype(cp.float32)
 
+
+def compute_openness_spatial_block(
+    block: cp.ndarray,
+    *,
+    openness_type: str = 'positive',
+    num_directions: int = 16,
+    max_distance: int = 50,
+    pixel_size: float = 1.0,
+) -> cp.ndarray:
+    ds_factor = _radius_to_downsample_factor(
+        float(max_distance),
+        block_shape=block.shape,
+        pixel_size=pixel_size,
+        algorithm_name="openness",
+    )
+    if ds_factor <= 1:
+        return compute_openness_vectorized(
+            block,
+            openness_type=openness_type,
+            num_directions=num_directions,
+            max_distance=max_distance,
+            pixel_size=pixel_size,
+        )
+    small = _downsample_nan_aware(block, ds_factor)
+    result_small = compute_openness_vectorized(
+        small,
+        openness_type=openness_type,
+        num_directions=num_directions,
+        max_distance=max(2, int(round(float(max_distance) / float(ds_factor)))),
+        pixel_size=float(pixel_size) * float(ds_factor),
+    )
+    return _upsample_to_shape(result_small, block.shape)
+
 class OpennessAlgorithm(DaskAlgorithm):
     """髢句ｺｦ繧｢繝ｫ繧ｴ繝ｪ繧ｺ繝・育ｰ｡譏馴ｫ倬溽沿・・"""
     
@@ -1531,8 +1758,11 @@ class OpennessAlgorithm(DaskAlgorithm):
         num_directions = params.get('num_directions', 16)
         pixel_size = params.get('pixel_size', 1.0)
         mode = str(params.get("mode", "local")).lower()
-        radii = _normalize_spatial_radii(params.get("radii"), pixel_size)
-        weights = params.get("weights", None)
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"),
+            params.get("weights", None),
+            pixel_size,
+        )
         agg = params.get("agg", "mean")
 
         if mode == "spatial":
@@ -1541,7 +1771,7 @@ class OpennessAlgorithm(DaskAlgorithm):
                 max_dist = int(max(2, round(float(r))))
                 responses.append(
                     gpu_arr.map_overlap(
-                        compute_openness_vectorized,
+                        compute_openness_spatial_block,
                         depth=max_dist + 1,
                         boundary='reflect',
                         dtype=cp.float32,
@@ -1620,7 +1850,7 @@ def compute_slope_spatial_block(
     pixel_scale_y: float = None,
     radius: float = 4.0,
 ) -> cp.ndarray:
-    smoothed = _smooth_for_radius(block, radius)
+    smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="slope")
     return compute_slope_block(
         smoothed,
         unit=unit,
@@ -1636,8 +1866,11 @@ class SlopeAlgorithm(DaskAlgorithm):
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
         mode = str(params.get("mode", "local")).lower()
-        radii = _normalize_spatial_radii(params.get("radii"), pixel_size)
-        weights = params.get("weights", None)
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"),
+            params.get("weights", None),
+            pixel_size,
+        )
         agg = params.get("agg", "mean")
 
         if mode == "spatial":
@@ -1689,6 +1922,8 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
                           shininess: float = 20.0, pixel_size: float = 1.0,
                           pixel_scale_x: float = None,
                           pixel_scale_y: float = None,
+                          roughness_norm_scale: float = None,
+                          geographic_mode: bool = False,
                           light_azimuth: float = Constants.DEFAULT_AZIMUTH, light_altitude: float = Constants.DEFAULT_ALTITUDE) -> cp.ndarray:
     """驥大ｱ槫・豐｢蜉ｹ譫懊・險育ｮ暦ｼ・ook-Torrance繝｢繝・Ν縺ｮ邁｡逡･迚茨ｼ・"""
     # NaN繝槭せ繧ｯ繧剃ｿ晏ｭ・
@@ -1703,7 +1938,12 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
         pixel_scale_y=pixel_scale_y,
     )
     
-    normal = cp.stack([-dx, -dy, cp.ones_like(dx)], axis=-1)
+    # Map raster derivatives into world ENU using pixel axis signs.
+    sign_x = 1.0 if (pixel_scale_x is None or float(pixel_scale_x) >= 0.0) else -1.0
+    sign_y = 1.0 if (pixel_scale_y is None or float(pixel_scale_y) >= 0.0) else -1.0
+    dz_d_east = dx * sign_x
+    dz_d_north = dy * sign_y
+    normal = cp.stack([-dz_d_east, -dz_d_north, cp.ones_like(dx)], axis=-1)
     normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
     
     # 繝ｩ繝輔ロ繧ｹ縺ｮ險育ｮ暦ｼ亥ｱ謇逧・↑讓咎ｫ倥・蛻・淵・・
@@ -1731,20 +1971,31 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     
     # 繝ｩ繝輔ロ繧ｹ繧呈ｭ｣隕丞喧・医ｈ繧企←蛻・↑遽・峇縺ｫ・・
     roughness_valid = roughness[~nan_mask] if nan_mask.any() else roughness
-    if len(roughness_valid) > 0 and cp.max(roughness_valid) > 0:
-        roughness = roughness / cp.max(roughness_valid)
-        # 譛蟆丞､繧定ｨｭ螳壹＠縺ｦ螳悟・縺ｪ髀｡髱｢蜿榊ｰ・ｒ髦ｲ縺・
-        roughness = cp.clip(roughness, 0.1, 1.0)
+    if len(roughness_valid) > 0:
+        if roughness_norm_scale is not None and float(roughness_norm_scale) > 1e-9:
+            # Global scale keeps roughness normalization consistent across tiles.
+            denom = float(roughness_norm_scale)
+        else:
+            p95_local = float(cp.percentile(roughness_valid, 95))
+            denom = p95_local if p95_local > 1e-9 else float(cp.max(roughness_valid))
+        if denom > 1e-9:
+            roughness = roughness / (roughness + denom)
+            roughness = cp.clip(roughness, 0.05, 1.0)
+        else:
+            roughness = cp.full_like(block, 0.5)
     else:
         roughness = cp.full_like(block, 0.5)
     
     # 蜈画ｺ先婿蜷・
-    light_az_rad = cp.radians(light_azimuth)
+    # Geographic rasters may exhibit polarity mismatch in display pipelines.
+    # Apply paired azimuth+polarity correction only in geographic mode.
+    effective_azimuth = float((light_azimuth + 180.0) % 360.0) if geographic_mode else float(light_azimuth)
+    light_az_rad = cp.radians(effective_azimuth)
     light_alt_rad = cp.radians(light_altitude)
     light_dir = cp.array([
-        cp.sin(light_az_rad) * cp.cos(light_alt_rad),
-        -cp.cos(light_az_rad) * cp.cos(light_alt_rad),
-        cp.sin(light_alt_rad)
+        cp.sin(light_az_rad) * cp.cos(light_alt_rad),  # east
+        cp.cos(light_az_rad) * cp.cos(light_alt_rad),  # north
+        cp.sin(light_alt_rad),                          # up
     ])
     
     # 隕也ｷ壽婿蜷托ｼ育悄荳翫°繧会ｼ・
@@ -1757,21 +2008,45 @@ def compute_specular_block(block: cp.ndarray, *, roughness_scale: float = 50.0,
     n_dot_h = cp.sum(normal * half_vec.reshape(1, 1, 3), axis=-1)
     n_dot_h = cp.clip(n_dot_h, 0, 1)
     
-    # 繧医ｊ遨上ｄ縺九↑謖・焚繧剃ｽｿ逕ｨ
-    exponent = shininess * (1.0 - roughness * 0.8)  # roughness縺碁ｫ倥＞縺ｻ縺ｩ謖・焚繧剃ｸ九￡繧・
+    # Roughness-aware exponent + metallic highlight boost.
+    exponent = shininess * (1.0 - roughness * 0.8)
     specular = cp.power(n_dot_h, exponent)
+    gloss_boost = 0.95 + 0.70 * (1.0 - roughness)
+    specular = cp.clip(specular * gloss_boost, 0.0, 1.0)
+
+    # Schlick-like fresnel term (view-dependent metallic edge sheen).
+    n_dot_v = cp.clip(normal[..., 2], 0.0, 1.0)
+    f0 = cp.float32(0.06)
+    fresnel = f0 + (1.0 - f0) * cp.power(1.0 - n_dot_v, 5.0)
+    specular = cp.clip(specular * (0.80 + 0.45 * fresnel), 0.0, 1.0)
+    # Soft-limit very bright spikes before blending.
+    specular = specular / (1.0 + 0.35 * specular)
     
     # 繝・ぅ繝輔Η繝ｼ繧ｺ謌仙・繧りｿｽ蜉・亥ｮ悟・縺ｪ鮟偵ｒ髦ｲ縺撰ｼ・
     n_dot_l = cp.sum(normal * light_dir.reshape(1, 1, 3), axis=-1)
     n_dot_l = cp.clip(n_dot_l, 0, 1)
-    diffuse = n_dot_l * 0.3  # 繝・ぅ繝輔Η繝ｼ繧ｺ謌仙・繧・0%
-    
-    # 蜷域・
-    result = diffuse + specular * 0.7
+    diffuse = n_dot_l * 0.28
+
+    # Specular-biased mix for metallic look while keeping diffuse form cues.
+    result = diffuse * 0.36 + specular * 0.64
     result = cp.clip(result, 0, 1)
-    
-    # 繧ｬ繝ｳ繝櫁｣懈ｭ｣・医ｈ繧頑・繧九￥縺吶ｋ縺溘ａ縲√ぎ繝ｳ繝槫､繧定ｪｿ謨ｴ・・
-    result = cp.power(result, 0.7)  # Constants.DEFAULT_GAMMA縺ｮ莉｣繧上ｊ縺ｫ0.7繧剃ｽｿ逕ｨ
+
+    # Preserve shadow detail first.
+    result = cp.power(result, 0.88)
+
+    # Add subtle metallic micro-contrast (high-frequency specular only).
+    micro = specular - gaussian_filter(specular, sigma=1.1, mode='nearest')
+    result = result + 0.10 * micro * (1.0 - 0.6 * roughness)
+    result = cp.clip(result, 0, 1)
+
+    # Milder symmetric shoulder compression to reduce clipping at both ends.
+    result = 0.5 + 0.5 * cp.tanh((result - 0.5) / 0.82)
+    # Keep headroom on both ends for display stretching and histogram latitude.
+    result = 0.04 + 0.92 * result
+
+    if geographic_mode:
+        result = 1.0 - result
+    result = cp.clip(result, 0, 1)
     
     # NaN蜃ｦ逅・
     result = restore_nan(result, nan_mask)
@@ -1786,11 +2061,13 @@ def compute_specular_spatial_block(
     pixel_size: float = 1.0,
     pixel_scale_x: float = None,
     pixel_scale_y: float = None,
+    roughness_norm_scale: float = None,
+    geographic_mode: bool = False,
     light_azimuth: float = Constants.DEFAULT_AZIMUTH,
     light_altitude: float = Constants.DEFAULT_ALTITUDE,
     radius: float = 4.0,
 ) -> cp.ndarray:
-    smoothed = _smooth_for_radius(block, radius)
+    smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="specular")
     return compute_specular_block(
         smoothed,
         roughness_scale=roughness_scale,
@@ -1798,6 +2075,8 @@ def compute_specular_spatial_block(
         pixel_size=pixel_size,
         pixel_scale_x=pixel_scale_x,
         pixel_scale_y=pixel_scale_y,
+        roughness_norm_scale=roughness_norm_scale,
+        geographic_mode=geographic_mode,
         light_azimuth=light_azimuth,
         light_altitude=light_altitude,
     )
@@ -1812,11 +2091,16 @@ class SpecularAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
+        roughness_norm_scale = params.get('roughness_norm_scale', None)
+        geographic_mode = bool(params.get('is_geographic_dem', False))
         light_azimuth = params.get('light_azimuth', Constants.DEFAULT_AZIMUTH)
         light_altitude = params.get('light_altitude', Constants.DEFAULT_ALTITUDE)
         mode = str(params.get("mode", "local")).lower()
-        radii = _normalize_spatial_radii(params.get("radii"), pixel_size)
-        weights = params.get("weights", None)
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"),
+            params.get("weights", None),
+            pixel_size,
+        )
         agg = params.get("agg", "mean")
 
         if mode == "spatial":
@@ -1835,6 +2119,8 @@ class SpecularAlgorithm(DaskAlgorithm):
                         pixel_size=pixel_size,
                         pixel_scale_x=pixel_scale_x,
                         pixel_scale_y=pixel_scale_y,
+                        roughness_norm_scale=roughness_norm_scale,
+                        geographic_mode=geographic_mode,
                         light_azimuth=light_azimuth,
                         light_altitude=light_altitude,
                         radius=float(radius),
@@ -1853,6 +2139,8 @@ class SpecularAlgorithm(DaskAlgorithm):
             pixel_size=pixel_size,
             pixel_scale_x=pixel_scale_x,
             pixel_scale_y=pixel_scale_y,
+            roughness_norm_scale=roughness_norm_scale,
+            geographic_mode=geographic_mode,
             light_azimuth=light_azimuth,
             light_altitude=light_altitude
         )
@@ -1864,6 +2152,7 @@ class SpecularAlgorithm(DaskAlgorithm):
             'light_azimuth': Constants.DEFAULT_AZIMUTH,
             'light_altitude': Constants.DEFAULT_ALTITUDE,
             'pixel_size': 1.0,
+            'roughness_norm_scale': None,
             'mode': 'local',
             'radii': None,
             'weights': None,
@@ -1940,7 +2229,7 @@ def compute_atmospheric_scattering_spatial_block(
     pixel_scale_y: float = None,
     radius: float = 4.0,
 ) -> cp.ndarray:
-    smoothed = _smooth_for_radius(block, radius)
+    smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="atmospheric_scattering")
     return compute_atmospheric_scattering_block(
         smoothed,
         scattering_strength=scattering_strength,
@@ -1961,8 +2250,11 @@ class AtmosphericScatteringAlgorithm(DaskAlgorithm):
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
         mode = str(params.get("mode", "local")).lower()
-        radii = _normalize_spatial_radii(params.get("radii"), pixel_size)
-        weights = params.get("weights", None)
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"),
+            params.get("weights", None),
+            pixel_size,
+        )
         agg = params.get("agg", "mean")
 
         if mode == "spatial":
@@ -2338,13 +2630,16 @@ class CurvatureAlgorithm(DaskAlgorithm):
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
         mode = str(params.get("mode", "local")).lower()
-        radii = _normalize_spatial_radii(params.get("radii"), pixel_size)
-        weights = params.get("weights", None)
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"),
+            params.get("weights", None),
+            pixel_size,
+        )
         agg = params.get("agg", "mean")
 
         if mode == "spatial":
             def _curv_spatial(block: cp.ndarray, *, radius: float, curvature_type: str, pixel_size: float) -> cp.ndarray:
-                smoothed = _smooth_for_radius(block, radius)
+                smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="curvature")
                 return compute_curvature_block(smoothed, curvature_type=curvature_type, pixel_size=pixel_size)
 
             responses = []
@@ -2785,7 +3080,7 @@ def compute_multi_light_uncertainty_spatial_block(
     pixel_scale_y: float = None,
     radius: float = 4.0,
 ) -> cp.ndarray:
-    smoothed = _smooth_for_radius(block, radius)
+    smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="multi_light_uncertainty")
     return compute_multi_light_uncertainty_block(
         smoothed,
         azimuths=azimuths,
@@ -2808,8 +3103,11 @@ class MultiLightUncertaintyAlgorithm(DaskAlgorithm):
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
         mode = str(params.get("mode", "local")).lower()
-        radii = _normalize_spatial_radii(params.get("radii"), pixel_size)
-        weights = params.get("weights", None)
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"),
+            params.get("weights", None),
+            pixel_size,
+        )
         agg = params.get("agg", "mean")
 
         if mode == "spatial":
@@ -2894,5 +3192,7 @@ ALGORITHMS = {
 #         return {'unit': 'degree', 'north_up': True}
 # 
 # ALGORITHMS['aspect'] = AspectAlgorithm()
+
+
 
 

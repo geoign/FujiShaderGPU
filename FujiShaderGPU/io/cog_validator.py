@@ -59,12 +59,13 @@ def _validate_cog_for_qgis(cog_path: str):
             print(f"   レベル{i+1}: {ovr_width} x {ovr_height} (1/{scale_factor})")
         
         # 圧縮確認
-        compression = ds.GetMetadata().get('COMPRESSION', 'なし')
+        img_md = ds.GetMetadata('IMAGE_STRUCTURE') or {}
+        compression = img_md.get('COMPRESSION', ds.GetMetadata().get('COMPRESSION', 'なし'))
         print(f"[INFO]  圧縮: {compression}")
         
         # COG準拠確認
         metadata = ds.GetMetadata()
-        layout = metadata.get('LAYOUT', '不明')
+        layout = img_md.get('LAYOUT', metadata.get('LAYOUT', '不明'))
         
         if 'COG' in layout.upper() or tiled:
             print("[OK] COG形式準拠")

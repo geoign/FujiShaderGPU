@@ -777,14 +777,14 @@ def run_pipeline(
         
         # アルゴリズムによって適切なデータ範囲を設定
         if algorithm in ['hillshade']:
-            # Hillshadeは0-255のまま
+            # Hillshade is now also float32 (0..1), aligned with tile backend.
             attrs = {
                 **dem.attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
-                "value_range": "0-255",
-                "data_type": "uint8-like"
+                "value_range": "0 to 1",
+                "data_type": "float32"
             }
         elif algorithm in ['slope']:
             # Slopeは単位による（度、パーセント、ラジアン）

@@ -68,6 +68,13 @@ class WindowsCLI(BaseCLI):
             default=1.0,
             help="NoDataスキップ閾値 (default: 1.0)"
         )
+
+        parser.add_argument(
+            "--nodata",
+            type=str,
+            default=None,
+            help="NoData値を明示指定 (例: 0, -9999, nan)"
+        )
         
         # GPU関連
         parser.add_argument(
@@ -94,19 +101,19 @@ class WindowsCLI(BaseCLI):
             "--mode",
             choices=["local", "spatial"],
             default="local",
-            help="空間モード (default: local)"
+            help="計算モード: local(近傍) / spatial(半径積算). spatialで半径未指定時はYAMLプリセットを使用"
         )
 
         parser.add_argument(
             "--radii",
             type=str,
-            help="Spatial radii in pixels (comma-separated, e.g. 4,16,64)"
+            help="Spatial半径(px)を明示指定 (例: 4,16,64)。未指定時はpixel sizeに応じてYAML自動選択"
         )
 
         parser.add_argument(
             "--weights",
             type=str,
-            help="Spatial weights (comma-separated, e.g. 0.5,0.3,0.2)"
+            help="Spatial重み (例: 0.5,0.3,0.2)。未指定時はYAML重み/等重みを自動適用"
         )
         
         # アルゴリズム固有パラメータの追加
@@ -142,6 +149,18 @@ class WindowsCLI(BaseCLI):
             "--cog-only",
             action="store_true",
             help="既存タイルからCOG生成のみ実行"
+        )
+        parser.add_argument(
+            "--cog-backend",
+            choices=["internal", "external", "auto"],
+            default="internal",
+            help="COG生成バックエンド (default: internal)"
+        )
+        parser.add_argument(
+            "--gdal-bin-dir",
+            type=str,
+            default=None,
+            help="外部GDALのbinディレクトリ (例: C:\\Program Files\\GDAL)"
         )
 
         # Experimental algorithms
@@ -180,6 +199,10 @@ class WindowsCLI(BaseCLI):
         # アルゴリズム固有の検証
         if args.algorithm == "rvi" and not hasattr(args, 'no_auto_scale'):
             self.logger.info("radii未指定時は地形解析による自動スケール決定を行います")
+        if args.cog_backend == "external" and not args.gdal_bin_dir:
+            self.logger.warning(
+                "--cog-backend external では --gdal-bin-dir の明示指定を推奨します"
+            )
     
     def execute(self, args: argparse.Namespace):
         """タイルベース処理を実行"""
@@ -200,6 +223,8 @@ class WindowsCLI(BaseCLI):
             'multiscale_mode': not args.single_scale,
             'auto_scale_analysis': not args.no_auto_scale,
             'cog_only': args.cog_only,
+            'cog_backend': args.cog_backend,
+            'gdal_bin_dir': args.gdal_bin_dir,
         })
         
         # ログ出力
@@ -212,6 +237,7 @@ class WindowsCLI(BaseCLI):
             self.logger.info(f"出力: {args.output}")
             self.logger.info(f"アルゴリズム: {args.algorithm}")
             self.logger.info(f"モード: {'マルチスケール' if params['multiscale_mode'] else 'シングルスケール'}")
+            self.logger.info(f"空間モード: {args.mode}")
         
         # 処理の実行
         try:
@@ -269,11 +295,14 @@ class WindowsCLI(BaseCLI):
                 sigma=10.0,
                 max_workers=params['max_workers'],
                 nodata_threshold=params['nodata_threshold'],
+                nodata_override=self._parse_nodata_override(args.nodata),
                 gpu_type=params['gpu_type'],
                 multiscale_mode=params['multiscale_mode'],
                 pixel_size=params['pixel_size'],
                 auto_scale_analysis=params['auto_scale_analysis'],
                 cog_only=params['cog_only'],
+                cog_backend=params['cog_backend'],
+                gdal_bin_dir=params['gdal_bin_dir'],
                 **algo_params  # アルゴリズム固有パラメータを展開
             )
             
@@ -282,3 +311,15 @@ class WindowsCLI(BaseCLI):
         except Exception as e:
             self.logger.error(f"✗ エラー: {e}")
             raise
+
+    @staticmethod
+    def _parse_nodata_override(raw_value):
+        if raw_value is None:
+            return None
+        text = str(raw_value).strip().lower()
+        if text in {"nan", "+nan", "-nan"}:
+            return float("nan")
+        try:
+            return float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --nodata value: {raw_value}") from exc

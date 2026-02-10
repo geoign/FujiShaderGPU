@@ -79,20 +79,19 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             "--mode",
             choices=["local", "spatial"],
             default="local",
-            help="空間モード (default: local)"
+            help="計算モード: local(近傍) / spatial(半径積算). spatialで半径未指定時はYAMLプリセットを使用"
         )
         
-        # RVI固有
         parser.add_argument(
             "--radii",
             type=str,
-            help="RVIの計算半径（ピクセル）。カンマ区切り (例: 4,16,64,256)"
+            help="Spatial半径(px)を明示指定 (例: 4,16,64)。未指定時はpixel sizeに応じてYAML自動選択"
         )
         
         parser.add_argument(
             "--weights",
             type=str,
-            help="各半径の重み。カンマ区切り (例: 0.4,0.3,0.2,0.1)"
+            help="Spatial重み (例: 0.5,0.3,0.2)。未指定時はYAML重み/等重みを自動適用"
         )
         
         parser.add_argument(

@@ -149,6 +149,14 @@ RVI radii behavior:
 - `--weights` is optional; if omitted, uniform weighting is used.
 - If `--radii` is omitted, RVI auto-derives radii from terrain characteristics.
 
+Spatial mode auto-preset behavior (all spatial-enabled algorithms):
+
+- If `--mode spatial` and `--radii` is omitted, radii/weights are loaded from `FujiShaderGPU/config/spatial_presets.yaml`.
+- Preset selection is based on detected pixel size (meters), for both projected and geographic DEMs.
+- If user supplies `--radii`, that explicit value has priority.
+- If user supplies `--weights`, it is used only when length matches `--radii`; otherwise fallback weighting is used.
+- Safety fallback: when `--mode spatial` is requested with no explicit `--radii/--weights` and input DEM has any side `<= 1024 px`, processing falls back to `--mode local` with a warning.
+
 Dask path with Zarr output:
 
 ```bash
@@ -191,6 +199,9 @@ python -m pip check
   - center-latitude based meter conversion computes anisotropic `dx/dy` scales
   - these scales are injected into algorithms via `pixel_scale_x/pixel_scale_y`
   - this is a practical approximation for simple use; wide-area/high-latitude data may need reprojection for best accuracy
+- Spatial auto presets are centralized in `FujiShaderGPU/config/spatial_presets.yaml`:
+  - pixel-size bins: `<5`, `5~25`, `25~50`, `50~250`, `250~1250`, `1250~5000`, `>5000` (meters)
+  - each bin defines default `radii` and `weights`
 - Local/spatial mode is unified across these algorithms:
   - `hillshade`
   - `slope`
