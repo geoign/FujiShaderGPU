@@ -454,16 +454,17 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP"]="60s"
         os.environ["DASK_DISTRIBUTED__DEPLOY__LOST_WORKER_TIMEOUT"]="60s"
 
-        # 追加: RMM環境変数
+        # Dynamic RMM settings from auto_tune
+        from FujiShaderGPU.config.auto_tune import compute_rmm_pool_gb
         gpus = GPUtil.getGPUs()
         if gpus:
             gpu_memory_gb = gpus[0].memoryTotal / 1024
         else:
-            gpu_memory_gb = 40  # デフォルトA100想定
-        if gpu_memory_gb >= 40:
-            os.environ["RMM_ALLOCATOR"]="pool"
-            os.environ["RMM_POOL_SIZE"]="35GB"  # A100の場合
-            os.environ["RMM_MAXIMUM_POOL_SIZE"]="38GB"  # VRAMの95%程度
+            gpu_memory_gb = 16  # 控えめなデフォルト
+        _rmm_gb = compute_rmm_pool_gb(gpu_memory_gb)
+        os.environ["RMM_ALLOCATOR"] = "pool"
+        os.environ["RMM_POOL_SIZE"] = f"{_rmm_gb}GB"
+        os.environ["RMM_MAXIMUM_POOL_SIZE"] = f"{int(_rmm_gb * 1.1)}GB"
 
         # パラメータの準備
         params = self.get_common_params(args)
@@ -697,7 +698,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 agg=getattr(args, 'agg', 'mean'),
                 chunk=getattr(args, 'chunk', None),
                 show_progress=params['show_progress'],
-                memory_fraction=getattr(args, 'memory_fraction', 0.5),
+                memory_fraction=getattr(args, 'memory_fraction', None),
                 **rvi_params,
                 **algo_params
             )

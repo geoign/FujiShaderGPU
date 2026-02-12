@@ -729,12 +729,12 @@ class RVIAlgorithm(DaskAlgorithm):
     
     def process(self, gpu_arr: da.Array, **params) -> da.Array:        
         # 譁ｰ縺励＞蜉ｹ邇・噪縺ｪ蜊雁ｾ・・繝ｼ繧ｹ
+        pixel_size = params.get('pixel_size', 1.0)
         radii = params.get('radii', None)
         weights = params.get('weights', None)
         
         # 閾ｪ蜍墓ｱｺ螳・
         if radii is None:
-            pixel_size = params.get('pixel_size', 1.0)
             radii = self._determine_optimal_radii(pixel_size)
         max_radius = max(radii)
         rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights, pixel_size=pixel_size)
@@ -812,7 +812,8 @@ def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = Constants.DEF
                            altitude: float = Constants.DEFAULT_ALTITUDE, z_factor: float = 1.0,
                            pixel_size: float = 1.0,
                            pixel_scale_x: float = None,
-                           pixel_scale_y: float = None) -> cp.ndarray:
+                           pixel_scale_y: float = None,
+                           geographic_mode: bool = False) -> cp.ndarray:
     """1繝悶Ο繝・け縺ｫ蟇ｾ縺吶ｋHillshade險育ｮ・"""
     # NaN繝槭せ繧ｯ繧剃ｿ晏ｭ・
     nan_mask = cp.isnan(block)
@@ -840,15 +841,22 @@ def compute_hillshade_block(block: cp.ndarray, *, azimuth: float = Constants.DEF
     normal = cp.stack([-dz_d_east, -dz_d_north, cp.ones_like(dx)], axis=-1)
     normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
 
+    # Geographic rasters may exhibit polarity mismatch in display pipelines.
+    # Apply paired azimuth+polarity correction only in geographic mode.
+    effective_azimuth = float((azimuth + 180.0) % 360.0) if geographic_mode else float(azimuth)
+    eff_az_rad = cp.radians(effective_azimuth)
+
     # Light direction from compass azimuth (0=north, clockwise) and altitude.
     light_dir = cp.array([
-        cp.sin(azimuth_rad) * cp.cos(altitude_rad),  # east
-        cp.cos(azimuth_rad) * cp.cos(altitude_rad),  # north
+        cp.sin(eff_az_rad) * cp.cos(altitude_rad),  # east
+        cp.cos(eff_az_rad) * cp.cos(altitude_rad),  # north
         cp.sin(altitude_rad),                        # up
     ])
 
     hillshade = cp.sum(normal * light_dir.reshape(1, 1, 3), axis=-1)
     hillshade = cp.clip(hillshade, 0.0, 1.0).astype(cp.float32)
+    if geographic_mode:
+        hillshade = 1.0 - hillshade
     
     # NaN蜃ｦ逅・
     hillshade = restore_nan(hillshade, nan_mask)
@@ -865,6 +873,7 @@ def compute_hillshade_spatial_block(
     pixel_size: float = 1.0,
     pixel_scale_x: float = None,
     pixel_scale_y: float = None,
+    geographic_mode: bool = False,
     radius: float = 4.0,
 ) -> cp.ndarray:
     smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="hillshade")
@@ -876,6 +885,7 @@ def compute_hillshade_spatial_block(
         pixel_size=pixel_size,
         pixel_scale_x=pixel_scale_x,
         pixel_scale_y=pixel_scale_y,
+        geographic_mode=geographic_mode,
     )
 
 class HillshadeAlgorithm(DaskAlgorithm):
@@ -888,6 +898,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
+        geographic_mode = bool(params.get('is_geographic_dem', False))
         multiscale = params.get('multiscale', False)
         radii = params.get('radii', [1])  # common multiscale parameter (pixels)
         weights = params.get('weights', None)
@@ -922,6 +933,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
                     pixel_size=pixel_size,
                     pixel_scale_x=pixel_scale_x,
                     pixel_scale_y=pixel_scale_y,
+                    geographic_mode=geographic_mode,
                     radius=float(radius),
                 )
                 results.append(hs)
@@ -958,6 +970,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 pixel_size=pixel_size,
                 pixel_scale_x=pixel_scale_x,
                 pixel_scale_y=pixel_scale_y,
+                geographic_mode=geographic_mode,
             )
     
     def get_default_params(self) -> dict:
@@ -1366,7 +1379,9 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
                                     num_samples: int = 16,
                                     radius: float = 10.0,
                                     intensity: float = 1.0,
-                                    pixel_size: float = 1.0) -> cp.ndarray:
+                                    pixel_size: float = 1.0,
+                                    pixel_scale_x: float = None,
+                                    pixel_scale_y: float = None) -> cp.ndarray:
     """繧ｹ繧ｯ繝ｪ繝ｼ繝ｳ遨ｺ髢鍋腸蠅・・驕ｮ阡ｽ・・SAO・峨・蝨ｰ蠖｢迚茨ｼ磯ｫ倬溘・繧ｯ繝医Ν蛹也沿・・"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
@@ -1417,7 +1432,16 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             # 鬮倥＆縺ｮ蟾ｮ縺ｨ驕ｮ阡ｽ隗貞ｺｦ
             height_diff = shifted - block
             # 菫ｮ豁｣: 螳滄圀縺ｮ霍晞屬・医Γ繝ｼ繝医Ν・峨ｒ菴ｿ逕ｨ
-            distance = r * pixel_size
+            # Per-direction physical distance accounting for pixel anisotropy.
+            _sx = abs(float(pixel_scale_x)) if pixel_scale_x is not None else float(pixel_size)
+            _sy = abs(float(pixel_scale_y)) if pixel_scale_y is not None else float(pixel_size)
+            if _sx < 1e-9:
+                _sx = float(pixel_size) if pixel_size else 1.0
+            if _sy < 1e-9:
+                _sy = float(pixel_size) if pixel_size else 1.0
+            phys_dx_ao = float(dx) * _sx
+            phys_dy_ao = float(dy) * _sy
+            distance = max(float(cp.sqrt(phys_dx_ao ** 2 + phys_dy_ao ** 2)), 1e-9)
             occlusion_angle = cp.arctan(height_diff / distance)
             
             # 豁｣縺ｮ隗貞ｺｦ縺ｮ縺ｿ繧帝・阡ｽ縺ｨ縺励※謇ｱ縺・ｼ井ｿｮ豁｣: 繧医ｊ驕ｩ蛻・↑驕ｮ阡ｽ縺ｮ險育ｮ暦ｼ・
@@ -1471,6 +1495,8 @@ def compute_ambient_occlusion_spatial_block(
     radius: float = 10.0,
     intensity: float = 1.0,
     pixel_size: float = 1.0,
+    pixel_scale_x: float = None,
+    pixel_scale_y: float = None,
 ) -> cp.ndarray:
     ds_factor = _radius_to_downsample_factor(
         float(radius),
@@ -1485,14 +1511,20 @@ def compute_ambient_occlusion_spatial_block(
             radius=radius,
             intensity=intensity,
             pixel_size=pixel_size,
+            pixel_scale_x=pixel_scale_x,
+            pixel_scale_y=pixel_scale_y,
         )
     small = _downsample_nan_aware(block, ds_factor)
+    ds_psx_ao = float(abs(float(pixel_scale_x)) * ds_factor) if pixel_scale_x is not None else None
+    ds_psy_ao = float(abs(float(pixel_scale_y)) * ds_factor) if pixel_scale_y is not None else None
     result_small = compute_ambient_occlusion_block(
         small,
         num_samples=num_samples,
         radius=max(1.0, float(radius) / float(ds_factor)),
         intensity=intensity,
         pixel_size=float(pixel_size) * float(ds_factor),
+        pixel_scale_x=ds_psx_ao,
+        pixel_scale_y=ds_psy_ao,
     )
     return _upsample_to_shape(result_small, block.shape)
 
@@ -1505,6 +1537,8 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         radius = params.get('radius', 10.0)
         intensity = params.get('intensity', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
+        pixel_scale_x = params.get('pixel_scale_x', None)
+        pixel_scale_y = params.get('pixel_scale_y', None)
         mode = str(params.get("mode", "local")).lower()
         radii, weights = _resolve_spatial_radii_weights(
             params.get("radii"),
@@ -1528,6 +1562,8 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
                         radius=r_use,
                         intensity=intensity,
                         pixel_size=pixel_size,
+                        pixel_scale_x=pixel_scale_x,
+                        pixel_scale_y=pixel_scale_y,
                     )
                 )
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
@@ -1543,7 +1579,9 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
             num_samples=num_samples,
             radius=radius,
             intensity=intensity,
-            pixel_size=pixel_size
+            pixel_size=pixel_size,
+            pixel_scale_x=pixel_scale_x,
+            pixel_scale_y=pixel_scale_y,
         )
     
     def get_default_params(self) -> dict:
@@ -1642,7 +1680,9 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                               openness_type: str = 'positive',
                               num_directions: int = 16,
                               max_distance: int = 50,
-                              pixel_size: float = 1.0) -> cp.ndarray:
+                              pixel_size: float = 1.0,
+                              pixel_scale_x: float = None,
+                              pixel_scale_y: float = None) -> cp.ndarray:
     """髢句ｺｦ縺ｮ險育ｮ暦ｼ域怙驕ｩ蛹也沿・・"""
     h, w = block.shape
     nan_mask = cp.isnan(block)
@@ -1696,7 +1736,17 @@ def compute_openness_vectorized(block: cp.ndarray, *,
             shifted = padded[start_y:start_y+h, start_x:start_x+w]
             
             # 隗貞ｺｦ險育ｮ励→譖ｴ譁ｰ
-            angle = cp.arctan((shifted - block) / (r * pixel_size))
+            # Per-direction physical distance accounting for pixel anisotropy.
+            _sx = abs(float(pixel_scale_x)) if pixel_scale_x is not None else float(pixel_size)
+            _sy = abs(float(pixel_scale_y)) if pixel_scale_y is not None else float(pixel_size)
+            if _sx < 1e-9:
+                _sx = float(pixel_size) if pixel_size else 1.0
+            if _sy < 1e-9:
+                _sy = float(pixel_size) if pixel_size else 1.0
+            phys_dx = float(offset_x) * _sx
+            phys_dy = float(offset_y) * _sy
+            phys_dist = max(float(cp.sqrt(phys_dx ** 2 + phys_dy ** 2)), 1e-9)
+            angle = cp.arctan((shifted - block) / phys_dist)
             
             if openness_type == 'positive':
                 valid = ~(cp.isnan(angle) | nan_mask)
@@ -1724,6 +1774,8 @@ def compute_openness_spatial_block(
     num_directions: int = 16,
     max_distance: int = 50,
     pixel_size: float = 1.0,
+    pixel_scale_x: float = None,
+    pixel_scale_y: float = None,
 ) -> cp.ndarray:
     ds_factor = _radius_to_downsample_factor(
         float(max_distance),
@@ -1738,14 +1790,21 @@ def compute_openness_spatial_block(
             num_directions=num_directions,
             max_distance=max_distance,
             pixel_size=pixel_size,
+            pixel_scale_x=pixel_scale_x,
+            pixel_scale_y=pixel_scale_y,
         )
     small = _downsample_nan_aware(block, ds_factor)
+    # Scale pixel_scale by ds_factor to maintain correct physical distances.
+    ds_psx = float(abs(float(pixel_scale_x)) * ds_factor) if pixel_scale_x is not None else None
+    ds_psy = float(abs(float(pixel_scale_y)) * ds_factor) if pixel_scale_y is not None else None
     result_small = compute_openness_vectorized(
         small,
         openness_type=openness_type,
         num_directions=num_directions,
         max_distance=max(2, int(round(float(max_distance) / float(ds_factor)))),
         pixel_size=float(pixel_size) * float(ds_factor),
+        pixel_scale_x=ds_psx,
+        pixel_scale_y=ds_psy,
     )
     return _upsample_to_shape(result_small, block.shape)
 
@@ -1757,6 +1816,8 @@ class OpennessAlgorithm(DaskAlgorithm):
         openness_type = params.get('openness_type', 'positive')
         num_directions = params.get('num_directions', 16)
         pixel_size = params.get('pixel_size', 1.0)
+        pixel_scale_x = params.get('pixel_scale_x', None)
+        pixel_scale_y = params.get('pixel_scale_y', None)
         mode = str(params.get("mode", "local")).lower()
         radii, weights = _resolve_spatial_radii_weights(
             params.get("radii"),
@@ -1780,6 +1841,8 @@ class OpennessAlgorithm(DaskAlgorithm):
                         num_directions=num_directions,
                         max_distance=max_dist,
                         pixel_size=pixel_size,
+                        pixel_scale_x=pixel_scale_x,
+                        pixel_scale_y=pixel_scale_y,
                     )
                 )
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
@@ -1793,7 +1856,9 @@ class OpennessAlgorithm(DaskAlgorithm):
             openness_type=openness_type,
             num_directions=num_directions,
             max_distance=max_distance,
-            pixel_size=pixel_size
+            pixel_size=pixel_size,
+            pixel_scale_x=pixel_scale_x,
+            pixel_scale_y=pixel_scale_y,
         )
     
     def get_default_params(self) -> dict:

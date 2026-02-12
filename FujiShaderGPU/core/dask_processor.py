@@ -45,6 +45,7 @@ from ..algorithms.common.auto_params import (
     determine_optimal_radii as determine_optimal_radii_shared,
 )
 from ..io.raster_info import metric_pixel_scales_from_metadata
+from ..config.auto_tune import compute_dask_chunk
 from .dask_cluster import (
     get_optimal_chunk_size as _cluster_optimal_chunk_size,
     make_cluster as _cluster_make_cluster,
@@ -626,7 +627,7 @@ def run_pipeline(
                 f"{mem.available / 2**30:.1f} GB available")
     
     # メモリフラクションの取得（algo_paramsから、なければデフォルト）
-    memory_fraction = algo_params.pop('memory_fraction', 0.8)
+    memory_fraction = algo_params.pop('memory_fraction', None)
     cluster, client = make_cluster(memory_fraction)
     
     try:
@@ -643,15 +644,15 @@ def run_pipeline(
                     total_pixels = src.width * src.height
                     total_gb = (total_pixels * 4) / (1024**3)
                 
-            # より細かい段階的な調整
-            if total_gb > 100:  # 100GB以上
-                chunk = 1024
-            elif total_gb > 50:  # 50-100GB
-                chunk = 1536
-            elif total_gb > 20:  # 20-50GB
-                chunk = 2048
-            else:
-                chunk = get_optimal_chunk_size()
+            # VRAM-aware dynamic chunk sizing
+            try:
+                _meminfo = cp.cuda.runtime.memGetInfo()
+                _vram_gb = _meminfo[1] / (1024**3)
+            except Exception:
+                _vram_gb = 16.0
+            chunk = compute_dask_chunk(
+                _vram_gb, data_gb=total_gb, algorithm=algorithm,
+            )
             
             logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
         
@@ -684,6 +685,14 @@ def run_pipeline(
         params['pixel_size'] = float(pixel_size_m)
         params.setdefault('pixel_scale_x', float(px_m_x))
         params.setdefault('pixel_scale_y', float(px_m_y))
+        # Tile path parity: set is_geographic_dem and elevation_scale.
+        # Note: in the Dask path pixel_scale_x/y are raw meter values so
+        #   elevation_scale is NOT applied to the DEM array.  The field is
+        #   provided only for algorithm-level flag consistency with the tile
+        #   pipeline (where DEM is pre-scaled by elevation_scale).
+        params.setdefault('is_geographic_dem', bool(is_geo))
+        params.setdefault('elevation_scale',
+                          float(1.0 / max(pixel_size_m, 1e-6)) if is_geo else 1.0)
         if is_geo:
             ratio = abs(px_m_y) / max(abs(px_m_x), 1e-9)
             logger.info(

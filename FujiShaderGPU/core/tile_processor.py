@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import import_module
 from ..core.gpu_memory import gpu_memory_pool
 from ..config.system_config import get_gpu_config
+from ..config.auto_tune import compute_max_workers, ALGORITHM_COMPLEXITY
 from ..core.tile_io import read_tile_window, write_tile_output
 from ..core.tile_compute import (
     run_tile_algorithm,
@@ -64,6 +65,95 @@ GLOBAL_STATS_NATIVE_ALGOS = {
 }
 NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges"}
 SIGNED_NORMALIZATION_ALGOS = {"rvi", "lrm", "fractal_anomaly"}
+
+
+def _sanitize_spatial_radii_weights_for_tile(
+    algorithm: str,
+    radii: Optional[List[float]],
+    weights: Optional[List[float]],
+    tile_size: int,
+) -> Tuple[Optional[List[int]], Optional[List[float]], Optional[str]]:
+    """
+    Clamp spatial radii to tile-safe values to avoid runaway padding/depth and OOM.
+    Returns (radii, weights, warning_message).
+    """
+    if not isinstance(radii, (list, tuple)) or len(radii) == 0:
+        return None, weights, None
+
+    # AO / openness are depth-heavy in spatial mode; cap only these two.
+    # Other algorithms are intentionally left unclamped here.
+    if algorithm not in {"ambient_occlusion", "openness"}:
+        out_no_cap: List[int] = []
+        for v in radii:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv <= 0:
+                continue
+            out_no_cap.append(max(2, int(round(fv))))
+        if not out_no_cap:
+            return None, weights, None
+        return out_no_cap, weights, None
+    generic_cap = max(2, min(512, int(max(64, tile_size // 3))))
+    if algorithm == "ambient_occlusion":
+        algo_cap = min(generic_cap, 256)
+    else:
+        # openness is lighter than AO but still depth-heavy.
+        algo_cap = min(generic_cap, 512)
+
+    out_r: List[int] = []
+    out_w: List[float] = []
+    for i, rv in enumerate(radii):
+        try:
+            r = int(round(float(rv)))
+        except (TypeError, ValueError):
+            continue
+        if r <= 0:
+            continue
+        r = min(r, algo_cap)
+        if r < 2:
+            r = 2
+        out_r.append(r)
+        if isinstance(weights, (list, tuple)) and i < len(weights):
+            try:
+                out_w.append(float(weights[i]))
+            except (TypeError, ValueError):
+                out_w.append(0.0)
+
+    if not out_r:
+        return None, None, None
+
+    # De-duplicate while preserving order.
+    dedup_idx = []
+    seen = set()
+    for idx, r in enumerate(out_r):
+        if r not in seen:
+            seen.add(r)
+            dedup_idx.append(idx)
+    dedup_r = [out_r[i] for i in dedup_idx]
+
+    dedup_w: Optional[List[float]] = None
+    if len(out_w) == len(out_r):
+        w2 = [max(0.0, out_w[i]) for i in dedup_idx]
+        s = float(sum(w2))
+        if s > 0:
+            dedup_w = [w / s for w in w2]
+
+    changed = False
+    try:
+        src_r = [int(round(float(v))) for v in radii]
+        changed = src_r != dedup_r
+    except Exception:
+        changed = True
+
+    warn = None
+    if changed:
+        warn = (
+            f"Spatial radii adjusted for {algorithm}: "
+            f"{list(radii)} -> {dedup_r} (tile-safe cap={algo_cap}px)"
+        )
+    return dedup_r, dedup_w, warn
 
 
 def _nodata_is_nan(nodata: Optional[float]) -> bool:
@@ -284,15 +374,7 @@ def _warn_if_compute_cost_high(
     halo_factor = max(1.0, (effective_span * effective_span) / float(tile_size * tile_size))
     total_pixels = float(width) * float(height)
 
-    algo_factor_map = {
-        "specular": 1.8,
-        "ambient_occlusion": 1.8,
-        "fractal_anomaly": 1.6,
-        "visual_saliency": 1.4,
-        "multiscale_terrain": 1.3,
-        "rvi": 1.2,
-    }
-    algo_factor = float(algo_factor_map.get(algorithm, 1.0))
+    algo_factor = float(ALGORITHM_COMPLEXITY.get(algorithm, 1.0))
 
     adjusted_gpix = (total_pixels * scale_count * halo_factor * algo_factor) / 1e9
     resolution_factor_vs_1m = 1.0 / max(px_size * px_size, 1e-6)
@@ -302,9 +384,9 @@ def _warn_if_compute_cost_high(
     except Exception:
         vram_gb = 0.0
 
-    # Tuned as warning-only thresholds; calibrated to 8GB-class GPUs.
-    high_threshold = 18.0 if vram_gb >= 12 else 10.0
-    medium_threshold = 9.0 if vram_gb >= 12 else 5.0
+    # VRAM-aware thresholds (scale continuously)
+    high_threshold = max(10.0, vram_gb * 1.5)
+    medium_threshold = max(5.0, vram_gb * 0.75)
 
     if adjusted_gpix >= high_threshold:
         logger.warning(
@@ -1472,6 +1554,45 @@ def process_dem_tiles(
     if max_workers is None:
         max_workers = gpu_config["max_workers"]
 
+    mode_norm = str(algo_params.get("mode", "local")).lower()
+    spatial_algorithms = {
+        "hillshade",
+        "slope",
+        "specular",
+        "atmospheric_scattering",
+        "curvature",
+        "ambient_occlusion",
+        "openness",
+        "multi_light_uncertainty",
+    }
+    if mode_norm == "spatial" and algorithm in spatial_algorithms:
+        # Resolve auto profile early so padding/cost estimation uses the effective list.
+        if algo_params.get("radii", None) is None:
+            try:
+                from ..algorithms.common.spatial_mode import determine_spatial_profile
+                auto_radii, auto_weights = determine_spatial_profile(pixel_size=float(pixel_size))
+                algo_params["radii"] = auto_radii
+                if algo_params.get("weights", None) is None and auto_weights is not None:
+                    algo_params["weights"] = auto_weights
+            except Exception:
+                pass
+
+        adj_r, adj_w, adj_warn = _sanitize_spatial_radii_weights_for_tile(
+            algorithm=algorithm,
+            radii=algo_params.get("radii"),
+            weights=algo_params.get("weights"),
+            tile_size=int(tile_size),
+        )
+        if adj_r is not None:
+            algo_params["radii"] = adj_r
+            if adj_w is not None:
+                algo_params["weights"] = adj_w
+            elif "weights" in algo_params and algo_params.get("weights") is not None:
+                # Fall back to uniform inside algorithm when weights are invalid after adjustment.
+                algo_params["weights"] = None
+        if adj_warn:
+            logger.warning(adj_warn)
+
     required_padding = _required_padding_for_algorithm(
         algorithm=algorithm,
         algo_params=algo_params,
@@ -1505,17 +1626,21 @@ def process_dem_tiles(
     except Exception:
         gpu_detected = True
     if gpu_detected:
-        recommended_workers = max_workers
-        if effective_span >= 2400:
-            recommended_workers = min(recommended_workers, 1)
-        elif effective_span >= 2000:
-            recommended_workers = min(recommended_workers, 2)
-        elif effective_span >= 1600:
-            recommended_workers = min(recommended_workers, 3)
+        try:
+            _vram = float(gpu_config.get("system_info", {}).get("vram_gb", 12.0))
+        except Exception:
+            _vram = 12.0
+        recommended_workers = compute_max_workers(
+            _vram,
+            effective_span=effective_span,
+            cpu_count=max_workers,
+            algorithm=algorithm,
+        )
         if recommended_workers < max_workers:
             logger.info(
-                "Worker auto-throttled for stability: "
-                f"{max_workers} -> {recommended_workers} (effective tile={effective_span}px)"
+                "Worker auto-throttled: "
+                f"{max_workers} -> {recommended_workers} "
+                f"(tile={effective_span}px, VRAM={_vram:.0f}GB)"
             )
             max_workers = recommended_workers
 

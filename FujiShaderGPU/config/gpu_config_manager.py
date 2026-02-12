@@ -6,6 +6,11 @@ from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
+try:
+    from .auto_tune import ALGORITHM_COMPLEXITY as _AUTO_COMPLEXITY
+except ImportError:
+    _AUTO_COMPLEXITY = None
+
 class GPUConfigManager:
     """GPU設定の一元管理（最小実装）"""
     
@@ -150,7 +155,9 @@ class GPUConfigManager:
         return new_preset
     
     def get_algorithm_complexity(self, algorithm: str) -> float:
-        """アルゴリズムの複雑度を取得"""
+        """アルゴリズムの複雑度を取得 (auto_tune.py に委譲)"""
+        if _AUTO_COMPLEXITY is not None:
+            return _AUTO_COMPLEXITY.get(algorithm, 1.0)
         return self._config["algorithm_complexity"].get(algorithm, 1.0)
     
     def get_system_preset(self, memory_gb: int) -> Dict[str, Any]:

@@ -13,6 +13,7 @@ import psutil
 from osgeo import gdal
 
 from ..config.gpu_config_manager import _gpu_config_manager
+from ..config.auto_tune import auto_tune
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,12 @@ def get_gpu_config(
 
     preset = _gpu_config_manager.get_preset(gpu_type)
 
+    # Dynamic parameter computation from VRAM
+    vram_gb = float(sys_config.get("vram_gb", 8.0))
+    cpu_count = int(sys_config.get("cpu_count", 4))
+    is_colab_env = bool(sys_config.get("is_colab", False))
+    tuned = auto_tune(vram_gb, cpu_count=cpu_count, is_colab=is_colab_env)
+
     if multiscale_mode:
         if target_distances:
             max_distance = max(target_distances)
@@ -52,13 +59,13 @@ def get_gpu_config(
     calculated_padding = max(min_padding, ((required_padding + 31) // 32) * 32)
 
     return {
-        "tile_size": preset["chunk_size"] * 2,
-        "max_workers": min(6, sys_config["cpu_count"]),
+        "tile_size": tuned["tile_size"],
+        "max_workers": tuned["max_workers"],
         "padding": calculated_padding,
-        "vram_monitor": gpu_type != "a100",
-        "batch_size": 2 if gpu_type == "a100" else 1,
-        "prefetch_tiles": 4 if gpu_type == "a100" else 2,
-        "description": f"{preset.get('name', gpu_type.upper())} 最適化設定",
+        "vram_monitor": vram_gb < 40,
+        "batch_size": tuned["batch_size"],
+        "prefetch_tiles": tuned["prefetch_tiles"],
+        "description": f"{gpu_type.upper()} 動的最適化 (VRAM {vram_gb:.0f}GB)",
         "system_info": sys_config,
     }
 

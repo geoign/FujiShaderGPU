@@ -7,6 +7,8 @@ from typing import Tuple
 
 import GPUtil
 import cupy as cp
+
+from ..config.auto_tune import auto_tune, compute_chunk_size, compute_rmm_pool_gb
 from dask import config as dask_config
 from dask_cuda import LocalCUDACluster
 from distributed import Client
@@ -15,26 +17,15 @@ logger = logging.getLogger(__name__)
 
 
 def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
-    base_chunk = int((gpu_memory_gb * 1024) ** 0.5 * 15)
-    if 20 > gpu_memory_gb >= 10:
-        return 1024
-    if 30 > gpu_memory_gb >= 20:
-        return 2048
-    if 50 > gpu_memory_gb >= 30:
-        return 8192
-    if gpu_memory_gb >= 70:
-        return 16384
-    return min(8192, (base_chunk // 512) * 512)
+    """Auto-tuned chunk size from VRAM (anchor-interpolated)."""
+    return compute_chunk_size(max(gpu_memory_gb, 4.0))
 
 
-def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client]:
+def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Client]:
     is_colab = 'google.colab' in sys.modules
-    if is_colab:
-        memory_fraction = min(memory_fraction, 0.5)
-        logger.info('Google Colab environment detected')
 
     gpus = GPUtil.getGPUs()
-    gpu_memory_gb = (gpus[0].memoryTotal / 1024) if gpus else 40
+    gpu_memory_gb = (gpus[0].memoryTotal / 1024) if gpus else 16
 
     try:
         meminfo = cp.cuda.runtime.memGetInfo()
@@ -42,7 +33,13 @@ def make_cluster(memory_fraction: float = 0.6) -> Tuple[LocalCUDACluster, Client
     except Exception:
         available_gb = gpu_memory_gb * 0.8
 
-    rmm_size = min(int(available_gb * (0.7 if gpu_memory_gb >= 40 else 0.6)), 20 if gpu_memory_gb >= 40 else 12)
+    tuned = auto_tune(gpu_memory_gb, is_colab=is_colab)
+    if memory_fraction is None:
+        memory_fraction = tuned["memory_fraction"]
+    if is_colab:
+        memory_fraction = min(memory_fraction, 0.50)
+        logger.info('Google Colab environment detected')
+    rmm_size = min(tuned["rmm_pool_size_gb"], int(available_gb * tuned["rmm_pool_fraction"]))
 
     dask_config.set({
         'distributed.worker.memory.target': 0.70,
