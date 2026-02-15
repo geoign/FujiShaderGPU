@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import tempfile
 from typing import Tuple
 
 import GPUtil
@@ -61,7 +63,7 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         interface='lo' if is_colab else None,
         rmm_maximum_pool_size=f'{int(rmm_size * 1.2)}GB',
         enable_cudf_spill=True,
-        local_directory='/tmp',
+        local_directory=os.environ.get('FUJISHADER_SPILL_DIR', tempfile.gettempdir()),
     )
 
     client = Client(cluster)

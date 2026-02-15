@@ -27,8 +27,31 @@ Input DEM (COG or Zarr)
   - Used by `core/dask_processor.py`.
 
 - `dask_shared.py`
-  - Shared algorithm base class (`DaskAlgorithm`) and full algorithm implementations.
+  - **再エクスポートハブ** (177行)。後方互換性のため全公開シンボルを再エクスポートする。
+  - 実装は以下のモジュールに分離済み (Phase 1–3 リファクタリング完了)。
   - Used by both Dask (`dask/*.py`) and Tile (`tile/*.py` via bridge) backends.
+
+- **Phase 1 共通基盤モジュール**:
+  - `_base.py` — `Constants`, `DaskAlgorithm` ABC, `classify_resolution`, `get_gradient_scale_factor`
+  - `_nan_utils.py` — NaN処理、空間スムージング、ダウンサンプリング/アップサンプリング、`restore_nan`
+  - `_global_stats.py` — `determine_optimal_downsample_factor`, `compute_global_stats`, `apply_global_normalization`
+  - `_normalization.py` — アルゴリズム別統計/正規化関数 (`rvi_stat_func`, `npr_stat_func` 等)
+
+- **Phase 2–3 アルゴリズム実装モジュール** (`_impl_*.py`):
+  - `_impl_rvi.py` — RVI (Ridge-Valley Index)
+  - `_impl_hillshade.py` — Hillshade
+  - `_impl_slope.py` — Slope
+  - `_impl_specular.py` — Specular
+  - `_impl_atmospheric_scattering.py` — Atmospheric Scattering
+  - `_impl_multiscale_terrain.py` — Multiscale Terrain
+  - `_impl_curvature.py` — Curvature
+  - `_impl_visual_saliency.py` — Visual Saliency
+  - `_impl_npr_edges.py` — NPR Edges
+  - `_impl_ambient_occlusion.py` — Ambient Occlusion
+  - `_impl_lrm.py` — LRM (Local Relief Model)
+  - `_impl_openness.py` — Openness
+  - `_impl_fractal_anomaly.py` — Fractal Anomaly
+  - `_impl_experimental.py` — Scale-Space Surprise + Multi-Light Uncertainty
 
 - `tile_shared.py`
   - Tile-side base class (`TileAlgorithm`) and lightweight algorithms that delegate directly to shared kernels.
@@ -114,7 +137,7 @@ Input DEM (COG or Zarr)
 - `utils/scale_analysis.py`, `utils/nodata_handler.py`, `utils/types.py`
 
 ## 4. Dask Algorithm Catalog
-Registered in `algorithms/dask_registry.py`:
+Registered in `algorithms/dask_registry.py` (and `dask_shared.py` ALGORITHMS):
 
 - `rvi`
 - `hillshade`
@@ -247,7 +270,7 @@ pytest -q -o addopts='' tests
 
 ## 11. Notes
 - Current structure treats modular algorithm files as canonical.
-- Algorithm implementations live in `dask_shared.py`; tile modules import them via bridge.
+- Algorithm implementations live in individual `_impl_*.py` modules; `dask_shared.py` is a 177-line re-export hub for backward compatibility.
 - `hillshade`, `slope`, `specular`, `atmospheric_scattering`, `curvature`, `ambient_occlusion`, `openness`, `multi_light_uncertainty` support unified local/spatial mode on both Dask and tile paths.
 
 ## 12. Dynamic GPU Optimization

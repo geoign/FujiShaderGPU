@@ -41,19 +41,14 @@ except ImportError:
     ALGORITHMS = {}
     logging.warning("dask registry module not found. No algorithms available.")
 
-from ..algorithms.common.auto_params import (
-    determine_optimal_radii as determine_optimal_radii_shared,
-)
+from ..algorithms.common.auto_params import determine_optimal_radii
 from ..io.raster_info import metric_pixel_scales_from_metadata
 from ..config.auto_tune import compute_dask_chunk
-from .dask_cluster import (
-    get_optimal_chunk_size as _cluster_optimal_chunk_size,
-    make_cluster as _cluster_make_cluster,
-)
+from .dask_cluster import make_cluster
 from .dask_io import (
-    is_zarr_path as _io_is_zarr_path,
-    load_input_dataarray as _io_load_input_dataarray,
-    write_zarr_output as _io_write_zarr_output,
+    is_zarr_path,
+    load_input_dataarray,
+    write_zarr_output,
 )
 
 # ロギング設定
@@ -80,23 +75,15 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
             return 1.0, 1.0, 1.0, False, None
 
 ###############################################################################
-# 1. Dask-CUDA クラスタ（改善版）
+# 1. Dask-CUDA クラスタ
+#    make_cluster() は dask_cluster.py から直接インポート済み
 ###############################################################################
-
-def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
-    """Return recommended chunk size from GPU memory."""
-    return _cluster_optimal_chunk_size(gpu_memory_gb)
-
-def make_cluster(memory_fraction: float = 0.6):
-    """Create Dask-CUDA cluster via core/dask_cluster.py."""
-    return _cluster_make_cluster(memory_fraction)
 
 ###############################################################################
 # 3. 地形解析による自動パラメータ決定
 ###############################################################################
 
-def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01, 
-                                   include_fft: bool = False) -> dict:
+def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01) -> dict:
     """地形の特性を統合的に解析"""
     # サンプリング処理（共通部分）
     h, w = dem_arr.shape
@@ -130,64 +117,13 @@ def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.0
     stats['mean_slope'] = float(cp.mean(valid_slope))
     stats['max_slope'] = float(cp.percentile(valid_slope, 95))
     
-    # FFT解析（オプション）
-    if include_fft:
-        # 2次微分と曲率
-        dyy, dyx = cp.gradient(dy)
-        dxy, dxx = cp.gradient(dx)
-        curvature = cp.abs(dxx + dyy)
-        valid_curv = curvature[valid_mask]
-        stats['mean_curvature'] = float(cp.mean(valid_curv))
-        
-        # FFTによる周波数解析
-        if valid_mask.sum() > 1000:  # 十分なデータがある場合
-            # 2D FFTで主要な周波数成分を検出
-            fft = cp.fft.fft2(sample - cp.mean(elevations))
-            power = cp.abs(fft)**2
-            
-            # 放射状平均パワースペクトル
-            freq = cp.fft.fftfreq(sample.shape[0])
-            freq_grid = cp.sqrt(freq[:, None]**2 + freq[None, :]**2)
-            
-            # 周波数ビンごとの平均パワー
-            n_bins = 50
-            freq_bins = cp.linspace(0, 0.5, n_bins)
-            power_spectrum = []
-            
-            for i in range(n_bins - 1):
-                mask = (freq_grid >= freq_bins[i]) & (freq_grid < freq_bins[i+1])
-                if mask.any():
-                    power_spectrum.append(float(cp.mean(power[mask])))
-                else:
-                    power_spectrum.append(0)
-            
-            # 主要な周波数成分を検出
-            power_spectrum = cp.array(power_spectrum)
-            peak_indices = cp.where(power_spectrum > cp.percentile(power_spectrum, 90))[0]
-            
-            if len(peak_indices) > 0:
-                dominant_freqs = freq_bins[peak_indices]
-                # 周波数を空間スケールに変換（ピクセル単位）
-                dominant_scales = [float(1.0 / (f + 1e-10)) for f in dominant_freqs if f > 0.01]
-            else:
-                dominant_scales = []
-            stats['dominant_scales'] = dominant_scales
-        else:
-            dominant_scales = []
-            stats['dominant_scales'] = []
-            stats['dominant_freqs'] = []
-    else:
-        stats['dominant_scales'] = []
-        stats['dominant_freqs'] = []
-        stats['mean_curvature'] = 0.0
+
     # auto-parameter 推定の共通指標
     stats["complexity_score"] = float(stats["mean_slope"] * stats["std_dev"])
     return stats
 
 
-def determine_optimal_radii(terrain_stats: dict) -> Tuple[List[int], List[float]]:
-    """共通モジュール経由で最適半径を決定。"""
-    return determine_optimal_radii_shared(terrain_stats)
+
 
 ###############################################################################
 # 4. 直接 COG 出力 (GDAL >= 3.8) - 改善版
@@ -215,10 +151,10 @@ def get_cog_options(dtype: str) -> dict:
     return base_options
 
 def check_gdal_version() -> tuple:
-    """GDAL バージョンをチェック"""
-    version = gdal.VersionInfo("VERSION_NUM")
-    major = int(version[0])
-    minor = int(version[1:3])
+    """GDAL バージョンをチェック（整数演算で安全にパース）"""
+    ver_num = int(gdal.VersionInfo("VERSION_NUM"))
+    major = ver_num // 1_000_000
+    minor = (ver_num % 1_000_000) // 10_000
     return major, minor
 
 def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = True):
@@ -296,14 +232,16 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
     dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
-    # メモリ制限を考慮してチャンクサイズを動的に調整
-    available_memory = cp.get_default_memory_pool().free_bytes() / (1024**3)
-    if available_memory < 10:  # 利用可能メモリが10GB未満
-        # より積極的なメモリ解放
+    # VRAM実残量に基づいてメモリ解放を判断（プール内free_bytesではなく実VRAM使用）
+    try:
+        _free_bytes, _total_bytes = cp.cuda.runtime.memGetInfo()
+        available_vram_gb = _free_bytes / (1024**3)
+    except Exception:
+        available_vram_gb = 10.0  # 安全なデフォルト値
+    if available_vram_gb < 10:
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
         gc.collect()
-        # Daskワーカーのメモリも解放
         try:
             client = get_client()
             client.run(lambda: gc.collect())
@@ -588,17 +526,7 @@ def validate_inputs(src_cog: str):
         raise FileNotFoundError(f"Input file not found: {src_cog}")
 
 
-def _is_zarr_path(path: str) -> bool:
-    return _io_is_zarr_path(path)
 
-
-def _load_input_dataarray(src_path: str, chunk: int) -> xr.DataArray:
-    return _io_load_input_dataarray(src_path, chunk)
-
-
-def _write_zarr_output(data: xr.DataArray, dst: Path, show_progress: bool = True):
-    logger.info("Writing output as Zarr: %s", dst)
-    _io_write_zarr_output(data, dst, show_progress=show_progress)
 
 def run_pipeline(
     src_cog: str,
@@ -628,13 +556,13 @@ def run_pipeline(
     
     # メモリフラクションの取得（algo_paramsから、なければデフォルト）
     memory_fraction = algo_params.pop('memory_fraction', None)
-    cluster, client = make_cluster(memory_fraction)
+    cluster, client = make_cluster(memory_fraction)  # dask_cluster.py 直接呼び出し
     
     try:
         # チャンクサイズの自動決定
         if chunk is None:
-            if _is_zarr_path(src_cog):
-                dem_probe = _load_input_dataarray(src_cog, 1024)
+            if is_zarr_path(src_cog):
+                dem_probe = load_input_dataarray(src_cog, 1024)
                 height = dem_probe.sizes[dem_probe.dims[-2]]
                 width = dem_probe.sizes[dem_probe.dims[-1]]
                 total_pixels = height * width
@@ -657,7 +585,7 @@ def run_pipeline(
             logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
         
         # 6-1) DEM 遅延ロード (COG または Zarr)
-        dem: xr.DataArray = _load_input_dataarray(src_cog, chunk)
+        dem: xr.DataArray = load_input_dataarray(src_cog, chunk)
         
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
@@ -711,7 +639,7 @@ def run_pipeline(
                 logger.info("Analyzing terrain for automatic radii determination...")
                 
                 # 地形解析
-                terrain_stats = analyze_terrain_characteristics(gpu_arr, sample_ratio=0.01, include_fft=False)
+                terrain_stats = analyze_terrain_characteristics(gpu_arr, sample_ratio=0.01)
                 terrain_stats['pixel_size'] = pixel_size
                 
                 # 最適な半径を決定
@@ -777,12 +705,9 @@ def run_pipeline(
                         "chunked writer will stream-compute each tile")
     
         # 6-5) xarray ラップ（改善：座標構築の簡略化）
-        if agg == "stack" and 'sigmas' in params and params['sigmas'] is not None:
-            dims = ("scale", *dem.dims)
-            coords = {"scale": params['sigmas'], **dem.coords}
-        else:
-            dims = dem.dims
-            coords = dem.coords
+        # 6-5) xarray ラップ（座標構築）
+        dims = dem.dims
+        coords = dem.coords
         
         # アルゴリズムによって適切なデータ範囲を設定
         if algorithm in ['hillshade']:
@@ -841,8 +766,9 @@ def run_pipeline(
         
         # 6-6) 出力 (COG または Zarr)
         dst_path = Path(dst_cog)
-        if _is_zarr_path(str(dst_path)):
-            _write_zarr_output(result_da, dst_path, show_progress=show_progress)
+        if is_zarr_path(str(dst_path)):
+            logger.info("Writing output as Zarr: %s", dst_path)
+            write_zarr_output(result_da, dst_path, show_progress=show_progress)
         else:
             write_cog_da_chunked(result_da, dst_path, show_progress=show_progress)
         logger.info("Pipeline completed successfully!")

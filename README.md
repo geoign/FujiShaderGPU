@@ -176,7 +176,9 @@ python -m pip check
 
 - `FujiShaderGPU/algorithms/`
   - `dask_registry.py`
-  - `dask_shared.py`
+  - `dask_shared.py` (re-export hub, 177 lines)
+  - `_base.py`, `_nan_utils.py`, `_global_stats.py`, `_normalization.py` (shared utilities)
+  - `_impl_*.py` (14 algorithm implementation modules)
   - `tile_shared.py`
   - `common/kernels.py`
   - `common/auto_params.py`

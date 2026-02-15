@@ -468,7 +468,7 @@ def _build_vrt_and_cog_ultra_fast(
     print("=== Fast COG generation start ===")
     _configure_gdal_ultra_performance(gpu_config)
 
-    vrt_path = os.path.join(tmp_tile_dir, "rvi_tiles.vrt")
+    vrt_path = os.path.join(tmp_tile_dir, "tiles.vrt")
     tile_files = sorted(glob.glob(os.path.join(tmp_tile_dir, "tile_*.tif")))
     if not tile_files:
         raise ValueError(f"No tile files found: {tmp_tile_dir}")

@@ -2,7 +2,7 @@
 FujiShaderGPU/core/tile_processor.py
 タイルベース地形解析処理のコア実装（Windows/macOS向け）
 """
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, FIRST_COMPLETED, wait
 from importlib import import_module
 from ..core.gpu_memory import gpu_memory_pool
 from ..config.system_config import get_gpu_config
@@ -1424,13 +1424,21 @@ def process_single_tile(
                 logger.debug(f"Tile ({ty}, {tx}) VRAM used: {used_gb:.2f} GB")
             del dem_gpu, result_gpu
 
-            # コア領域抽出
+            # コア領域抽出（多バンド出力にも対応）
             core_x_in_win = core_x - win_x_off
             core_y_in_win = core_y - win_y_off
-            result_core = result_tile[
-                core_y_in_win : core_y_in_win + core_h,
-                core_x_in_win : core_x_in_win + core_w,
-            ]
+            if result_tile.ndim == 3:
+                # HxWxC 形式の多バンド出力
+                result_core = result_tile[
+                    core_y_in_win : core_y_in_win + core_h,
+                    core_x_in_win : core_x_in_win + core_w,
+                    :,
+                ]
+            else:
+                result_core = result_tile[
+                    core_y_in_win : core_y_in_win + core_h,
+                    core_x_in_win : core_x_in_win + core_w,
+                ]
             if tile_algo_params.get("_apply_global_stats_post", False):
                 core_mask_nodata = None
                 if mask_nodata is not None:
@@ -1917,34 +1925,54 @@ def process_dem_tiles(
             completed_count = 0
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_tile = {
-                    executor.submit(
+                # メモリ節約: 全 Future を一括生成せずストリーミング投入
+                pending = set()
+                tile_iter = iter(tile_infos)
+                max_pending = max_workers * 2  # 先行投入上限
+
+                def _submit_next():
+                    """待機キューにタスクを追加。追加成功で True を返す。"""
+                    info = next(tile_iter, None)
+                    if info is None:
+                        return False
+                    fut = executor.submit(
                         process_single_tile,
-                        input_cog_path, tile_info, tmp_tile_dir, algorithm, sigma,
+                        input_cog_path, info, tmp_tile_dir, algorithm, sigma,
                         nodata, src_transform, src_crs, profile,
                         nodata_threshold, gpu_config.get("vram_monitor", False),
                         multiscale_mode, pixel_size, target_distances, weights,
                         **algo_params
-                    ): tile_info for tile_info in tile_infos
-                }
+                    )
+                    pending.add(fut)
+                    return True
 
-                for future in as_completed(future_to_tile):
-                    result = future.result()
-                    completed_count += 1
-                    progress = completed_count / total_tiles * 100
+                # 初回バッチ投入
+                for _ in range(min(max_pending, total_tiles)):
+                    if not _submit_next():
+                        break
 
-                    if result.success:
-                        processed_tiles.append(result)
-                    elif result.skipped_reason:
-                        skipped_tiles.append(result)
-                    else:
-                        error_tiles.append(result)
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        result = future.result()
+                        completed_count += 1
+                        progress = completed_count / total_tiles * 100
 
-                    if completed_count % 10 == 0:
-                        logger.info(
-                            f"[OK] Progress: {completed_count}/{total_tiles} ({progress:.1f}%) "
-                            f"[success={len(processed_tiles)}, skipped={len(skipped_tiles)}, error={len(error_tiles)}]"
-                        )
+                        if result.success:
+                            processed_tiles.append(result)
+                        elif result.skipped_reason:
+                            skipped_tiles.append(result)
+                        else:
+                            error_tiles.append(result)
+
+                        if completed_count % 10 == 0:
+                            logger.info(
+                                f"[OK] Progress: {completed_count}/{total_tiles} ({progress:.1f}%) "
+                                f"[success={len(processed_tiles)}, skipped={len(skipped_tiles)}, error={len(error_tiles)}]"
+                            )
+
+                        # 完了した分だけ新しいタスクを補充
+                        _submit_next()
 
             logger.info(f"処理結果: 成功{len(processed_tiles)}, スキップ{len(skipped_tiles)}, エラー{len(error_tiles)}")
 
