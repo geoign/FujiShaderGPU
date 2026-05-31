@@ -671,9 +671,9 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         }
         if args.algorithm in spatial_mode_algorithms:
             algo_params['mode'] = getattr(args, 'mode', 'local')
-            if getattr(args, 'radii_list', None):
+            if args.algorithm != "rvi" and getattr(args, 'radii_list', None):
                 algo_params['radii'] = args.radii_list
-            if getattr(args, 'weights_list', None):
+            if args.algorithm != "rvi" and getattr(args, 'weights_list', None):
                 algo_params['weights'] = args.weights_list
 
         # 処理の実行

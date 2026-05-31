@@ -10,7 +10,7 @@ from typing import Tuple
 import GPUtil
 import cupy as cp
 
-from ..config.auto_tune import auto_tune, compute_chunk_size, compute_rmm_pool_gb
+from ..config.auto_tune import auto_tune, compute_chunk_size
 from dask import config as dask_config
 from dask_cuda import LocalCUDACluster
 from distributed import Client
@@ -42,6 +42,8 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         memory_fraction = min(memory_fraction, 0.50)
         logger.info('Google Colab environment detected')
     rmm_size = min(tuned["rmm_pool_size_gb"], int(available_gb * tuned["rmm_pool_fraction"]))
+    spill_dir = os.environ.get('FUJISHADER_SPILL_DIR', tempfile.gettempdir())
+    logger.info("Dask spill directory: %s", spill_dir)
 
     dask_config.set({
         'distributed.worker.memory.target': 0.70,
@@ -55,7 +57,7 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
 
     cluster = LocalCUDACluster(
         device_memory_limit=max(0.1, min(float(memory_fraction), 0.95)),
-        jit_unspill=True,
+        jit_unspill=False,
         rmm_pool_size=f'{rmm_size}GB',
         threads_per_worker=1,
         silence_logs=logging.WARNING,
@@ -63,7 +65,7 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         interface='lo' if is_colab else None,
         rmm_maximum_pool_size=f'{int(rmm_size * 1.2)}GB',
         enable_cudf_spill=True,
-        local_directory=os.environ.get('FUJISHADER_SPILL_DIR', tempfile.gettempdir()),
+        local_directory=spill_dir,
     )
 
     client = Client(cluster)

@@ -132,15 +132,15 @@ def compute_global_stats(gpu_arr: da.Array,
     params_small = algorithm_params.copy()
 
     # スケール系パラメータの調整が必要な場合
-    for key in ['scale', 'sigma', 'radius', 'kernel_size']:
+    for key in ['scale', 'sigma', 'radius', 'radii', 'kernel_size']:
         if key in params_small and params_small[key] is not None:
-            if isinstance(params_small[key], list):
-                if key in ['radius', 'kernel_size']:
+            if isinstance(params_small[key], (list, tuple)):
+                if key in ['radius', 'radii', 'kernel_size']:
                     params_small[key] = [max(1, int(s/downsample_factor)) for s in params_small[key]]
                 else:
                     params_small[key] = [max(1, s/downsample_factor) for s in params_small[key]]
             else:
-                if key in ['radius', 'kernel_size']:
+                if key in ['radius', 'radii', 'kernel_size']:
                     params_small[key] = max(1, int(params_small[key]/downsample_factor))
                 else:
                     params_small[key] = max(1, params_small[key]/downsample_factor)

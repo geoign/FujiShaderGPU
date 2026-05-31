@@ -12,6 +12,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -53,6 +54,57 @@ from .dask_io import (
 
 # ロギング設定
 logger = logging.getLogger(__name__)
+
+
+def _format_gib(num_bytes: int) -> str:
+    return f"{num_bytes / (1024**3):.1f}GB"
+
+
+def _select_chunk_temp_parent(data_nbytes: int) -> Path:
+    """Choose and diagnose the temporary directory for chunk GeoTIFFs."""
+    selected_from = None
+    for env_name in ("FUJISHADER_TMP_DIR", "CPL_TMPDIR", "TMPDIR", "TMP", "TEMP"):
+        value = os.environ.get(env_name)
+        if value:
+            selected_from = env_name
+            parent = Path(value)
+            break
+    else:
+        parent = Path(tempfile.gettempdir())
+
+    parent.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(parent)
+    estimated = max(data_nbytes, int(data_nbytes * 0.75))
+    origin = f" from ${selected_from}" if selected_from else " from tempfile default"
+    logger.info(
+        "Chunk temporary directory%s: %s (free=%s)",
+        origin,
+        parent,
+        _format_gib(usage.free),
+    )
+    if usage.free < estimated:
+        logger.warning(
+            "Chunk temporary directory may be too small for COG staging "
+            "(free=%s, output array=%s). Set FUJISHADER_TMP_DIR, TMPDIR, "
+            "TMP, TEMP, and CPL_TMPDIR to a large persistent volume.",
+            _format_gib(usage.free),
+            _format_gib(data_nbytes),
+        )
+    if not selected_from and str(parent).startswith("/tmp") and Path("/content").exists():
+        try:
+            content_free = shutil.disk_usage("/content").free
+        except OSError:
+            content_free = 0
+        if content_free > usage.free:
+            logger.warning(
+                "Runpod/Colab-compatible layout detected: /tmp has %s free, "
+                "while /content has %s free. For large COG output set "
+                "FUJISHADER_TMP_DIR=/content/fujishader_tmp and CPL_TMPDIR "
+                "to the same path.",
+                _format_gib(usage.free),
+                _format_gib(content_free),
+            )
+    return parent
 
 
 def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, float, float, bool, Optional[float]]:
@@ -269,7 +321,8 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
     with dask_config.set(prefetch_config):
 
         # 一時ディレクトリ作成
-        with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_parent = _select_chunk_temp_parent(int(data.nbytes))
+        with tempfile.TemporaryDirectory(dir=tmp_parent) as tmpdir:
             # チャンクごとに処理
             chunk_files = []
             
@@ -670,10 +723,11 @@ def run_pipeline(
             # Already injected above; keep this branch as a no-op for compatibility.
             params['pixel_size'] = float(params.get('pixel_size', 1.0))
 
-        # 追加：fractal_anomaly用のradii処理
-        if algorithm == "fractal_anomaly" and radii is not None:
+        # CLI passes explicit radii through run_pipeline's top-level radii
+        # parameter, so restore it for non-RVI spatial algorithms.
+        if algorithm != "rvi" and radii is not None:
             params['radii'] = radii
-            logger.info(f"Setting radii for fractal_anomaly: {radii}")
+            logger.info(f"Setting radii for {algorithm}: {radii}")
         
         # 6-3) アルゴリズム実行（run_pipeline内）
         logger.info(f"Computing {algorithm} with parameters: {params}")

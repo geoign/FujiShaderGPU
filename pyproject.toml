@@ -41,11 +41,14 @@ dependencies = [
     "cupy-cuda12x>=13.4.0",  # 縺ｾ縺溘・ cupy-cuda12x for CUDA 12
     "rasterio>=1.3.0",
     "psutil>=5.8.0",
-    'GDAL>=3.0.0; platform_system != "Windows"',
     "tqdm",
 ]
 
 [project.optional-dependencies]
+# GDAL Python bindings are intentionally not declared here.
+# Install the binding that exactly matches native libgdal, e.g.
+#   GDAL_VERSION=$(gdal-config --version)
+#   python -m pip install --no-build-isolation "GDAL==$GDAL_VERSION"
 # Linux/Dask-CUDA 螳溯｡檎腸蠅・
 linux = [
     "dask-cuda>=24.6",
@@ -56,6 +59,7 @@ linux = [
     "rioxarray>=0.15",
     "GPUtil>=1.4",
     "rmm-cu12>=25.6",
+    "cudf-cu12>=25.6",
 ]
 # Windows/macOS 繧ｿ繧､繝ｫ蜃ｦ逅・ｮ溯｡檎腸蠅・
 windows = [
