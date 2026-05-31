@@ -381,9 +381,13 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                                     chunk_file,
                                     driver="GTiff",
                                     compress="ZSTD",
+                                    zstd_level=1,
+                                    predictor=3,
                                     tiled=True,
                                     blockxsize=512,
-                                    blockysize=512
+                                    blockysize=512,
+                                    BIGTIFF="YES",
+                                    num_threads="ALL_CPUS",
                                 )
                                 chunk_files.append(chunk_file)
                                 
