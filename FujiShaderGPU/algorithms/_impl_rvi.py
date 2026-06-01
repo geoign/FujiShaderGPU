@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import List, Optional
 import cupy as cp
 import numpy as np
+import dask
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
@@ -128,7 +129,7 @@ def compute_rvi_result_stats(rvi: da.Array) -> tuple:
         algorithm_name="rvi",
         target_pixels=4_000_000,
         min_factor=1,
-        max_factor=64,
+        max_factor=256,
     )
     downsample_factor = int(max(1, downsample_factor))
 
@@ -141,7 +142,15 @@ def compute_rvi_result_stats(rvi: da.Array) -> tuple:
         rvi[oy::downsample_factor, ox::downsample_factor].ravel()
         for oy, ox in offsets
     ]
-    sample = (da.concatenate(samples) if len(samples) > 1 else samples[0]).compute()
+    # Do not concatenate as Dask arrays here.  On dask-cuda this may trigger a
+    # P2P rechunk shuffle, whose CPU shard-size inspection is not compatible
+    # with CuPy device buffers on non-HMM systems.  Compute the strided samples
+    # from the shared graph, then concatenate the returned CuPy arrays on GPU.
+    computed_samples = dask.compute(*samples)
+    valid_samples = [s for s in computed_samples if getattr(s, "size", 0) > 0]
+    if not valid_samples:
+        return (1.0,)
+    sample = cp.concatenate(valid_samples) if len(valid_samples) > 1 else valid_samples[0]
     return rvi_stat_func(sample)
 
 

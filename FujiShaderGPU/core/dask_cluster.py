@@ -65,6 +65,10 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
     )
 
     dask_config.set({
+        # dask-cuda P2P rechunk/shuffle may inspect CuPy buffers from CPU and
+        # fail on non-HMM systems.  The task-based rechunk path is slower but
+        # robust for FujiShaderGPU's single-GPU Runpod/Colab workloads.
+        'array.rechunk.method': 'tasks',
         'distributed.worker.memory.target': 0.70,
         'distributed.worker.memory.spill': 0.75,
         'distributed.worker.memory.pause': 0.85,
