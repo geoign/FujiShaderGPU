@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import os
 import shutil
 import subprocess
@@ -13,6 +14,8 @@ from typing import List, Optional
 from osgeo import gdal
 
 from ..config.gdal_config import _configure_gdal_ultra_performance
+
+logger = logging.getLogger(__name__)
 
 # Keep current non-exception behavior and silence GDAL 4.0 future warning.
 gdal.DontUseExceptions()
@@ -122,9 +125,9 @@ def _create_qgis_optimized_overviews(tiff_path: str) -> None:
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"Overview build complete: {len(overview_levels)} levels")
+        logger.info("Overview build complete: %d levels", len(overview_levels))
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-        print(f"gdaladdo failed, fallback to GDAL API: {exc}")
+        logger.warning("gdaladdo failed, fallback to GDAL API: %s", exc)
         _create_overviews_gdal_api(tiff_path)
 
 
@@ -133,7 +136,7 @@ def _assert_has_overviews(tiff_path: str) -> None:
     overview_count = _get_overview_count(tiff_path)
     if overview_count <= 0:
         raise ValueError(f"COG output has no overviews: {tiff_path}")
-    print(f"COG overview count: {overview_count}")
+    logger.info("COG overview count: %d", overview_count)
 
 
 def _ensure_output_nodata(path: str, nodata: Optional[float]) -> None:
@@ -176,10 +179,10 @@ def _create_vrt_ultra_fast(
     if len(tile_files) > 20:
         try:
             _create_vrt_command_line_ultra(tile_files, vrt_path, nodata=nodata)
-            print(f"Command line VRT: {time.time() - start:.1f}s")
+            logger.info("Command line VRT: %.1fs", time.time() - start)
             return
         except Exception as exc:
-            print(f"Command line VRT failed; fallback to Python API: {exc}")
+            logger.warning("Command line VRT failed; fallback to Python API: %s", exc)
 
     vrt_options = gdal.BuildVRTOptions(
         resolution="highest",
@@ -191,7 +194,7 @@ def _create_vrt_ultra_fast(
         VRTNodata=nodata,
     )
     gdal.BuildVRT(vrt_path, tile_files, options=vrt_options)
-    print(f"Python VRT: {time.time() - start:.1f}s")
+    logger.info("Python VRT: %.1fs", time.time() - start)
 
 
 def _create_cog_ultra_fast(
@@ -236,7 +239,7 @@ def _create_cog_ultra_fast(
             size_mb = _estimate_written_mb(output_cog_path)
             elapsed = max(now - start, 1e-6)
             avg_mb_s = size_mb / elapsed
-            print(f"COG conversion: {pct}% (written={size_mb:.1f}MB, avg={avg_mb_s:.1f}MB/s)")
+            logger.info("COG conversion: %d%% (written=%.1fMB, avg=%.1fMB/s)", pct, size_mb, avg_mb_s)
             last_progress["pct"] = pct
             last_progress["ts"] = now
         return 1
@@ -244,9 +247,9 @@ def _create_cog_ultra_fast(
     vrt_ds = gdal.Open(vrt_path, gdal.GA_ReadOnly)
     if vrt_ds is None:
         raise ValueError(f"Failed to open VRT: {vrt_path}")
-    print(
-        "COG source size: "
-        f"{vrt_ds.RasterXSize} x {vrt_ds.RasterYSize}, bands={vrt_ds.RasterCount}"
+    logger.info(
+        "COG source size: %d x %d, bands=%d",
+        vrt_ds.RasterXSize, vrt_ds.RasterYSize, vrt_ds.RasterCount,
     )
     src_pixels = int(vrt_ds.RasterXSize) * int(vrt_ds.RasterYSize)
 
@@ -257,14 +260,14 @@ def _create_cog_ultra_fast(
     monitor_thread: Optional[threading.Thread] = None
 
     if not use_python_callback:
-        print("COG conversion: large raster detected; using low-overhead progress monitor.")
+        logger.info("COG conversion: large raster detected; using low-overhead progress monitor.")
 
         def _monitor_progress() -> None:
             while not monitor_stop.wait(30.0):
                 size_mb = _estimate_written_mb(output_cog_path)
                 elapsed = max(time.time() - start, 1e-6)
                 avg_mb_s = size_mb / elapsed
-                print(f"COG conversion: running (written={size_mb:.1f}MB, avg={avg_mb_s:.1f}MB/s)")
+                logger.info("COG conversion: running (written=%.1fMB, avg=%.1fMB/s)", size_mb, avg_mb_s)
 
         monitor_thread = threading.Thread(target=_monitor_progress, daemon=True)
         monitor_thread.start()
@@ -297,7 +300,7 @@ def _create_cog_ultra_fast(
     elapsed = time.time() - start
     size_mb = os.path.getsize(output_cog_path) / (1024 * 1024)
     throughput = size_mb / elapsed if elapsed > 0 else 0
-    print(f"COG complete: {elapsed:.1f}s, {size_mb:.1f}MB, {throughput:.1f}MB/s")
+    logger.info("COG complete: %.1fs, %.1fMB, %.1fMB/s", elapsed, size_mb, throughput)
 
 
 def _create_cog_gtiff_ultra_fast(
@@ -338,7 +341,7 @@ def _create_cog_gtiff_ultra_fast(
         temp_result = None
 
         _ensure_output_nodata(temp_tiff_path, nodata)
-        print("Building overviews...")
+        logger.info("Building overviews...")
         _create_qgis_optimized_overviews(temp_tiff_path)
         _assert_has_overviews(temp_tiff_path)
 
@@ -368,7 +371,7 @@ def _create_cog_gtiff_ultra_fast(
         os.remove(temp_tiff_path)
 
         elapsed = time.time() - start
-        print(f"GTiff COG complete: {elapsed:.1f}s")
+        logger.info("GTiff COG complete: %.1fs", elapsed)
     except Exception:
         if os.path.exists(temp_tiff_path):
             os.remove(temp_tiff_path)
@@ -447,10 +450,10 @@ def _create_vrt_and_cog_external_cli(
     env = _prepare_external_gdal_env(preferred_bin)
     gdalbuildvrt = _find_cli_tool("gdalbuildvrt", preferred_bin)
     gdal_translate = _find_cli_tool("gdal_translate", preferred_bin)
-    print(f"External GDAL tools: buildvrt={gdalbuildvrt}, translate={gdal_translate}")
+    logger.info("External GDAL tools: buildvrt=%s, translate=%s", gdalbuildvrt, gdal_translate)
     if preferred_bin is None and gdal_bin_dir is None:
-        print(
-            "WARNING: Using GDAL tools from PATH. "
+        logger.warning(
+            "Using GDAL tools from PATH. "
             "For reproducible performance, specify --gdal-bin-dir explicitly."
         )
 
@@ -474,7 +477,7 @@ def _create_vrt_and_cog_external_cli(
             cmd_vrt.extend(["-srcnodata", nval, "-vrtnodata", nval])
         cmd_vrt.append(vrt_path)
         subprocess.run(cmd_vrt, check=True, env=env)
-        print(f"External CLI VRT: {time.time() - start:.1f}s")
+        logger.info("External CLI VRT: %.1fs", time.time() - start)
 
         cmd_cog = [
             gdal_translate,
@@ -499,7 +502,7 @@ def _create_vrt_and_cog_external_cli(
         elapsed = time.time() - start
         size_mb = os.path.getsize(output_cog_path) / (1024 * 1024)
         throughput = size_mb / elapsed if elapsed > 0 else 0.0
-        print(f"External CLI COG complete: {elapsed:.1f}s, {size_mb:.1f}MB, {throughput:.1f}MB/s")
+        logger.info("External CLI COG complete: %.1fs, %.1fMB, %.1fMB/s", elapsed, size_mb, throughput)
     finally:
         if os.path.exists(file_list_path):
             os.remove(file_list_path)
@@ -513,7 +516,7 @@ def _build_vrt_and_cog_ultra_fast(
     gdal_bin_dir: Optional[str] = None,
 ) -> None:
     """Build VRT from tile outputs and convert to COG."""
-    print("=== Fast COG generation start ===")
+    logger.info("=== Fast COG generation start ===")
     _configure_gdal_ultra_performance(gpu_config)
 
     vrt_path = os.path.join(tmp_tile_dir, "tiles.vrt")
@@ -522,9 +525,9 @@ def _build_vrt_and_cog_ultra_fast(
         raise ValueError(f"No tile files found: {tmp_tile_dir}")
 
     nodata = _detect_nodata_from_tiles(tile_files)
-    print(f"VRT create: merging {len(tile_files)} tiles")
+    logger.info("VRT create: merging %d tiles", len(tile_files))
     if nodata is not None:
-        print(f"Detected tile nodata={nodata:g}; preserving nodata through VRT/COG")
+        logger.info("Detected tile nodata=%g; preserving nodata through VRT/COG", nodata)
 
     backend_norm = str(backend or "internal").lower()
     if backend_norm not in {"internal", "external", "auto"}:
@@ -542,7 +545,7 @@ def _build_vrt_and_cog_ultra_fast(
             use_external = False
 
     if use_external:
-        print("COG backend: external GDAL CLI")
+        logger.info("COG backend: external GDAL CLI")
         _create_vrt_and_cog_external_cli(
             tile_files=tile_files,
             vrt_path=vrt_path,
@@ -551,11 +554,11 @@ def _build_vrt_and_cog_ultra_fast(
             gdal_bin_dir=gdal_bin_dir,
         )
     else:
-        print("COG backend: internal GDAL Python")
+        logger.info("COG backend: internal GDAL Python")
         _create_vrt_ultra_fast(tile_files, vrt_path, nodata=nodata)
         if gdal.GetDriverByName("COG"):
             _create_cog_ultra_fast(vrt_path, output_cog_path, gpu_config, nodata=nodata)
         else:
             _create_cog_gtiff_ultra_fast(vrt_path, output_cog_path, gpu_config, nodata=nodata)
 
-    print("=== Fast COG generation done ===")
+    logger.info("=== Fast COG generation done ===")

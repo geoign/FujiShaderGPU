@@ -5,6 +5,7 @@ Multiscale Terrain (マルチスケール地形) アルゴリズム実装。
 dask_shared.py からの分離モジュール (Phase 3)。
 """
 from __future__ import annotations
+import logging
 import cupy as cp
 import dask.array as da
 
@@ -12,6 +13,8 @@ from ._base import Constants, DaskAlgorithm
 from ._nan_utils import handle_nan_with_gaussian, restore_nan
 from ._global_stats import determine_optimal_downsample_factor
 from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
+
+logger = logging.getLogger(__name__)
 
 
 class MultiscaleDaskAlgorithm(DaskAlgorithm):
@@ -81,7 +84,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             if norm_scale <= 1e-9:
                 norm_scale = 1.0
         if params.get('verbose', False):
-            print(f"Multiscale Terrain global stats: min={norm_min:.3f}, p80_scale={norm_scale:.3f}")
+            logger.info("Multiscale Terrain global stats: min=%.3f, p80_scale=%.3f", norm_min, norm_scale)
         results = []
         for scale in scales:
             def compute_detail_with_smooth(block, *, scale):

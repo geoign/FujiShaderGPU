@@ -35,7 +35,7 @@ def get_gpu_config(
         gpu_name = sys_config.get("gpu_name", "").upper()
         vram_gb = float(sys_config.get("vram_gb", 0.0))
         gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
-        print(f"GPU自動検出: {gpu_name} ({vram_gb:.1f}GB) -> {gpu_type}")
+        logger.info("GPU自動検出: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
 
     preset = _gpu_config_manager.get_preset(gpu_type)
 
@@ -112,13 +112,13 @@ def detect_optimal_system_config() -> dict:
     else:
         config["optimization_level"] = "standard"
 
-    print("システム検出結果:")
-    print(f"  CPU: {config['cpu_count']}コア, RAM: {config['memory_gb']}GB")
+    logger.info("システム検出結果:")
+    logger.info("  CPU: %sコア, RAM: %sGB", config['cpu_count'], config['memory_gb'])
     if config["gpu_detected"]:
-        print(f"  GPU: {config['gpu_name']}, VRAM: {config['vram_gb']:.1f}GB")
+        logger.info("  GPU: %s, VRAM: %.1fGB", config['gpu_name'], config['vram_gb'])
     else:
-        print("  GPU: 未検出 (CPU情報のみで継続)")
-    print(f"  最適化レベル: {config['optimization_level']}")
+        logger.info("  GPU: 未検出 (CPU情報のみで継続)")
+    logger.info("  最適化レベル: %s", config['optimization_level'])
     return config
 
 
@@ -126,23 +126,21 @@ def check_gdal_environment():
     """
     GDAL環境チェック (QGIS最適化対応)
     """
-    print("=== GDAL環境チェック ===")
+    logger.info("=== GDAL環境チェック ===")
 
     gdal_version = gdal.VersionInfo()
-    print(f"GDALバージョン: {gdal_version}")
+    logger.info("GDALバージョン: %s", gdal_version)
 
     cog_driver = gdal.GetDriverByName("COG")
-    print(f"COGドライバー: {'利用可能' if cog_driver else '利用不可'}")
+    logger.info("COGドライバー: %s", '利用可能' if cog_driver else '利用不可')
 
     gtiff_driver = gdal.GetDriverByName("GTiff")
-    print(f"GTiffドライバー: {'利用可能' if gtiff_driver else '利用不可'}")
+    logger.info("GTiffドライバー: %s", '利用可能' if gtiff_driver else '利用不可')
 
-    print("\nQGIS最適化:")
-    print("  - 512x512ブロックサイズ")
-    print("  - 多段階オーバービュー")
-    print("  - AVERAGE リサンプリング")
-    print("  - ZSTD圧縮")
+    logger.info("QGIS最適化: 512x512ブロック / 多段階オーバービュー / AVERAGEリサンプリング / ZSTD圧縮")
 
     sys_config = detect_optimal_system_config()
-    print(f"Platform: {sys_config['platform']}, GPU detected: {sys_config['gpu_detected']}")
-    print("=" * 50)
+    logger.info(
+        "Platform: %s, GPU detected: %s",
+        sys_config['platform'], sys_config['gpu_detected'],
+    )

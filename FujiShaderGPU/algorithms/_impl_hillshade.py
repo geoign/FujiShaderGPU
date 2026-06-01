@@ -68,6 +68,8 @@ class HillshadeAlgorithm(DaskAlgorithm):
         azimuth = params.get('azimuth', Constants.DEFAULT_AZIMUTH)
         altitude = params.get('altitude', Constants.DEFAULT_ALTITUDE)
         z_factor = params.get('z_factor', 1.0)
+        if z_factor is None:
+            z_factor = 1.0
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)

@@ -86,4 +86,6 @@ class MultiLightUncertaintyAlgorithm(TileAlgorithm):
             z_factor=float(p["z_factor"]),
             uncertainty_weight=float(p["uncertainty_weight"]),
             pixel_size=float(p.get("pixel_size", 1.0)),
+            pixel_scale_x=p.get("pixel_scale_x", None),
+            pixel_scale_y=p.get("pixel_scale_y", None),
         )

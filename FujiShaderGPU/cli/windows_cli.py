@@ -147,7 +147,7 @@ class WindowsCLI(BaseCLI):
         parser.add_argument(
             "--z-factor",
             type=float,
-            default=None,
+            default=1.0,
             help="Hillshade vertical exaggeration (default: 1.0)"
         )
         

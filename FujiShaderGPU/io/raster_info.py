@@ -1,10 +1,13 @@
 """Raster metadata helpers."""
 from __future__ import annotations
 
+import logging
 import math
 from typing import Optional, Tuple
 
 import rasterio
+
+logger = logging.getLogger(__name__)
 
 
 def metric_pixel_scales_from_metadata(
@@ -54,12 +57,12 @@ def detect_pixel_size_from_cog(input_cog_path: str) -> float:
                 bounds=src.bounds,
             )
             if is_geo:
-                print(f"Geographic CRS: center latitude {lat_center:.3f} deg")
-                print(f"Converted meters: {abs(scale_x):.3f}m x {abs(scale_y):.3f}m")
+                logger.info("Geographic CRS: center latitude %.3f deg", lat_center)
+                logger.info("Converted meters: %.3fm x %.3fm", abs(scale_x), abs(scale_y))
             else:
-                print(f"Projected CRS: {abs(scale_x):.3f}m x {abs(scale_y):.3f}m")
-            print(f"Auto pixel size: {pixel_size:.3f}m")
+                logger.info("Projected CRS: %.3fm x %.3fm", abs(scale_x), abs(scale_y))
+            logger.info("Auto pixel size: %.3fm", pixel_size)
             return float(pixel_size)
     except Exception as e:
-        print(f"Pixel size detection error: {e}")
+        logger.warning("Pixel size detection error: %s", e)
         return 0.5
