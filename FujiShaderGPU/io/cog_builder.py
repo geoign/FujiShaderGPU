@@ -81,6 +81,17 @@ def _create_overviews_gdal_api(tiff_path: str) -> None:
         raise ValueError("BuildOverviews failed")
 
 
+def _get_overview_count(tiff_path: str) -> int:
+    """Return the overview count on band 1, or 0 when the file cannot be read."""
+    ds = gdal.Open(tiff_path, gdal.GA_ReadOnly)
+    if ds is None or ds.RasterCount < 1:
+        return 0
+    band = ds.GetRasterBand(1)
+    overview_count = band.GetOverviewCount() if band is not None else 0
+    ds = None
+    return int(overview_count)
+
+
 def _create_qgis_optimized_overviews(tiff_path: str) -> None:
     """Build QGIS-friendly overview pyramid."""
     overview_levels = ["2", "4", "8", "16", "32", "64", "128", "256", "512"]
@@ -115,6 +126,14 @@ def _create_qgis_optimized_overviews(tiff_path: str) -> None:
     except (subprocess.CalledProcessError, FileNotFoundError) as exc:
         print(f"gdaladdo failed, fallback to GDAL API: {exc}")
         _create_overviews_gdal_api(tiff_path)
+
+
+def _assert_has_overviews(tiff_path: str) -> None:
+    """Fail fast if COG creation unexpectedly omitted the overview pyramid."""
+    overview_count = _get_overview_count(tiff_path)
+    if overview_count <= 0:
+        raise ValueError(f"COG output has no overviews: {tiff_path}")
+    print(f"COG overview count: {overview_count}")
 
 
 def _ensure_output_nodata(path: str, nodata: Optional[float]) -> None:
@@ -186,9 +205,11 @@ def _create_cog_ultra_fast(
     cog_options = [
         "COMPRESS=ZSTD",
         "LEVEL=1",
+        "OVERVIEW_COMPRESS=ZSTD",
         "BIGTIFF=YES",
         "BLOCKSIZE=512",
         "NUM_THREADS=ALL_CPUS",
+        "OVERVIEWS=IGNORE_EXISTING",
         "OVERVIEW_RESAMPLING=AVERAGE",
         "OVERVIEW_COUNT=8",
         "ALIGNED_LEVELS=4",
@@ -271,6 +292,7 @@ def _create_cog_ultra_fast(
     result = None
 
     _ensure_output_nodata(output_cog_path, nodata)
+    _assert_has_overviews(output_cog_path)
 
     elapsed = time.time() - start
     size_mb = os.path.getsize(output_cog_path) / (1024 * 1024)
@@ -284,7 +306,7 @@ def _create_cog_gtiff_ultra_fast(
     gpu_config: dict,
     nodata: Optional[float] = None,
 ) -> None:
-    """Fallback COG creation path using GTiff + overviews."""
+    """Fallback COG creation path using a staged GTiff with overviews."""
     start = time.time()
     temp_tiff_path = output_cog_path.replace(".tif", "_temp.tif")
 
@@ -318,9 +340,32 @@ def _create_cog_gtiff_ultra_fast(
         _ensure_output_nodata(temp_tiff_path, nodata)
         print("Building overviews...")
         _create_qgis_optimized_overviews(temp_tiff_path)
+        _assert_has_overviews(temp_tiff_path)
 
-        shutil.move(temp_tiff_path, output_cog_path)
+        cog_options = [
+            "COMPRESS=ZSTD",
+            "LEVEL=1",
+            "OVERVIEW_COMPRESS=ZSTD",
+            "BIGTIFF=YES",
+            "BLOCKSIZE=512",
+            "NUM_THREADS=ALL_CPUS",
+            "OVERVIEWS=FORCE_USE_EXISTING",
+            "OVERVIEW_RESAMPLING=AVERAGE",
+        ]
+        cog_result = gdal.Translate(
+            output_cog_path,
+            temp_tiff_path,
+            format="COG",
+            creationOptions=cog_options,
+            noData=nodata,
+        )
+        if cog_result is None:
+            raise ValueError("COG translate failed")
+        cog_result = None
+
         _ensure_output_nodata(output_cog_path, nodata)
+        _assert_has_overviews(output_cog_path)
+        os.remove(temp_tiff_path)
 
         elapsed = time.time() - start
         print(f"GTiff COG complete: {elapsed:.1f}s")
@@ -438,9 +483,11 @@ def _create_vrt_and_cog_external_cli(
             "-of", "COG",
             "-co", "COMPRESS=ZSTD",
             "-co", "LEVEL=1",
+            "-co", "OVERVIEW_COMPRESS=ZSTD",
             "-co", "NUM_THREADS=ALL_CPUS",
             "-co", "BLOCKSIZE=512",
             "-co", "BIGTIFF=YES",
+            "-co", "OVERVIEWS=IGNORE_EXISTING",
             "-co", "OVERVIEW_RESAMPLING=AVERAGE",
             "-co", "OVERVIEW_COUNT=8",
             vrt_path,
@@ -448,6 +495,7 @@ def _create_vrt_and_cog_external_cli(
         ]
         subprocess.run(cmd_cog, check=True, env=env)
         _ensure_output_nodata(output_cog_path, nodata)
+        _assert_has_overviews(output_cog_path)
         elapsed = time.time() - start
         size_mb = os.path.getsize(output_cog_path) / (1024 * 1024)
         throughput = size_mb / elapsed if elapsed > 0 else 0.0

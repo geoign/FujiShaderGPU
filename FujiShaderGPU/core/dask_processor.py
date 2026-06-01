@@ -13,7 +13,6 @@ import gc
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -185,10 +184,12 @@ def get_cog_options(dtype: str) -> dict:
     """データ型に応じた最適なCOGオプションを返す"""
     base_options = {
         "COMPRESS": "ZSTD",
-        "LEVEL": "6",
+        "LEVEL": "1",
         "BLOCKSIZE": "512",
-        "OVERVIEWS": "AUTO",
-        "OVERVIEW_RESAMPLING": "NEAREST",
+        "OVERVIEWS": "IGNORE_EXISTING",
+        "OVERVIEW_COMPRESS": "ZSTD",
+        "OVERVIEW_RESAMPLING": "AVERAGE",
+        "OVERVIEW_COUNT": "8",
         "BIGTIFF": "YES",
         "NUM_THREADS": "ALL_CPUS",
     }
@@ -208,6 +209,78 @@ def check_gdal_version() -> tuple:
     major = ver_num // 1_000_000
     minor = (ver_num % 1_000_000) // 10_000
     return major, minor
+
+
+def _get_overview_count(tiff_path: Path) -> int:
+    """Return the overview count on band 1, or 0 when the file cannot be read."""
+    ds = gdal.Open(str(tiff_path), gdal.GA_ReadOnly)
+    if ds is None or ds.RasterCount < 1:
+        return 0
+    band = ds.GetRasterBand(1)
+    overview_count = band.GetOverviewCount() if band is not None else 0
+    ds = None
+    return int(overview_count)
+
+
+def _assert_has_overviews(tiff_path: Path):
+    """Fail fast when COG creation unexpectedly omitted its overview pyramid."""
+    overview_count = _get_overview_count(tiff_path)
+    if overview_count <= 0:
+        raise ValueError(f"COG output has no overviews: {tiff_path}")
+    logger.info("COG overview count: %d", overview_count)
+
+
+def _ensure_cog_has_overviews(dst: Path, cog_options: dict):
+    """Rebuild a COG in-place when the writer produced no overviews."""
+    if _get_overview_count(dst) > 0:
+        _assert_has_overviews(dst)
+        return
+
+    logger.warning("COG output has no overviews; rebuilding with forced ZSTD overviews")
+    src = dst.with_suffix(".no_overviews.tif")
+    repaired = dst.with_suffix(".with_overviews.tif")
+    src.unlink(missing_ok=True)
+    repaired.unlink(missing_ok=True)
+    dst.replace(src)
+    try:
+        build_cog_with_overviews(src, repaired, cog_options)
+        repaired.replace(dst)
+        _assert_has_overviews(dst)
+    finally:
+        src.unlink(missing_ok=True)
+        repaired.unlink(missing_ok=True)
+
+
+def _build_zstd_overviews(path: Path, cog_options: dict):
+    """Build internal ZSTD-compressed overviews on a temporary GeoTIFF."""
+    previous_options = {
+        "COMPRESS_OVERVIEW": gdal.GetConfigOption("COMPRESS_OVERVIEW"),
+        "ZLEVEL_OVERVIEW": gdal.GetConfigOption("ZLEVEL_OVERVIEW"),
+        "BIGTIFF_OVERVIEW": gdal.GetConfigOption("BIGTIFF_OVERVIEW"),
+        "GDAL_TIFF_OVR_BLOCKSIZE": gdal.GetConfigOption("GDAL_TIFF_OVR_BLOCKSIZE"),
+        "GDAL_NUM_THREADS": gdal.GetConfigOption("GDAL_NUM_THREADS"),
+    }
+    try:
+        gdal.SetConfigOption("COMPRESS_OVERVIEW", cog_options.get("OVERVIEW_COMPRESS", "ZSTD"))
+        gdal.SetConfigOption("ZLEVEL_OVERVIEW", cog_options.get("LEVEL", "1"))
+        gdal.SetConfigOption("BIGTIFF_OVERVIEW", "YES")
+        gdal.SetConfigOption("GDAL_TIFF_OVR_BLOCKSIZE", cog_options.get("BLOCKSIZE", "512"))
+        gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+
+        ds = gdal.Open(str(path), gdal.GA_Update)
+        if ds is None:
+            raise ValueError(f"Failed to open temporary TIFF for overviews: {path}")
+        result = ds.BuildOverviews(
+            cog_options.get("OVERVIEW_RESAMPLING", "AVERAGE"),
+            [2, 4, 8, 16, 32, 64, 128, 256],
+        )
+        ds = None
+        if result != 0:
+            raise ValueError(f"BuildOverviews failed: {path}")
+    finally:
+        for key, value in previous_options.items():
+            gdal.SetConfigOption(key, value)
+
 
 def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """DataArray を直接 COG として保存（進捗表示付き）"""
@@ -266,6 +339,7 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                     driver="COG",
                     **cog_options,
                 )
+                _ensure_cog_has_overviews(dst, cog_options)
             
             size_mb = os.path.getsize(dst) / 2**20
             logger.info(f"[OK] COG written: {dst} ({size_mb:.1f} MB)")
@@ -432,13 +506,39 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                     pbar.close()
                 return 1
             
-            gdal.Translate(
-                str(dst),
-                str(vrt_file),
-                format="COG" if use_cog_driver else "GTiff",
-                creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
-                callback=gdal_progress_callback
-            )
+            if use_cog_driver:
+                result = gdal.Translate(
+                    str(dst),
+                    str(vrt_file),
+                    format="COG",
+                    creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
+                    callback=gdal_progress_callback
+                )
+                if result is None:
+                    raise ValueError("COG conversion failed")
+                result = None
+                _ensure_cog_has_overviews(dst, cog_options)
+            else:
+                tmp_tif = Path(tmpdir) / "merged_tmp.tif"
+                result = gdal.Translate(
+                    str(tmp_tif),
+                    str(vrt_file),
+                    format="GTiff",
+                    creationOptions=[
+                        "TILED=YES",
+                        "BLOCKXSIZE=512",
+                        "BLOCKYSIZE=512",
+                        "COMPRESS=ZSTD",
+                        f"ZLEVEL={cog_options.get('LEVEL', '1')}",
+                        "BIGTIFF=YES",
+                        "NUM_THREADS=ALL_CPUS",
+                    ],
+                    callback=gdal_progress_callback
+                )
+                if result is None:
+                    raise ValueError("Temporary GeoTIFF conversion failed")
+                result = None
+                build_cog_with_overviews(tmp_tif, dst, cog_options)
             
             logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
 
@@ -502,8 +602,15 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
     tmp = dst.with_suffix(".tmp.tif")
     try:
         # COG固有のオプションを除外
-        tiff_options = {k: v for k, v in cog_options.items() 
-                       if k not in ['OVERVIEWS', 'OVERVIEW_RESAMPLING']}
+        tiff_options = {
+            k: v for k, v in cog_options.items()
+            if k not in [
+                'OVERVIEWS',
+                'OVERVIEW_COMPRESS',
+                'OVERVIEW_COUNT',
+                'OVERVIEW_RESAMPLING',
+            ]
+        }
         
         # 進捗表示付きで計算してから書き込み        
         logger.info("Computing result...")
@@ -540,38 +647,38 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
 ###############################################################################
 
 def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
-    """旧版 GDAL 用: 一時 TIFF → COG 変換 + オーバービュー"""
+    """旧版 GDAL 用: 一時 TIFF にoverviewを作成してからCOGへ変換"""
     # CPU数を取得して並列処理
     num_cpus = os.cpu_count() or 1
-    
-    cmd_translate = [
-        "gdal_translate", "-of", "COG",
-        "-co", f"COMPRESS={cog_options.get('COMPRESS', 'ZSTD')}",
-        "-co", f"LEVEL={cog_options.get('LEVEL', '1')}",
-        "-co", f"BLOCKSIZE={cog_options.get('BLOCKSIZE', '512')}",
-        "-co", "BIGTIFF=YES",
-        "-co", f"NUM_THREADS={num_cpus}",
+
+    _build_zstd_overviews(src, cog_options)
+    _assert_has_overviews(src)
+
+    translate_options = [
+        f"COMPRESS={cog_options.get('COMPRESS', 'ZSTD')}",
+        f"LEVEL={cog_options.get('LEVEL', '1')}",
+        f"OVERVIEW_COMPRESS={cog_options.get('OVERVIEW_COMPRESS', 'ZSTD')}",
+        f"BLOCKSIZE={cog_options.get('BLOCKSIZE', '512')}",
+        "BIGTIFF=YES",
+        f"NUM_THREADS={num_cpus}",
+        "OVERVIEWS=FORCE_USE_EXISTING",
+        f"OVERVIEW_RESAMPLING={cog_options.get('OVERVIEW_RESAMPLING', 'AVERAGE')}",
     ]
     
     # PREDICTORがある場合のみ追加
     if 'PREDICTOR' in cog_options:
-        cmd_translate.extend(["-co", f"PREDICTOR={cog_options['PREDICTOR']}"])
-    
-    cmd_translate.extend([str(src), str(dst)])
-    
-    cmd_addo = [
-        "gdaladdo", "-r", "nearest",
-        "--config", "COMPRESS_OVERVIEW", cog_options.get('COMPRESS', 'ZSTD'),
-        "--config", "GDAL_NUM_THREADS", str(num_cpus),
-        str(dst), "2", "4", "8", "16", "32", "64",
-    ]
-    
-    try:
-        subprocess.run(cmd_translate, check=True, capture_output=True)
-        subprocess.run(cmd_addo, check=True, capture_output=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"GDAL command failed: {e.stderr.decode()}")
-        raise
+        translate_options.append(f"PREDICTOR={cog_options['PREDICTOR']}")
+
+    result = gdal.Translate(
+        str(dst),
+        str(src),
+        format="COG",
+        creationOptions=translate_options,
+    )
+    if result is None:
+        raise ValueError(f"COG translate failed: {dst}")
+    result = None
+    _assert_has_overviews(dst)
 
 ###############################################################################
 # 6. メインパイプライン
