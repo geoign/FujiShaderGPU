@@ -5,6 +5,7 @@ RVI (Ridge-Valley Index) アルゴリズム実装。
 dask_shared.py からの分離モジュール (Phase 2)。
 """
 from __future__ import annotations
+import logging
 from typing import List, Optional
 import cupy as cp
 import numpy as np
@@ -23,6 +24,8 @@ from ._global_stats import (
     determine_optimal_downsample_factor,
 )
 from ._normalization import rvi_stat_func, rvi_norm_func
+
+logger = logging.getLogger(__name__)
 
 
 def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
@@ -154,6 +157,73 @@ def compute_rvi_result_stats(rvi: da.Array) -> tuple:
     return rvi_stat_func(sample)
 
 
+def compute_rvi_input_sample_stats(
+    gpu_arr: da.Array,
+    *,
+    radii: List[int],
+    weights: Optional[List[float]] = None,
+    pixel_size: float = 1.0,
+) -> tuple:
+    """Estimate RVI scale from coarse DEM samples without full-resolution overlap.
+
+    Computing stats from the full RVI Dask graph is accurate but expensive for
+    huge rasters and large radii because it materializes map_overlap halos before
+    any write progress is visible.  A coarse DEM sample with radii scaled into
+    the sampled grid gives a stable global scale at a small fraction of the cost.
+    """
+    downsample_factor = determine_optimal_downsample_factor(
+        gpu_arr.shape,
+        algorithm_name="rvi",
+        target_pixels=2_000_000,
+        min_factor=16,
+        max_factor=512,
+    )
+    downsample_factor = int(max(1, downsample_factor))
+    scaled_radii = [
+        max(1, int(round(float(radius) / downsample_factor)))
+        for radius in radii
+    ]
+    sample_pixel_size = float(pixel_size) * downsample_factor
+
+    offsets = [(0, 0)]
+    if downsample_factor > 1:
+        half = downsample_factor // 2
+        offsets.extend([(0, half), (half, 0), (half, half)])
+
+    logger.info(
+        "Estimating RVI global stats from DEM samples: downsample=%dx, radii=%s -> %s",
+        downsample_factor,
+        list(radii),
+        scaled_radii,
+    )
+
+    samples = [
+        gpu_arr[oy::downsample_factor, ox::downsample_factor]
+        for oy, ox in offsets
+    ]
+    computed_samples = dask.compute(*samples)
+
+    rvi_samples = []
+    for sample in computed_samples:
+        if getattr(sample, "size", 0) == 0:
+            continue
+        rvi_sample = compute_rvi_efficient_block(
+            sample.astype(cp.float32, copy=False),
+            radii=scaled_radii,
+            weights=weights,
+            pixel_size=sample_pixel_size,
+        )
+        rvi_samples.append(rvi_sample.ravel())
+
+    if not rvi_samples:
+        return (1.0,)
+
+    sample_rvi = cp.concatenate(rvi_samples) if len(rvi_samples) > 1 else rvi_samples[0]
+    stats = rvi_stat_func(sample_rvi)
+    logger.info("RVI global normalization stats estimated: abs_p80=%.6f", float(stats[0]))
+    return stats
+
+
 class RVIAlgorithm(DaskAlgorithm):
     """Ridge-Valley Indexアルゴリズム（効率的実装）"""
 
@@ -174,7 +244,12 @@ class RVIAlgorithm(DaskAlgorithm):
             and float(stats[0]) > 1e-9
         )
         if not stats_ok:
-            stats = compute_rvi_result_stats(rvi)
+            stats = compute_rvi_input_sample_stats(
+                gpu_arr,
+                radii=radii,
+                weights=weights,
+                pixel_size=pixel_size,
+            )
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 1 and float(stats[0]) > 1e-9):
             stats = (1.0,)
 
