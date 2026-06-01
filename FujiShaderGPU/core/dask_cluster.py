@@ -55,18 +55,27 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
 
     logging.getLogger('distributed.core').setLevel(logging.WARNING)
 
-    cluster = LocalCUDACluster(
-        device_memory_limit=max(0.1, min(float(memory_fraction), 0.95)),
-        jit_unspill=False,
-        rmm_pool_size=f'{rmm_size}GB',
-        threads_per_worker=1,
-        silence_logs=logging.WARNING,
-        death_timeout='60s' if is_colab else '30s',
-        interface='lo' if is_colab else None,
-        rmm_maximum_pool_size=f'{int(rmm_size * 1.2)}GB',
-        enable_cudf_spill=True,
-        local_directory=spill_dir,
-    )
+    cluster_kwargs = {
+        'device_memory_limit': max(0.1, min(float(memory_fraction), 0.95)),
+        'rmm_pool_size': f'{rmm_size}GB',
+        'threads_per_worker': 1,
+        'silence_logs': logging.WARNING,
+        'death_timeout': '60s' if is_colab else '30s',
+        'interface': 'lo' if is_colab else None,
+        'rmm_maximum_pool_size': f'{int(rmm_size * 1.2)}GB',
+        'enable_cudf_spill': True,
+        'local_directory': spill_dir,
+    }
+
+    try:
+        cluster = LocalCUDACluster(**cluster_kwargs)
+    except TypeError as exc:
+        if 'enable_cudf_spill' not in str(exc):
+            raise
+        # Older dask-cuda releases do not expose cuDF native spilling.
+        cluster_kwargs.pop('enable_cudf_spill', None)
+        logger.info("dask-cuda does not support enable_cudf_spill; using default spilling")
+        cluster = LocalCUDACluster(**cluster_kwargs)
 
     client = Client(cluster)
     return cluster, client
