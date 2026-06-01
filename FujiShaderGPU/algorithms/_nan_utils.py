@@ -201,6 +201,20 @@ def _upsample_coarse_response_block(block, *, coarse, full_h, full_w, block_info
     return out.astype(cp.float32)
 
 
+def _nanmean_dispatch(a, axis=None, **kwargs):
+    """CuPy-backed nanmean tolerant of da.coarsen's numpy meta probe.
+
+    ``da.coarsen`` infers the output meta by calling the reduction once with a
+    tiny *numpy* sample array, while the real chunks are CuPy. ``cp.nanmean``
+    rejects numpy input outright (TypeError). Promote a numpy probe to CuPy so
+    the call succeeds and the coarsened array keeps a CuPy meta consistent with
+    its real chunks.
+    """
+    if isinstance(a, np.ndarray):
+        a = cp.asarray(a)
+    return cp.nanmean(a, axis=axis, **kwargs)
+
+
 def coarse_large_radius_response(
     gpu_arr: da.Array,
     *,
@@ -227,7 +241,7 @@ def coarse_large_radius_response(
     if coarse_cache is not None and "coarse" in coarse_cache:
         coarse = coarse_cache["coarse"]
     else:
-        coarse = da.coarsen(cp.nanmean, gpu_arr, {0: factor, 1: factor}, trim_excess=True)
+        coarse = da.coarsen(_nanmean_dispatch, gpu_arr, {0: factor, 1: factor}, trim_excess=True)
         if coarse_cache is not None:
             coarse_cache["coarse"] = coarse
 
