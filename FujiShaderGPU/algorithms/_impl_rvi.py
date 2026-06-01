@@ -17,7 +17,10 @@ from ._nan_utils import (
     restore_nan,
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
 )
-from ._global_stats import compute_global_stats, apply_global_normalization
+from ._global_stats import (
+    apply_global_normalization,
+    determine_optimal_downsample_factor,
+)
 from ._normalization import rvi_stat_func, rvi_norm_func
 
 
@@ -118,6 +121,30 @@ def multiscale_rvi(gpu_arr: da.Array, *,
     return result
 
 
+def compute_rvi_result_stats(rvi: da.Array) -> tuple:
+    """Estimate global normalization stats directly from the computed RVI field."""
+    downsample_factor = determine_optimal_downsample_factor(
+        rvi.shape,
+        algorithm_name="rvi",
+        target_pixels=4_000_000,
+        min_factor=1,
+        max_factor=64,
+    )
+    downsample_factor = int(max(1, downsample_factor))
+
+    offsets = [(0, 0)]
+    if downsample_factor > 1:
+        half = downsample_factor // 2
+        offsets.extend([(0, half), (half, 0), (half, half)])
+
+    samples = [
+        rvi[oy::downsample_factor, ox::downsample_factor].ravel()
+        for oy, ox in offsets
+    ]
+    sample = (da.concatenate(samples) if len(samples) > 1 else samples[0]).compute()
+    return rvi_stat_func(sample)
+
+
 class RVIAlgorithm(DaskAlgorithm):
     """Ridge-Valley Indexアルゴリズム（効率的実装）"""
 
@@ -128,7 +155,6 @@ class RVIAlgorithm(DaskAlgorithm):
 
         if radii is None:
             radii = self._determine_optimal_radii(pixel_size)
-        max_radius = max(radii)
         rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights, pixel_size=pixel_size)
 
         # Prefer externally supplied global stats (tile backend computes once).
@@ -139,18 +165,7 @@ class RVIAlgorithm(DaskAlgorithm):
             and float(stats[0]) > 1e-9
         )
         if not stats_ok:
-            num_blocks = int(np.prod(gpu_arr.numblocks)) if hasattr(gpu_arr, "numblocks") else 1
-            if num_blocks > 1:
-                stats = compute_global_stats(
-                    rvi,
-                    rvi_stat_func,
-                    compute_rvi_efficient_block,
-                    {'radii': radii, 'weights': weights, 'pixel_size': pixel_size},
-                    params.get('downsample_factor', None),
-                    depth=max_radius * 2 + 1
-                )
-            else:
-                stats = (1.0,)
+            stats = compute_rvi_result_stats(rvi)
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 1 and float(stats[0]) > 1e-9):
             stats = (1.0,)
 

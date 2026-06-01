@@ -8,6 +8,9 @@ from __future__ import annotations
 from typing import Tuple
 import cupy as cp
 
+NORMAL_PERCENTILE = 80.0
+OVERFLOW_LIMIT = 1.5
+
 
 # --- RVI用 ---
 
@@ -16,7 +19,7 @@ def rvi_stat_func(data: cp.ndarray) -> Tuple[float]:
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
         abs_valid = cp.abs(valid_data)
-        scale = float(cp.percentile(abs_valid, 80))
+        scale = float(cp.percentile(abs_valid, NORMAL_PERCENTILE))
         if scale > 1e-9:
             return (scale,)
         # Fallback for near-constant tiles/arrays.
@@ -29,7 +32,7 @@ def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     scale_global = stats[0]
     if scale_global > 0:
         normalized = block / scale_global
-        return cp.clip(normalized, -1, 1)
+        return cp.clip(normalized, -OVERFLOW_LIMIT, OVERFLOW_LIMIT)
     return cp.zeros_like(block)
 
 
@@ -51,20 +54,14 @@ def npr_stat_func(data: cp.ndarray) -> Tuple[float, float]:
 # --- LRM用 ---
 
 def lrm_stat_func(data: cp.ndarray) -> Tuple[float]:
-    """Return robust LRM scale using MAD fallback."""
+    """Return robust signed scale: p80(abs(value)) maps to +/-1."""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) == 0:
         return (1.0,)
 
-    med = cp.median(valid_data)
-    abs_dev = cp.abs(valid_data - med)
-    mad = float(cp.median(abs_dev))
-    if mad > 1e-9:
-        return (1.4826 * mad,)
-
-    p90 = float(cp.percentile(abs_dev, 90))
-    if p90 > 1e-9:
-        return (p90,)
+    scale = float(cp.percentile(cp.abs(valid_data), NORMAL_PERCENTILE))
+    if scale > 1e-9:
+        return (scale,)
     return (1.0,)
 
 
@@ -74,7 +71,7 @@ def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     """TPI/LRM用の正規化"""
     max_abs = stats[0]
     if max_abs > 0:
-        return cp.clip(block / max_abs, -1, 1)
+        return cp.clip(block / max_abs, -OVERFLOW_LIMIT, OVERFLOW_LIMIT)
     return cp.zeros_like(block)
 
 
@@ -84,4 +81,6 @@ __all__ = [
     "npr_stat_func",
     "lrm_stat_func",
     "tpi_norm_func",
+    "NORMAL_PERCENTILE",
+    "OVERFLOW_LIMIT",
 ]

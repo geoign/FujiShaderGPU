@@ -115,6 +115,19 @@ class WindowsCLI(BaseCLI):
             type=str,
             help="Spatial重み (例: 0.5,0.3,0.2)。未指定時はYAML重み/等重みを自動適用"
         )
+
+        parser.add_argument(
+            "--no-fill-dem-holes",
+            action="store_true",
+            help="spatialモードでの内陸NoData穴埋めを無効化"
+        )
+
+        parser.add_argument(
+            "--hole-fill-max-components",
+            type=int,
+            default=256,
+            help="個別内挿で処理する穴数の上限/chunk (default: 256)。超過時は低解像度平滑補間"
+        )
         
         # アルゴリズム固有パラメータの追加
         parser.add_argument(
@@ -280,6 +293,8 @@ class WindowsCLI(BaseCLI):
                 algo_params['uncertainty_weight'] = args.uncertainty_weight
 
             algo_params['mode'] = args.mode
+            algo_params['fill_dem_holes'] = not args.no_fill_dem_holes
+            algo_params['hole_fill_max_components'] = args.hole_fill_max_components
             if radii_list:
                 algo_params['radii'] = radii_list
             if weights_list:

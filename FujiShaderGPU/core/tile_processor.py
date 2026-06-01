@@ -16,9 +16,13 @@ from ..core.tile_compute import (
 from ..io.raster_info import detect_pixel_size_from_cog, metric_pixel_scales_from_metadata
 from ..utils.types import TileResult
 from ..utils.scale_analysis import analyze_terrain_scales, _get_default_scales
-from ..utils.nodata_handler import _handle_nodata_ultra_fast
+from ..utils.nodata_handler import (
+    _handle_nodata_ultra_fast,
+    fill_enclosed_nodata_holes,
+)
 from ..io.cog_builder import _build_vrt_and_cog_ultra_fast
 from ..io.cog_validator import _validate_cog_for_qgis
+from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 import os
 import math
 import glob
@@ -416,6 +420,15 @@ def _percentile_minmax_np(data: np.ndarray, pmin: float = 1.0, pmax: float = 99.
     return (mn, mx)
 
 
+def _unsigned_p80_stats_np(data: np.ndarray) -> Optional[Tuple[float, float]]:
+    valid = data[np.isfinite(data)]
+    if valid.size == 0:
+        return None
+    lo = float(np.percentile(valid, 1.0))
+    scale = float(np.percentile(np.maximum(valid - lo, 0.0), NORMAL_PERCENTILE))
+    if not (np.isfinite(lo) and np.isfinite(scale)) or scale <= 1e-9:
+        return None
+    return (lo, scale)
 def _normalize_by_global_stats(
     arr: np.ndarray,
     stats: Union[Tuple[float, float], List[Tuple[float, float]], None],
@@ -426,26 +439,28 @@ def _normalize_by_global_stats(
         return arr
 
     if arr.ndim == 2 and isinstance(stats, (tuple, list)) and len(stats) == 2 and not isinstance(stats[0], (tuple, list)):
-        mn, mx = float(stats[0]), float(stats[1])
-        if np.isfinite(mn) and np.isfinite(mx) and mx > mn:
-            src = arr.astype(np.float32, copy=False)
-            if target_range == "unit_specular":
+        lo, scale = float(stats[0]), float(stats[1])
+        src = arr.astype(np.float32, copy=False)
+        if target_range == "unit_specular":
+            if np.isfinite(lo) and np.isfinite(scale) and scale > lo:
                 # Keep flat areas near middle-gray while expanding subtle contrast globally.
-                center = 0.5 * (mn + mx)
-                half = max(0.5 * (mx - mn), 1e-6)
+                center = 0.5 * (lo + scale)
+                half = max(0.5 * (scale - lo), 1e-6)
                 out = 0.5 + 0.45 * np.tanh((src - center) / (0.75 * half))
                 return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
-            if target_range == "unit_surprise":
-                # Match legacy visual feel with a global (tile-stable) curve.
-                out = np.clip((src - mn) / (mx - mn), 0.0, 1.0)
-                return np.power(out, 1.0 / 2.0).astype(np.float32, copy=False)
-            if target_range == "signed":
-                center = 0.5 * (mn + mx)
-                half = max(abs(mx - center), abs(mn - center), 1e-6)
+            return arr
+        if target_range == "signed":
+            if np.isfinite(lo) and np.isfinite(scale) and scale > lo:
+                center = 0.5 * (lo + scale)
+                half = max(abs(scale - center), abs(lo - center), 1e-6)
                 out = (src - center) / half
-                return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
-            out = (src - mn) / (mx - mn)
-            return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+                return np.clip(out, -OVERFLOW_LIMIT, OVERFLOW_LIMIT).astype(np.float32, copy=False)
+            return arr
+        if np.isfinite(lo) and np.isfinite(scale) and scale > 1e-9:
+            out = np.clip((src - lo) / scale, 0.0, OVERFLOW_LIMIT)
+            if target_range == "unit_surprise":
+                return np.power(out, 1.0 / 2.0).astype(np.float32, copy=False)
+            return np.clip(out, 0.0, OVERFLOW_LIMIT).astype(np.float32, copy=False)
         return arr
 
     if arr.ndim == 2 and isinstance(stats, (tuple, list)) and len(stats) >= 3 and not isinstance(stats[0], (tuple, list)):
@@ -481,11 +496,11 @@ def _normalize_by_global_stats(
                 # Use a partial floor subtraction to suppress noise while preserving gradation.
                 floor = 0.2 * mn
                 denom = max(mx - floor, 1e-6)
-                out = np.clip((src - floor) / denom, 0.0, 1.0)
+                out = np.clip((src - floor) / denom, 0.0, OVERFLOW_LIMIT)
                 gamma = max(1e-3, gamma_hint)
                 return np.power(out, 1.0 / gamma).astype(np.float32, copy=False)
             out = (src - mn) / (mx - mn)
-            return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
+            return np.clip(out, 0.0, OVERFLOW_LIMIT).astype(np.float32, copy=False)
         return arr
 
     if arr.ndim == 2 and isinstance(stats, (tuple, list)) and len(stats) == 1:
@@ -493,10 +508,8 @@ def _normalize_by_global_stats(
         if np.isfinite(scale) and scale > 1e-9:
             src = arr.astype(np.float32, copy=False)
             if target_range == "signed":
-                out = np.tanh(src / (2.5 * scale))
-                return np.clip(out, -1.0, 1.0).astype(np.float32, copy=False)
-            out = np.tanh(src / (2.5 * scale))
-            return np.clip(0.5 * (out + 1.0), 0.0, 1.0).astype(np.float32, copy=False)
+                return np.clip(src / scale, -OVERFLOW_LIMIT, OVERFLOW_LIMIT).astype(np.float32, copy=False)
+            return np.clip(src / scale, 0.0, OVERFLOW_LIMIT).astype(np.float32, copy=False)
         return arr
 
     if arr.ndim == 3 and isinstance(stats, (tuple, list)) and len(stats) == arr.shape[2]:
@@ -505,14 +518,18 @@ def _normalize_by_global_stats(
             st = stats[ch]
             if not (isinstance(st, (tuple, list)) and len(st) == 2):
                 continue
-            mn, mx = float(st[0]), float(st[1])
-            if np.isfinite(mn) and np.isfinite(mx) and mx > mn:
-                if target_range == "signed":
-                    center = 0.5 * (mn + mx)
-                    half = max(abs(mx - center), abs(mn - center), 1e-6)
-                    out[:, :, ch] = np.clip((out[:, :, ch] - center) / half, -1.0, 1.0)
-                else:
-                    out[:, :, ch] = np.clip((out[:, :, ch] - mn) / (mx - mn), 0.0, 1.0)
+            lo, scale = float(st[0]), float(st[1])
+            if target_range == "signed":
+                if np.isfinite(lo) and np.isfinite(scale) and scale > lo:
+                    center = 0.5 * (lo + scale)
+                    half = max(abs(scale - center), abs(lo - center), 1e-6)
+                    out[:, :, ch] = np.clip(
+                        (out[:, :, ch] - center) / half,
+                        -OVERFLOW_LIMIT,
+                        OVERFLOW_LIMIT,
+                    )
+            elif np.isfinite(lo) and np.isfinite(scale) and scale > 1e-9:
+                out[:, :, ch] = np.clip((out[:, :, ch] - lo) / scale, 0.0, OVERFLOW_LIMIT)
         return out
 
     return arr
@@ -732,13 +749,13 @@ def _compute_global_multiscale_terrain_stats(
         valid_data = combined[~cp.isnan(combined)]
         if valid_data.size == 0:
             return None
-        norm_min = float(cp.percentile(valid_data, 5))
-        norm_max = float(cp.percentile(valid_data, 95))
-        if not np.isfinite(norm_min) or not np.isfinite(norm_max):
+        norm_min = float(cp.percentile(valid_data, 1))
+        norm_scale = float(cp.percentile(cp.maximum(valid_data - norm_min, 0.0), NORMAL_PERCENTILE))
+        if not np.isfinite(norm_min) or not np.isfinite(norm_scale):
             return None
-        if norm_max <= norm_min:
+        if norm_scale <= 1e-9:
             return None
-        return (norm_min, norm_max)
+        return (norm_min, norm_scale)
     except Exception as exc:
         logger.warning(f"Failed to compute multiscale global stats; fallback to per-tile stats: {exc}")
         return None
@@ -785,12 +802,12 @@ def _compute_global_visual_saliency_stats(
         stats = visual_saliency_stat_func(saliency)
         if not stats:
             return None
-        mn, mx = float(stats[0]), float(stats[1])
-        if not np.isfinite(mn) or not np.isfinite(mx):
+        mn, scale = float(stats[0]), float(stats[1])
+        if not np.isfinite(mn) or not np.isfinite(scale):
             return None
-        if mx <= mn:
+        if scale <= 1e-9:
             return None
-        return (mn, mx)
+        return (mn, scale)
     except Exception as exc:
         logger.warning(f"Failed to compute visual saliency global stats; fallback to per-tile stats: {exc}")
         return None
@@ -938,8 +955,8 @@ def _compute_global_scale_space_surprise_stats(
     scales: Optional[List[float]],
     enhancement: float = 2.0,
     elevation_scale: float = 1.0,
-) -> Optional[Tuple[float, float, float]]:
-    """Estimate global SSS normalization range once (legacy-style tone curve)."""
+) -> Optional[Tuple[float, float]]:
+    """Estimate global SSS normalization scale: p80 maps to +1."""
     try:
         from ..algorithms.common.kernels import scale_space_surprise as kernel_scale_space_surprise
     except Exception as exc:
@@ -975,12 +992,10 @@ def _compute_global_scale_space_surprise_stats(
         valid = cp.asnumpy(raw[~cp.isnan(raw)])
         if valid.size == 0:
             return None
-        p01 = float(np.percentile(valid, 1.0))
-        p99 = float(np.percentile(valid, 99.0))
-        if not (np.isfinite(p01) and np.isfinite(p99)) or p99 <= p01:
+        scale = float(np.percentile(np.maximum(valid, 0.0), NORMAL_PERCENTILE))
+        if not np.isfinite(scale) or scale <= 1e-9:
             return None
-        gamma = max(1.3, float(enhancement) * 1.0)
-        return (p01, p99, gamma)
+        return (0.0, scale)
     except Exception as exc:
         logger.warning(
             f"Failed to compute global scale_space_surprise stats; fallback to generic stats: {exc}"
@@ -1113,11 +1128,11 @@ def _compute_generic_global_algorithm_stats(
                 if p90 <= p10:
                     return None
                 return (p10, p50, p90)
-            return _percentile_minmax_np(result, pmin=1.0, pmax=99.0)
+            return _unsigned_p80_stats_np(result)
         if result.ndim == 3:
             stats: List[Tuple[float, float]] = []
             for ch in range(result.shape[2]):
-                st = _percentile_minmax_np(result[:, :, ch], pmin=1.0, pmax=99.0)
+                st = _unsigned_p80_stats_np(result[:, :, ch])
                 if st is None:
                     return None
                 stats.append(st)
@@ -1345,6 +1360,14 @@ def process_single_tile(
             mask_nodata = None
             if nodata is not None:
                 mask_nodata = _build_nodata_mask(dem_tile, nodata)
+            elif np.isnan(dem_tile).any():
+                mask_nodata = np.isnan(dem_tile)
+
+            fill_dem_holes = (
+                str(algo_params.get("mode", "local")).lower() == "spatial"
+                and bool(algo_params.get("fill_dem_holes", True))
+            )
+            if mask_nodata is not None:
                 nodata_ratio = np.count_nonzero(mask_nodata) / mask_nodata.size
                 
                 if nodata_ratio >= nodata_threshold:
@@ -1360,13 +1383,36 @@ def process_single_tile(
                     # Avoid flooding IDLE socket with thousands of warnings on huge rasters.
                     logger.debug(f"Tile({ty}, {tx}) has high NoData ratio: {nodata_ratio:.1%}")
 
+                if fill_dem_holes:
+                    dem_tile, mask_nodata, filled_holes = fill_enclosed_nodata_holes(
+                        dem_tile,
+                        mask_nodata,
+                        max_holes_for_interpolation=int(
+                            algo_params.get("hole_fill_max_components", 256)
+                        ),
+                    )
+                    if filled_holes:
+                        logger.debug(
+                            "Tile(%d, %d) filled %d enclosed NoData holes",
+                            ty,
+                            tx,
+                            filled_holes,
+                        )
+                    if mask_nodata is not None and not np.any(mask_nodata):
+                        mask_nodata = None
+
                 if algorithm in {"rvi", "fractal_anomaly"}:
                     # RVI uses NaN-aware filters. Keep NoData as NaN to avoid boundary
                     # virtual-fill outliers that can dominate normalization.
                     dem_tile_processed = dem_tile.astype(np.float32, copy=True)
-                    dem_tile_processed[mask_nodata] = np.nan
+                    if mask_nodata is not None:
+                        dem_tile_processed[mask_nodata] = np.nan
                 else:
-                    dem_tile_processed = _handle_nodata_ultra_fast(dem_tile, mask_nodata)
+                    dem_tile_processed = (
+                        _handle_nodata_ultra_fast(dem_tile, mask_nodata)
+                        if mask_nodata is not None
+                        else dem_tile
+                    )
             else:
                 dem_tile_processed = dem_tile
 
@@ -1377,6 +1423,8 @@ def process_single_tile(
             algo_instance = _load_algorithm(algorithm)
             # Build per-tile params so geographic DEMs can use local latitude scaling.
             tile_algo_params = dict(algo_params)
+            tile_algo_params.pop("fill_dem_holes", None)
+            tile_algo_params.pop("hole_fill_max_components", None)
             if src_crs is not None and getattr(src_crs, "is_geographic", False):
                 try:
                     # Use core tile center latitude for local meter conversion.
@@ -1775,7 +1823,7 @@ def process_dem_tiles(
                     algo_params["global_stats"] = global_ms_stats
                     logger.info(
                         "Multiscale global normalization stats fixed for all tiles: "
-                        f"min={global_ms_stats[0]:.6f}, max={global_ms_stats[1]:.6f}"
+                        f"min={global_ms_stats[0]:.6f}, p80_scale={global_ms_stats[1]:.6f}"
                     )
             elif algorithm == "visual_saliency":
                 global_vs_stats = _compute_global_visual_saliency_stats(
@@ -1789,7 +1837,7 @@ def process_dem_tiles(
                     algo_params["global_stats"] = global_vs_stats
                     logger.info(
                         "Visual saliency global normalization stats fixed for all tiles: "
-                        f"min={global_vs_stats[0]:.6f}, max={global_vs_stats[1]:.6f}"
+                        f"min={global_vs_stats[0]:.6f}, p80_scale={global_vs_stats[1]:.6f}"
                     )
             elif algorithm == "lrm":
                 global_lrm_stats = _compute_global_lrm_scale(
@@ -1821,7 +1869,7 @@ def process_dem_tiles(
                     algo_params["global_stats"] = global_fractal_stats
                     logger.info(
                         "Fractal global normalization stats fixed for all tiles: "
-                        f"mean={global_fractal_stats[0]:.6f}, std={global_fractal_stats[1]:.6f}"
+                        f"center={global_fractal_stats[0]:.6f}, p80_scale={global_fractal_stats[1]:.6f}"
                     )
             elif algorithm == "scale_space_surprise":
                 global_sss_stats = _compute_global_scale_space_surprise_stats(
@@ -1835,8 +1883,7 @@ def process_dem_tiles(
                     algo_params["global_stats"] = global_sss_stats
                     logger.info(
                         "Scale-space surprise global normalization stats fixed for all tiles: "
-                        f"min={global_sss_stats[0]:.6f}, max={global_sss_stats[1]:.6f}, "
-                        f"gamma={global_sss_stats[2]:.3f}"
+                        f"min={global_sss_stats[0]:.6f}, p80_scale={global_sss_stats[1]:.6f}"
                     )
             elif algorithm == "specular":
                 global_roughness_scale = _compute_global_specular_roughness_scale(

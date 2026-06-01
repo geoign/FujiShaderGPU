@@ -14,6 +14,7 @@ from cupyx.scipy.ndimage import gaussian_filter
 from ._base import DaskAlgorithm
 from ._nan_utils import restore_nan
 from ._global_stats import compute_global_stats
+from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 
 
 def _compress_saliency_feature(feature):
@@ -22,18 +23,18 @@ def _compress_saliency_feature(feature):
 
 
 def visual_saliency_stat_func(data):
-    """Global robust range for saliency normalization."""
+    """Global unsigned scale: p80 maps to +1."""
     valid_data = data[~cp.isnan(data)]
     if valid_data.size == 0:
         return (0.0, 1.0)
-    return (float(cp.percentile(valid_data, 0.5)),
-            float(cp.percentile(valid_data, 99.5)))
+    scale = float(cp.percentile(cp.maximum(valid_data, 0.0), NORMAL_PERCENTILE))
+    return (0.0, scale if scale > 1e-9 else 1.0)
 
 
 def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16],
                                  pixel_size=1.0, pixel_scale_x=None,
                                  pixel_scale_y=None, normalize=True,
-                                 norm_min=None, norm_max=None):
+                                 norm_min=None, norm_scale=None):
     """Itti-style saliency (intensity + orientation conspicuity) for DEM."""
     nan_mask = cp.isnan(block)
     if nan_mask.any():
@@ -83,13 +84,13 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16],
         O = cp.zeros_like(work, dtype=cp.float32)
     sal = 0.5 * (I + O)
     if normalize:
-        if norm_min is None or norm_max is None:
-            norm_min, norm_max = visual_saliency_stat_func(sal)
-        if norm_max > norm_min:
-            result = (sal - norm_min) / (norm_max - norm_min)
+        if norm_min is None or norm_scale is None:
+            norm_min, norm_scale = visual_saliency_stat_func(sal)
+        if norm_scale > 1e-9:
+            result = (sal - norm_min) / norm_scale
         else:
             result = cp.zeros_like(sal)
-        result = cp.clip(result, 0, 1)
+        result = cp.clip(result, 0, OVERFLOW_LIMIT)
     else:
         result = sal
     result = restore_nan(result, nan_mask)
@@ -127,7 +128,7 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
             meta=cp.empty((0, 0), dtype=cp.float32),
             scales=scales, pixel_size=pixel_size,
             pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-            normalize=True, norm_min=stats[0], norm_max=stats[1])
+            normalize=True, norm_min=stats[0], norm_scale=stats[1])
 
     def get_default_params(self):
         return {

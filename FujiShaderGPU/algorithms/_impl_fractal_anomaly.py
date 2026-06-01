@@ -14,6 +14,7 @@ from cupyx.scipy.ndimage import gaussian_filter, median_filter
 from ._base import DaskAlgorithm, classify_resolution
 from ._nan_utils import handle_nan_with_gaussian, restore_nan
 from ._global_stats import compute_global_stats
+from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 
 
 def compute_roughness_multiscale(block, radii, window_mult=3, detrend=True):
@@ -107,8 +108,11 @@ def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
     feature_out = alpha * raw_feature + (1.0 - alpha) * feat_smooth
     if normalize and mean_global is not None and std_global is not None:
         if std_global > 1e-6:
-            Z = (feature_out - mean_global) / std_global
-            result = cp.tanh(Z / 2.5)
+            result = cp.clip(
+                (feature_out - mean_global) / std_global,
+                -OVERFLOW_LIMIT,
+                OVERFLOW_LIMIT,
+            )
         else:
             result = cp.zeros_like(feature_out)
     else:
@@ -125,19 +129,12 @@ def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
 
 
 def fractal_stat_func(data):
-    """Compute robust center/scale for fractal-anomaly normalization."""
+    """Compute robust center/scale: p80(abs(centered)) maps to +/-1."""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
-        p05 = float(cp.percentile(valid_data, 5))
-        p95 = float(cp.percentile(valid_data, 95))
-        if p95 > p05:
-            center = 0.5 * (p05 + p95)
-            scale = max(0.5 * (p95 - p05), 1e-6)
-            return (center, scale)
         center = float(cp.median(valid_data))
         abs_dev = cp.abs(valid_data - center)
-        mad = float(cp.median(abs_dev))
-        scale = 1.4826 * mad if mad > 1e-9 else 0.5
+        scale = float(cp.percentile(abs_dev, NORMAL_PERCENTILE))
         return (center, max(scale, 1e-6))
     return (0.0, 0.5)
 

@@ -11,7 +11,7 @@ import dask.array as da
 from ._base import DaskAlgorithm
 from ._nan_utils import handle_nan_with_gaussian, restore_nan
 from ._global_stats import compute_global_stats
-from ._normalization import lrm_stat_func
+from ._normalization import OVERFLOW_LIMIT, lrm_stat_func
 
 
 def compute_lrm_block(block, *, kernel_size=25, pixel_size=1.0,
@@ -29,7 +29,7 @@ def compute_lrm_block(block, *, kernel_size=25, pixel_size=1.0,
             scale = lrm_stat_func(lrm)[0]
             if not cp.isfinite(scale) or scale <= 1e-9:
                 scale = 1.0
-        result = cp.tanh(lrm / (2.5 * scale))
+        result = cp.clip(lrm / scale, -OVERFLOW_LIMIT, OVERFLOW_LIMIT)
     result = restore_nan(result, nan_mask)
     return result.astype(cp.float32)
 

@@ -11,7 +11,6 @@ import cupy as cp
 import numpy as np
 import dask.array as da
 
-from ._base import Constants
 from ._nan_utils import restore_nan
 
 
@@ -186,11 +185,6 @@ def apply_global_normalization(block: cp.ndarray,
         nan_mask = cp.isnan(block)
 
     normalized = norm_func(block, stats, nan_mask)
-
-    # ガンマ補正（0-1の範囲の場合のみ）
-    valid_normalized = normalized[~nan_mask]
-    if len(valid_normalized) > 0 and cp.min(valid_normalized) >= 0 and cp.max(valid_normalized) <= 1:
-        normalized = cp.power(normalized, Constants.DEFAULT_GAMMA)
 
     # NaN位置を復元
     normalized = restore_nan(normalized, nan_mask)

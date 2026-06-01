@@ -57,6 +57,7 @@ linux = [
     "zarr>=2.18",
     "xarray>=2024.1",
     "rioxarray>=0.15",
+    "scipy>=1.7.0",
     "GPUtil>=1.4",
     "rmm-cu12>=25.6",
     "cudf-cu12>=25.6",

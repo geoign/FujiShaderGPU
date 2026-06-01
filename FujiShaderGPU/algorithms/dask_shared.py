@@ -139,7 +139,8 @@ from ._impl_curvature import compute_curvature_block, CurvatureAlgorithm
 
 # --- _impl_experimental.py ---
 from ._impl_experimental import (
-    compute_scale_space_surprise_block, ScaleSpaceSurpriseAlgorithm,
+    compute_scale_space_surprise_block, scale_space_surprise_stat_func,
+    ScaleSpaceSurpriseAlgorithm,
     compute_multi_light_uncertainty_block,
     compute_multi_light_uncertainty_spatial_block,
     MultiLightUncertaintyAlgorithm,

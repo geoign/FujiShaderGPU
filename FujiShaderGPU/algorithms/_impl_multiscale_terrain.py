@@ -11,6 +11,7 @@ import dask.array as da
 from ._base import Constants, DaskAlgorithm
 from ._nan_utils import handle_nan_with_gaussian, restore_nan
 from ._global_stats import determine_optimal_downsample_factor
+from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 
 
 class MultiscaleDaskAlgorithm(DaskAlgorithm):
@@ -58,18 +59,29 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                 meta=cp.empty((0, 0), dtype=cp.float32), scale=scale_small)
             results_small.append(detail_small)
 
-        combined_small = da.map_blocks(
-            create_weighted_combiner(weights), *results_small,
-            dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32)
-        ).compute()
-        valid_data = combined_small[~cp.isnan(combined_small)]
-        if len(valid_data) > 0:
-            norm_min = float(cp.percentile(valid_data, 5))
-            norm_max = float(cp.percentile(valid_data, 95))
+        stats = params.get('global_stats', None)
+        stats_ok = (
+            isinstance(stats, (tuple, list))
+            and len(stats) >= 2
+            and float(stats[1]) > 1e-9
+        )
+        if stats_ok:
+            norm_min, norm_scale = float(stats[0]), float(stats[1])
         else:
-            norm_min, norm_max = 0.0, 1.0
+            combined_small = da.map_blocks(
+                create_weighted_combiner(weights), *results_small,
+                dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32)
+            ).compute()
+            valid_data = combined_small[~cp.isnan(combined_small)]
+            if len(valid_data) > 0:
+                norm_min = float(cp.percentile(valid_data, 1))
+                norm_scale = float(cp.percentile(cp.maximum(valid_data - norm_min, 0.0), NORMAL_PERCENTILE))
+            else:
+                norm_min, norm_scale = 0.0, 1.0
+            if norm_scale <= 1e-9:
+                norm_scale = 1.0
         if params.get('verbose', False):
-            print(f"Multiscale Terrain global stats: min={norm_min:.3f}, max={norm_max:.3f}")
+            print(f"Multiscale Terrain global stats: min={norm_min:.3f}, p80_scale={norm_scale:.3f}")
         results = []
         for scale in scales:
             def compute_detail_with_smooth(block, *, scale):
@@ -91,11 +103,8 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             for i, block in enumerate(blocks):
                 valid = ~cp.isnan(block)
                 result[valid] += block[valid] * weights[i]
-            if norm_max > norm_min:
-                result = (result - norm_min) / (norm_max - norm_min)
-                result = cp.clip(result, 0, 1)
-            else:
-                result = cp.full_like(result, 0.5)
+            result = (result - norm_min) / norm_scale
+            result = cp.clip(result, 0, OVERFLOW_LIMIT)
             result = cp.power(result, Constants.DEFAULT_GAMMA)
             result[nan_mask] = cp.nan
             return result.astype(cp.float32)

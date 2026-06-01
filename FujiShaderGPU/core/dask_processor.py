@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 
+import numpy as np
 import psutil
 import rasterio
 from pathlib import Path
@@ -43,6 +44,7 @@ except ImportError:
 
 from ..algorithms.common.auto_params import determine_optimal_radii
 from ..io.raster_info import metric_pixel_scales_from_metadata
+from ..utils.nodata_handler import fill_enclosed_nodata_holes
 from ..config.auto_tune import compute_dask_chunk
 from .dask_cluster import make_cluster
 from .dask_io import (
@@ -124,6 +126,68 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
             return float(x_res), float(y_res), float(mean_m), False, None
         except Exception:
             return 1.0, 1.0, 1.0, False, None
+
+
+def _estimate_hole_fill_overlap(params: dict) -> int:
+    radii = params.get("radii")
+    if isinstance(radii, (list, tuple)) and radii:
+        try:
+            return int(max(16, min(512, max(int(r) for r in radii if int(r) > 0))))
+        except Exception:
+            return 64
+    return 64
+
+
+def _fill_enclosed_nodata_holes_block(
+    block: np.ndarray,
+    *,
+    max_holes_for_interpolation: int = 256,
+) -> np.ndarray:
+    arr = np.asarray(block, dtype=np.float32)
+    mask = np.isnan(arr)
+    if not np.any(mask):
+        return arr
+    filled, _remaining, _count = fill_enclosed_nodata_holes(
+        arr,
+        mask,
+        max_holes_for_interpolation=max_holes_for_interpolation,
+    )
+    return filled.astype(np.float32, copy=False)
+
+
+def _apply_spatial_dem_hole_fill(
+    dem: xr.DataArray,
+    *,
+    algorithm: str,
+    params: dict,
+) -> xr.DataArray:
+    mode = str(params.get("mode", "local")).lower()
+    if mode != "spatial" or not bool(params.get("fill_dem_holes", True)):
+        return dem
+
+    depth = _estimate_hole_fill_overlap(params)
+    max_holes = int(params.get("hole_fill_max_components", 256))
+    logger.info(
+        "Spatial DEM hole filling enabled: overlap=%dpx, sparse_threshold=%d holes/chunk",
+        depth,
+        max_holes,
+    )
+    filled_data = da.map_overlap(
+        _fill_enclosed_nodata_holes_block,
+        dem.data,
+        depth=depth,
+        boundary=np.nan,
+        trim=True,
+        dtype=np.float32,
+        max_holes_for_interpolation=max_holes,
+    )
+    return xr.DataArray(
+        filled_data,
+        dims=dem.dims,
+        coords=dem.coords,
+        attrs=dem.attrs,
+        name=dem.name or algorithm.upper(),
+    )
 
 ###############################################################################
 # 1. Dask-CUDA クラスタ
@@ -253,6 +317,7 @@ def _ensure_cog_has_overviews(dst: Path, cog_options: dict):
 
 def _build_zstd_overviews(path: Path, cog_options: dict):
     """Build internal ZSTD-compressed overviews on a temporary GeoTIFF."""
+    logger.info("Building ZSTD-compressed overviews: %s", path)
     previous_options = {
         "COMPRESS_OVERVIEW": gdal.GetConfigOption("COMPRESS_OVERVIEW"),
         "ZLEVEL_OVERVIEW": gdal.GetConfigOption("ZLEVEL_OVERVIEW"),
@@ -653,6 +718,7 @@ def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
 
     _build_zstd_overviews(src, cog_options)
     _assert_has_overviews(src)
+    logger.info("Converting overview-backed temporary TIFF to COG: %s", dst)
 
     translate_options = [
         f"COMPRESS={cog_options.get('COMPRESS', 'ZSTD')}",
@@ -753,14 +819,7 @@ def run_pipeline(
         
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
-        
-        # 6-2) CuPy 配列へ変換（改善：メタデータ指定）
-        gpu_arr: da.Array = dem.data.map_blocks(
-            cp.asarray, 
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32)
-        )
-        
+
         # アルゴリズム固有のデフォルトパラメータを取得
         default_params = algo.get_default_params()
 
@@ -771,6 +830,21 @@ def run_pipeline(
             'show_progress': show_progress,
             'agg': agg
         }
+
+        dem = _apply_spatial_dem_hole_fill(
+            dem,
+            algorithm=algorithm,
+            params=params,
+        )
+        params.pop("fill_dem_holes", None)
+        params.pop("hole_fill_max_components", None)
+
+        # 6-2) CuPy 配列へ変換（改善：メタデータ指定）
+        gpu_arr: da.Array = dem.data.map_blocks(
+            cp.asarray,
+            dtype=cp.float32,
+            meta=cp.empty((0, 0), dtype=cp.float32)
+        )
 
         # Inject anisotropic pixel scales (simple geographic DEM support).
         px_m_x, px_m_y, pixel_size_m, is_geo, lat_center = _detect_metric_scales_from_dataarray(dem)
@@ -896,18 +970,43 @@ def run_pipeline(
                 "unit": unit,
                 "data_type": "float32"
             }
-        elif algorithm in ['lrm', 'rvi']:
-            # LRM、RVIは-1から+1
+        elif algorithm in ['lrm', 'rvi', 'fractal_anomaly']:
+            # Signed terrain anomaly outputs map p80(abs(value)) to +/-1,
+            # with overflow preserved for strong extrema.
             attrs = {
                 **dem.attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
-                "value_range": "-1 to +1",
+                "value_range": "-1.5 to +1.5",
+                "normal_range": "-1 to +1",
+                "normal_percentile": "80",
+                "data_type": "float32"
+            }
+        elif algorithm in [
+            'atmospheric_scattering',
+            'multiscale_terrain',
+            'curvature',
+            'visual_saliency',
+            'ambient_occlusion',
+            'openness',
+            'scale_space_surprise',
+            'multi_light_uncertainty',
+        ]:
+            # Unsigned analysis outputs map p80(value) to +1,
+            # with overflow preserved for strong extrema.
+            attrs = {
+                **dem.attrs,
+                "algorithm": algorithm,
+                "parameters": str(params),
+                "processing": f"Dask-CUDA {algorithm.upper()}",
+                "value_range": "0 to 1.5",
+                "normal_range": "0 to 1",
+                "normal_percentile": "80",
                 "data_type": "float32"
             }
         else:
-            # その他は0から1
+            # Display/stylized outputs keep their native display range.
             attrs = {
                 **dem.attrs,
                 "algorithm": algorithm,

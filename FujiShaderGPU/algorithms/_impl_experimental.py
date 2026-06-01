@@ -12,10 +12,12 @@ import cupy as cp
 import dask.array as da
 
 from ._base import DaskAlgorithm
+from ._global_stats import compute_global_stats
 from ._nan_utils import (
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
     _smooth_for_radius,
 )
+from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 from .common.kernels import (
     scale_space_surprise as kernel_scale_space_surprise,
     multi_light_uncertainty as kernel_multi_light_uncertainty,
@@ -26,12 +28,35 @@ from .common.kernels import (
 ###############################################################################
 
 def compute_scale_space_surprise_block(block, *, scales, enhancement=2.0,
-                                      normalize=True):
+                                      normalize=True, norm_min=None, norm_scale=None):
     """Scale-Space Surprise Map: スケール間での特徴変化量を強調"""
     nan_mask = cp.isnan(block)
-    return kernel_scale_space_surprise(
+    surprise = kernel_scale_space_surprise(
         block, scales=scales, enhancement=enhancement,
-        normalize=normalize, nan_mask=nan_mask)
+        normalize=False, nan_mask=nan_mask)
+    if normalize:
+        if norm_scale is None:
+            _min, _scale = scale_space_surprise_stat_func(surprise)
+            norm_min = _min if norm_min is None else norm_min
+            norm_scale = _scale
+        scale = float(norm_scale)
+        if scale > 1e-9:
+            offset = 0.0 if norm_min is None else float(norm_min)
+            surprise = cp.clip((surprise - offset) / scale, 0, OVERFLOW_LIMIT)
+            surprise = cp.power(surprise, 1.0 / max(1e-3, enhancement))
+        else:
+            surprise = cp.zeros_like(surprise)
+        surprise = cp.where(nan_mask, cp.nan, surprise)
+    return surprise.astype(cp.float32)
+
+
+def scale_space_surprise_stat_func(data):
+    """Global unsigned scale: p80 maps to +1."""
+    valid_data = data[~cp.isnan(data)]
+    if valid_data.size == 0:
+        return (0.0, 1.0)
+    scale = float(cp.percentile(cp.maximum(valid_data, 0.0), NORMAL_PERCENTILE))
+    return (0.0, scale if scale > 1e-9 else 1.0)
 
 
 class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
@@ -40,11 +65,26 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
         enhancement = float(params.get('enhancement', 2.0))
         normalize = bool(params.get('normalize', True))
         depth = int(max(1, cp.ceil(max(scales) * 3).item())) + 1
+        stats = params.get('global_stats', None)
+        stats_ok = isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9
+        if normalize and not stats_ok:
+            stats = compute_global_stats(
+                gpu_arr,
+                scale_space_surprise_stat_func,
+                compute_scale_space_surprise_block,
+                {'scales': scales, 'enhancement': enhancement, 'normalize': False},
+                downsample_factor=params.get('downsample_factor', None),
+                depth=depth,
+                algorithm_name='scale_space_surprise',
+            )
+        if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):
+            stats = (0.0, 1.0)
         return gpu_arr.map_overlap(
             compute_scale_space_surprise_block, depth=depth,
             boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            scales=scales, enhancement=enhancement, normalize=normalize)
+            scales=scales, enhancement=enhancement, normalize=normalize,
+            norm_min=stats[0], norm_scale=stats[1])
 
     def get_default_params(self):
         return {
@@ -128,7 +168,8 @@ class MultiLightUncertaintyAlgorithm(DaskAlgorithm):
 
 
 __all__ = [
-    "compute_scale_space_surprise_block", "ScaleSpaceSurpriseAlgorithm",
+    "compute_scale_space_surprise_block", "scale_space_surprise_stat_func",
+    "ScaleSpaceSurpriseAlgorithm",
     "compute_multi_light_uncertainty_block",
     "compute_multi_light_uncertainty_spatial_block",
     "MultiLightUncertaintyAlgorithm",
