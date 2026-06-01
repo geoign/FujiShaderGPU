@@ -11,7 +11,6 @@ import dask.array as da
 
 from ._base import Constants, DaskAlgorithm
 from ._nan_utils import handle_nan_with_gaussian, restore_nan
-from ._global_stats import determine_optimal_downsample_factor
 from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 
 logger = logging.getLogger(__name__)
@@ -22,45 +21,12 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr, **params):
         scales = params.get('scales', [1, 10, 50, 100])
         weights = params.get('weights', None)
-        downsample_factor = params.get('downsample_factor', None)
-        if downsample_factor is None:
-            downsample_factor = determine_optimal_downsample_factor(
-                gpu_arr.shape, algorithm_name='multiscale_terrain')
         if weights is None:
             weights = [1.0 / s for s in scales]
         weights = cp.array(weights, dtype=cp.float32)
         weights = weights / weights.sum()
         max_scale = max(scales)
         common_depth = min(int(4 * max_scale), Constants.MAX_DEPTH)
-        downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
-        results_small = []
-        max_scale_small = max([max(1, s // downsample_factor) for s in scales])
-        common_depth_small = min(int(4 * max_scale_small), Constants.MAX_DEPTH)
-
-        def create_weighted_combiner(weights):
-            def weighted_combine_for_stats(*blocks):
-                nan_mask = cp.isnan(blocks[0])
-                result = cp.zeros_like(blocks[0])
-                for i, block in enumerate(blocks):
-                    valid = ~cp.isnan(block)
-                    result[valid] += block[valid] * weights[i]
-                result[nan_mask] = cp.nan
-                return result
-            return weighted_combine_for_stats
-
-        for i, scale in enumerate(scales):
-            scale_small = max(1, scale // downsample_factor)
-            def compute_detail_small(block, *, scale):
-                smoothed, nan_mask = handle_nan_with_gaussian(
-                    block, sigma=max(scale, 0.5), mode='nearest')
-                detail = block - smoothed
-                detail = restore_nan(detail, nan_mask)
-                return detail
-            detail_small = downsampled.map_overlap(
-                compute_detail_small, depth=common_depth_small,
-                boundary='reflect', dtype=cp.float32,
-                meta=cp.empty((0, 0), dtype=cp.float32), scale=scale_small)
-            results_small.append(detail_small)
 
         stats = params.get('global_stats', None)
         stats_ok = (
@@ -71,12 +37,32 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         if stats_ok:
             norm_min, norm_scale = float(stats[0]), float(stats[1])
         else:
-            combined_small = da.map_blocks(
-                create_weighted_combiner(weights), *results_small,
-                dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32)
-            ).compute()
+            # Estimate global normalization from a bounded central crop computed
+            # at full resolution.  Striding the full array (gpu_arr[::n, ::n])
+            # would force every chunk -- the entire dataset -- to be read and
+            # copied to the GPU before any write progress is visible, stalling on
+            # very large rasters.  A contiguous window only reads the chunks it
+            # overlaps and uses the same scales as the final output.
+            h, w = gpu_arr.shape
+            win = int(min(int(h), int(w), max(4096, int(common_depth) * 4)))
+            win = max(256, win)
+            y0 = max(0, (int(h) - win) // 2)
+            x0 = max(0, (int(w) - win) // 2)
+            y1 = min(int(h), y0 + win)
+            x1 = min(int(w), x0 + win)
+
+            sample_block = gpu_arr[y0:y1, x0:x1].compute()
+            nan_mask_s = cp.isnan(sample_block)
+            combined_small = cp.zeros_like(sample_block, dtype=cp.float32)
+            for i, scale in enumerate(scales):
+                smoothed_s, _ = handle_nan_with_gaussian(
+                    sample_block, sigma=max(float(scale), 0.5), mode='nearest')
+                detail_s = sample_block - smoothed_s
+                valid_s = ~cp.isnan(detail_s)
+                combined_small[valid_s] += detail_s[valid_s] * float(weights[i])
+            combined_small[nan_mask_s] = cp.nan
             valid_data = combined_small[~cp.isnan(combined_small)]
-            if len(valid_data) > 0:
+            if valid_data.size > 0:
                 norm_min = float(cp.percentile(valid_data, 1))
                 norm_scale = float(cp.percentile(cp.maximum(valid_data - norm_min, 0.0), NORMAL_PERCENTILE))
             else:

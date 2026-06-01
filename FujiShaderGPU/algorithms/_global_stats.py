@@ -86,11 +86,18 @@ def compute_global_stats(gpu_arr: da.Array,
                         stat_func: callable,
                         algorithm_func: callable,
                         algorithm_params: dict,
-                        downsample_factor: int = None,  # Noneの場合は自動決定
+                        downsample_factor: int = None,  # 後方互換のため保持（未使用）
                         depth: int = None,
                         algorithm_name: str = None) -> Tuple[Any, ...]:
     """
-    ダウンサンプリングしたデータで統計量を計算する共通関数。
+    境界付き中央クロップ上でアルゴリズムを実行し統計量を計算する共通関数。
+
+    フル解像度配列をストライドスライス（``gpu_arr[::n, ::n]``）すると、間引きの
+    ために全チャンク＝データセット全体が読み込まれGPUへ転送され、書き込み進捗が
+    出る前に巨大ラスタで停止してしまう。連続した中央ウィンドウを読むことで、重なる
+    チャンクのみを実体化し、小さく有界なコストでグローバルスケールを推定する。
+    アルゴリズムはそのウィンドウ上でフル解像度のブロック関数として直接実行するため、
+    スケール系パラメータの縮小は不要。
 
     Parameters:
     -----------
@@ -99,59 +106,34 @@ def compute_global_stats(gpu_arr: da.Array,
     stat_func : callable
         統計量を計算する関数。CuPy配列を受け取り、統計量のタプルを返す
     algorithm_func : callable
-        アルゴリズムの処理関数（正規化なしバージョン）
+        アルゴリズムの処理関数（正規化なしバージョン、ブロック関数）
     algorithm_params : dict
         アルゴリズムのパラメータ
-    downsample_factor : int
-        ダウンサンプリング係数
     depth : int
-        map_overlapのdepth（Noneの場合は自動計算）
+        アルゴリズムのハロー幅（中央ウィンドウサイズの目安に使用）
 
     Returns:
     --------
     統計量のタプル
     """
-    # downsample_factorが指定されていない場合は自動決定
-    if downsample_factor is None:
-        downsample_factor = determine_optimal_downsample_factor(
-            gpu_arr.shape,
-            algorithm_name=algorithm_name
-        )
+    h, w = gpu_arr.shape
+    halo = int(depth) if depth else 1
+    # ウィンドウはアルゴリズムのフットプリントを十分含みつつ、フルラスタサイズに
+    # かかわらず有界に保つ。
+    win = int(min(int(h), int(w), max(4096, halo * 4)))
+    win = max(256, win)
+    y0 = max(0, (int(h) - win) // 2)
+    x0 = max(0, (int(w) - win) // 2)
+    y1 = min(int(h), y0 + win)
+    x1 = min(int(w), x0 + win)
 
-    # ダウンサンプリング
-    downsampled = gpu_arr[::downsample_factor, ::downsample_factor]
+    sample_block = gpu_arr[y0:y1, x0:x1].compute()
+    if getattr(sample_block, "size", 0) == 0:
+        return stat_func(cp.zeros((1, 1), dtype=cp.float32))
 
-    # depthの調整
-    if depth is not None:
-        depth_small = max(1, depth // downsample_factor)
-    else:
-        depth_small = 1
-
-    # ダウンサンプル版でアルゴリズムを実行（正規化なし）
-    params_small = algorithm_params.copy()
-
-    # スケール系パラメータの調整が必要な場合
-    for key in ['scale', 'sigma', 'radius', 'radii', 'kernel_size']:
-        if key in params_small and params_small[key] is not None:
-            if isinstance(params_small[key], (list, tuple)):
-                if key in ['radius', 'radii', 'kernel_size']:
-                    params_small[key] = [max(1, int(s/downsample_factor)) for s in params_small[key]]
-                else:
-                    params_small[key] = [max(1, s/downsample_factor) for s in params_small[key]]
-            else:
-                if key in ['radius', 'radii', 'kernel_size']:
-                    params_small[key] = max(1, int(params_small[key]/downsample_factor))
-                else:
-                    params_small[key] = max(1, params_small[key]/downsample_factor)
-
-    result_small = downsampled.map_overlap(
-        algorithm_func,
-        depth=depth_small,
-        boundary='reflect',
-        dtype=cp.float32,
-        meta=cp.empty((0, 0), dtype=cp.float32),
-        **params_small
-    ).compute()
+    result_small = algorithm_func(
+        sample_block.astype(cp.float32, copy=False), **algorithm_params
+    )
 
     # 統計量を計算
     stats = stat_func(result_small)

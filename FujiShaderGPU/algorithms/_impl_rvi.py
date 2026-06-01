@@ -164,62 +164,45 @@ def compute_rvi_input_sample_stats(
     weights: Optional[List[float]] = None,
     pixel_size: float = 1.0,
 ) -> tuple:
-    """Estimate RVI scale from coarse DEM samples without full-resolution overlap.
+    """Estimate RVI scale from a bounded central crop of the DEM.
 
-    Computing stats from the full RVI Dask graph is accurate but expensive for
-    huge rasters and large radii because it materializes map_overlap halos before
-    any write progress is visible.  A coarse DEM sample with radii scaled into
-    the sampled grid gives a stable global scale at a small fraction of the cost.
+    A strided sample of the full-resolution Dask array (``gpu_arr[::n, ::n]``)
+    looks cheap but forces *every* chunk -- i.e. the entire dataset -- to be read
+    from disk and copied to the GPU before any write progress is visible, which
+    stalls on very large rasters.  Reading a single contiguous central window
+    only materializes the few chunks overlapping that window, giving a stable
+    global scale at a tiny, bounded cost.  ``compute_rvi_efficient_block`` already
+    downsamples large radii internally, so the original radii are used as-is.
     """
-    downsample_factor = determine_optimal_downsample_factor(
-        gpu_arr.shape,
-        algorithm_name="rvi",
-        target_pixels=2_000_000,
-        min_factor=16,
-        max_factor=512,
-    )
-    downsample_factor = int(max(1, downsample_factor))
-    scaled_radii = [
-        max(1, int(round(float(radius) / downsample_factor)))
-        for radius in radii
-    ]
-    sample_pixel_size = float(pixel_size) * downsample_factor
-
-    offsets = [(0, 0)]
-    if downsample_factor > 1:
-        half = downsample_factor // 2
-        offsets.extend([(0, half), (half, 0), (half, half)])
+    h, w = gpu_arr.shape
+    max_radius = max((int(r) for r in radii), default=1)
+    # Window must comfortably contain the largest radius footprint while staying
+    # bounded regardless of the full raster size.
+    win = int(min(int(h), int(w), max(4096, max_radius * 4)))
+    win = max(256, win)
+    y0 = max(0, (int(h) - win) // 2)
+    x0 = max(0, (int(w) - win) // 2)
+    y1 = min(int(h), y0 + win)
+    x1 = min(int(w), x0 + win)
 
     logger.info(
-        "Estimating RVI global stats from DEM samples: downsample=%dx, radii=%s -> %s",
-        downsample_factor,
+        "Estimating RVI global stats from central %dx%d window (radii=%s)",
+        x1 - x0,
+        y1 - y0,
         list(radii),
-        scaled_radii,
     )
 
-    samples = [
-        gpu_arr[oy::downsample_factor, ox::downsample_factor]
-        for oy, ox in offsets
-    ]
-    computed_samples = dask.compute(*samples)
-
-    rvi_samples = []
-    for sample in computed_samples:
-        if getattr(sample, "size", 0) == 0:
-            continue
-        rvi_sample = compute_rvi_efficient_block(
-            sample.astype(cp.float32, copy=False),
-            radii=scaled_radii,
-            weights=weights,
-            pixel_size=sample_pixel_size,
-        )
-        rvi_samples.append(rvi_sample.ravel())
-
-    if not rvi_samples:
+    sample = gpu_arr[y0:y1, x0:x1].compute()
+    if getattr(sample, "size", 0) == 0:
         return (1.0,)
 
-    sample_rvi = cp.concatenate(rvi_samples) if len(rvi_samples) > 1 else rvi_samples[0]
-    stats = rvi_stat_func(sample_rvi)
+    rvi_sample = compute_rvi_efficient_block(
+        sample.astype(cp.float32, copy=False),
+        radii=[max(1, int(r)) for r in radii],
+        weights=weights,
+        pixel_size=float(pixel_size),
+    )
+    stats = rvi_stat_func(rvi_sample)
     logger.info("RVI global normalization stats estimated: abs_p80=%.6f", float(stats[0]))
     return stats
 

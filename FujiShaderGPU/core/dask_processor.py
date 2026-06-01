@@ -756,6 +756,84 @@ def validate_inputs(src_cog: str):
         raise FileNotFoundError(f"Input file not found: {src_cog}")
 
 
+def _compute_rvi_global_stats_from_overview(
+    src_cog: str,
+    *,
+    radii: List[int],
+    weights: Optional[List[float]],
+    pixel_size: float,
+    sample_max: int = 2048,
+) -> Optional[tuple]:
+    """Estimate the RVI normalization scale from a decimated overview read.
+
+    Striding the full-resolution Dask array forces every chunk (the entire
+    dataset) to be read and copied to the GPU before any write progress is
+    visible, which stalls on very large rasters.  A decimated rasterio read uses
+    the COG overview pyramid and returns a representative full-extent sample at a
+    tiny fraction of the cost -- mirroring the tile backend's strategy.
+    """
+    try:
+        from ..algorithms._impl_rvi import compute_rvi_efficient_block
+        from ..algorithms._normalization import rvi_stat_func
+        from rasterio.enums import Resampling
+    except Exception as exc:
+        logger.warning("RVI overview stats helpers unavailable: %s", exc)
+        return None
+
+    if not radii:
+        return None
+
+    try:
+        with rasterio.open(src_cog) as src:
+            scale = max(src.width / sample_max, src.height / sample_max, 1.0)
+            sample_w = max(128, int(src.width / scale))
+            sample_h = max(128, int(src.height / scale))
+            sample_ma = src.read(
+                1,
+                out_shape=(sample_h, sample_w),
+                resampling=Resampling.nearest,
+                out_dtype=np.float32,
+                masked=True,
+            )
+            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
+            nodata = src.nodata
+
+        if nodata is not None and not np.isnan(float(nodata)):
+            sample = np.where(
+                np.isclose(sample, float(nodata), rtol=0.0, atol=1e-6),
+                np.nan,
+                sample,
+            ).astype(np.float32, copy=False)
+
+        sample_pixel_size = float(pixel_size) * float(scale)
+        scaled_radii = [max(1, int(round(float(r) / scale))) for r in radii]
+
+        sample_gpu = cp.asarray(sample, dtype=cp.float32)
+        rvi_sample = compute_rvi_efficient_block(
+            sample_gpu,
+            radii=scaled_radii,
+            weights=weights,
+            pixel_size=sample_pixel_size,
+        )
+        stats = rvi_stat_func(rvi_sample)
+        if not stats or not np.isfinite(float(stats[0])) or float(stats[0]) <= 1e-9:
+            return None
+        logger.info(
+            "RVI global stats from overview: decimation=%.1fx, radii=%s -> %s, abs_p80=%.6f",
+            scale,
+            list(radii),
+            scaled_radii,
+            float(stats[0]),
+        )
+        return stats
+    except Exception as exc:
+        logger.warning(
+            "Failed to compute RVI overview stats; falling back to window sampling: %s",
+            exc,
+        )
+        return None
+
+
 
 
 def run_pipeline(
@@ -913,7 +991,24 @@ def run_pipeline(
         if algorithm != "rvi" and radii is not None:
             params['radii'] = radii
             logger.info(f"Setting radii for {algorithm}: {radii}")
-        
+
+        # RVI: derive the global normalization scale from a fast decimated
+        # overview read instead of striding the full-resolution array (which
+        # would read the entire dataset before any write progress is visible).
+        if (
+            algorithm == "rvi"
+            and "global_stats" not in params
+            and not is_zarr_path(src_cog)
+        ):
+            rvi_global_stats = _compute_rvi_global_stats_from_overview(
+                src_cog,
+                radii=params.get("radii"),
+                weights=params.get("weights"),
+                pixel_size=float(params.get("pixel_size", 1.0)),
+            )
+            if rvi_global_stats is not None:
+                params["global_stats"] = rvi_global_stats
+
         # 6-3) アルゴリズム実行（run_pipeline内）
         logger.info(f"Computing {algorithm} with parameters: {params}")
 
