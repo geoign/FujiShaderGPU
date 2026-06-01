@@ -598,61 +598,84 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                                 cp.get_default_memory_pool().free_all_blocks()
                             pbar.update(1)
                 
-            # VRTで統合してCOGに変換
+            # VRTで統合 -> 単一中間GeoTIFF -> オーバービュー -> COG
             if not chunk_files:
                 raise ValueError("No chunks were successfully processed")
-                
+
             logger.info(f"Creating VRT from {len(chunk_files)} chunks...")
             vrt_file = Path(tmpdir) / "merged.vrt"
             gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
-            
-            # COGに変換
-            logger.info("Converting to COG format...")
-            
+
             # GDALの進捗コールバック
-            pbar = tqdm(total=100, desc="COG conversion", unit="%")
+            pbar = tqdm(total=100, desc="Consolidating", unit="%")
             def gdal_progress_callback(complete, _message, _cb_data):
                 pbar.n = int(complete * 100)
                 pbar.refresh()
                 if complete >= 1.0:
                     pbar.close()
                 return 1
-            
-            if use_cog_driver:
-                result = gdal.Translate(
-                    str(dst),
-                    str(vrt_file),
-                    format="COG",
-                    creationOptions=list(f"{k}={v}" for k, v in cog_options.items()),
-                    callback=gdal_progress_callback
-                )
-                if result is None:
-                    raise ValueError("COG conversion failed")
-                result = None
-                _ensure_cog_has_overviews(dst, cog_options)
-            else:
-                tmp_tif = Path(tmpdir) / "merged_tmp.tif"
-                result = gdal.Translate(
-                    str(tmp_tif),
-                    str(vrt_file),
-                    format="GTiff",
-                    creationOptions=[
-                        "TILED=YES",
-                        "BLOCKXSIZE=512",
-                        "BLOCKYSIZE=512",
-                        "COMPRESS=ZSTD",
-                        f"ZLEVEL={cog_options.get('LEVEL', '1')}",
-                        "BIGTIFF=YES",
-                        "NUM_THREADS=ALL_CPUS",
-                    ],
-                    callback=gdal_progress_callback
-                )
-                if result is None:
-                    raise ValueError("Temporary GeoTIFF conversion failed")
-                result = None
-                build_cog_with_overviews(tmp_tif, dst, cog_options)
-            
-            logger.info(f"Successfully created COG from {len(chunk_files)} chunks")
+
+            # ディスク占有削減: チャンク群を1枚の中間GeoTIFFへ統合してから、
+            # オーバービュー生成・COG変換の前にチャンク(=フル解像度1コピー分)と
+            # VRTを解放する。こうしないと「チャンク + 中間 + 最終COG」の3つの巨大
+            # コピーが同一ディスク上に同時存在し、ピークが ~3.66x に膨らむ
+            # (VRTを直接COG化してもドライバが内部一時ファイルを作るため同じ)。
+            # 統合後にチャンクを消すことでピークを ~2.66x に抑える。
+            merged_tif = Path(tmpdir) / "merged_tmp.tif"
+            logger.info("Consolidating %d chunks into single GeoTIFF: %s",
+                        len(chunk_files), merged_tif)
+            consolidate_options = [
+                "TILED=YES",
+                "BLOCKXSIZE=512",
+                "BLOCKYSIZE=512",
+                "COMPRESS=ZSTD",
+                f"ZLEVEL={cog_options.get('LEVEL', '1')}",
+                "BIGTIFF=YES",
+                "NUM_THREADS=ALL_CPUS",
+            ]
+            if 'PREDICTOR' in cog_options:
+                consolidate_options.append(f"PREDICTOR={cog_options['PREDICTOR']}")
+
+            result = gdal.Translate(
+                str(merged_tif),
+                str(vrt_file),
+                format="GTiff",
+                creationOptions=consolidate_options,
+                callback=gdal_progress_callback,
+            )
+            if result is None:
+                raise ValueError("Chunk consolidation failed")
+            result = None
+
+            # フル解像度データは merged_tmp.tif に揃ったので、チャンクとVRTを
+            # 即座に削除してディスクを解放してから重い後段(オーバービュー+COG)へ進む。
+            freed = 0
+            for f in chunk_files:
+                try:
+                    freed += f.stat().st_size
+                    f.unlink()
+                except OSError:
+                    pass
+            try:
+                vrt_file.unlink()
+            except OSError:
+                pass
+            n_done = len(chunk_files)
+            chunk_files.clear()
+            logger.info("Freed %s of chunk staging before COG build",
+                        _format_gib(freed))
+
+            # 単一GeoTIFF -> in-placeオーバービュー -> COG(FORCE_USE_EXISTING)
+            logger.info("Converting consolidated GeoTIFF to COG format...")
+            build_cog_with_overviews(merged_tif, dst, cog_options)
+
+            # 中間GeoTIFFも解放(TemporaryDirectoryの後始末を待たずに最終出力分の余裕を確保)
+            try:
+                merged_tif.unlink()
+            except OSError:
+                pass
+
+            logger.info(f"Successfully created COG from {n_done} chunks")
 
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """COG書き出し（メモリ容量に応じて自動選択）"""
