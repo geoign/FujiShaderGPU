@@ -44,7 +44,6 @@ except ImportError:
 
 from ..algorithms.common.auto_params import determine_optimal_radii
 from ..io.raster_info import metric_pixel_scales_from_metadata
-from ..utils.nodata_handler import fill_enclosed_nodata_holes
 from ..config.auto_tune import compute_dask_chunk
 from .dask_cluster import make_cluster
 from .dask_io import (
@@ -112,8 +111,10 @@ def _log_overview_availability(src_cog: str) -> None:
             logger.info("Input overviews available: %s (used for decimated sampling)", ov)
         else:
             logger.warning(
-                "Input COG has no overviews; decimated stat/sampling reads will be slower. "
-                "Consider pre-building them: gdaladdo -r average %s 2 4 8 16 32 64 128 256",
+                "Input has no overviews; decimated stat/sampling reads will be slow. "
+                "FujiShaderGPU expects an overview-bearing COG -- pre-process the input first:\n"
+                "    python -m FujiShaderGPU.prepare %s prepared_cog.tif\n"
+                "then run the pipeline on 'prepared_cog.tif'.",
                 src_cog,
             )
     except Exception as exc:
@@ -186,67 +187,6 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
         except Exception:
             return 1.0, 1.0, 1.0, False, None
 
-
-def _estimate_hole_fill_overlap(params: dict) -> int:
-    radii = params.get("radii")
-    if isinstance(radii, (list, tuple)) and radii:
-        try:
-            return int(max(16, min(512, max(int(r) for r in radii if int(r) > 0))))
-        except Exception:
-            return 64
-    return 64
-
-
-def _fill_enclosed_nodata_holes_block(
-    block: np.ndarray,
-    *,
-    max_holes_for_interpolation: int = 256,
-) -> np.ndarray:
-    arr = np.asarray(block, dtype=np.float32)
-    mask = np.isnan(arr)
-    if not np.any(mask):
-        return arr
-    filled, _remaining, _count = fill_enclosed_nodata_holes(
-        arr,
-        mask,
-        max_holes_for_interpolation=max_holes_for_interpolation,
-    )
-    return filled.astype(np.float32, copy=False)
-
-
-def _apply_spatial_dem_hole_fill(
-    dem: xr.DataArray,
-    *,
-    algorithm: str,
-    params: dict,
-) -> xr.DataArray:
-    mode = str(params.get("mode", "local")).lower()
-    if mode != "spatial" or not bool(params.get("fill_dem_holes", True)):
-        return dem
-
-    depth = _estimate_hole_fill_overlap(params)
-    max_holes = int(params.get("hole_fill_max_components", 256))
-    logger.info(
-        "Spatial DEM hole filling enabled: overlap=%dpx, sparse_threshold=%d holes/chunk",
-        depth,
-        max_holes,
-    )
-    filled_data = da.map_overlap(
-        _fill_enclosed_nodata_holes_block,
-        dem.data,
-        depth=depth,
-        boundary=np.nan,
-        trim=True,
-        dtype=np.float32,
-        max_holes_for_interpolation=max_holes,
-    )
-    return xr.DataArray(
-        filled_data,
-        dims=dem.dims,
-        coords=dem.coords,
-        attrs=dem.attrs,
-        name=dem.name or algorithm.upper(),
-    )
 
 ###############################################################################
 # 1. Dask-CUDA クラスタ
@@ -1020,13 +960,8 @@ def run_pipeline(
             'agg': agg
         }
 
-        dem = _apply_spatial_dem_hole_fill(
-            dem,
-            algorithm=algorithm,
-            params=params,
-        )
-        params.pop("fill_dem_holes", None)
-        params.pop("hole_fill_max_components", None)
+        # NoData void filling is owned by the preprocessing command
+        # (`python -m FujiShaderGPU.prepare`); the pipeline no longer fills holes.
 
         # 6-2) CuPy 配列へ変換（改善：メタデータ指定）
         gpu_arr: da.Array = dem.data.map_blocks(

@@ -95,19 +95,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         )
 
         parser.add_argument(
-            "--no-fill-dem-holes",
-            action="store_true",
-            help="spatialモードでの内陸NoData穴埋めを無効化"
-        )
-
-        parser.add_argument(
-            "--hole-fill-max-components",
-            type=int,
-            default=256,
-            help="個別内挿で処理する穴数の上限/chunk (default: 256)。超過時は低解像度平滑補間"
-        )
-        
-        parser.add_argument(
             "--auto-radii",
             action="store_true",
             default=True,
@@ -684,8 +671,6 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         }
         if args.algorithm in spatial_mode_algorithms:
             algo_params['mode'] = getattr(args, 'mode', 'local')
-            algo_params['fill_dem_holes'] = not getattr(args, 'no_fill_dem_holes', False)
-            algo_params['hole_fill_max_components'] = getattr(args, 'hole_fill_max_components', 256)
             if args.algorithm != "rvi" and getattr(args, 'radii_list', None):
                 algo_params['radii'] = args.radii_list
             if args.algorithm != "rvi" and getattr(args, 'weights_list', None):

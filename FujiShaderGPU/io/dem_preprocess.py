@@ -1,0 +1,339 @@
+"""DEM preprocessing: convert any GDAL raster to a FujiShaderGPU-ready COG.
+
+This module turns an arbitrary GDAL-readable raster into a Cloud Optimized
+GeoTIFF (ZSTD + internal overviews, float32) that the FujiShaderGPU pipeline
+expects, optionally filling NoData voids during the conversion.
+
+NoData fill is intentionally a **low-frequency** operation: the value inside a
+void is best estimated by a smooth surface derived from the surrounding terrain.
+We therefore fill on a coarse overview grid (a few thousand pixels) -- where
+edge-connectivity and interpolation are effectively free -- and bilinearly
+upsample that surface to fill the full-resolution voids while streaming the
+output.  This keeps the cost almost independent of the full raster size.
+
+Fill modes
+----------
+- ``none``      : no filling; NoData is preserved.
+- ``enclosed``  : fill only interior voids (NoData *not* connected to the raster
+                  border).  Border-connected NoData (e.g. ocean / dataset
+                  exterior) is kept as NoData.  **Default.**
+- ``all``       : fill every NoData cell, including border-connected regions, and
+                  emit a fully dense raster with no NoData (useful for 3D model
+                  generation where NaN/NoData is not allowed).  Note that filling
+                  large exterior regions is a coarse extrapolation.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.windows import Window
+from osgeo import gdal
+
+from ..utils.nodata_handler import _edge_connected_mask
+
+logger = logging.getLogger(__name__)
+
+FILL_MODES = ("none", "enclosed", "all")
+
+
+# ---------------------------------------------------------------------------
+# Coarse-grid fill (the expensive work happens here, on a small array)
+# ---------------------------------------------------------------------------
+def _fill_coarse_surface(coarse: np.ndarray, valid: np.ndarray) -> np.ndarray:
+    """Return a fully-valued smooth surface over a small coarse grid.
+
+    Valid cells are preserved exactly; invalid cells receive a valid-weighted
+    Gaussian estimate (smooth), falling back to the nearest valid value where the
+    Gaussian support does not reach (e.g. the middle of a very large void).
+    """
+    from scipy.ndimage import distance_transform_edt, gaussian_filter
+
+    out = coarse.astype(np.float32, copy=True)
+    if valid.all():
+        return out
+    if not valid.any():
+        # No reference data at all; nothing meaningful to fill with.
+        return np.zeros_like(out, dtype=np.float32)
+
+    # Nearest valid value for every cell (guarantees a finite value everywhere).
+    nearest_idx = distance_transform_edt(
+        ~valid, return_distances=False, return_indices=True
+    )
+    nearest = out[tuple(nearest_idx)]
+
+    # Valid-weighted Gaussian smoothing removes nearest-neighbour (Voronoi) seams
+    # in the filled region while keeping valid cells exact.
+    sigma = float(max(1.0, min(coarse.shape) / 64.0))
+    weights = valid.astype(np.float32)
+    sv = gaussian_filter(np.where(valid, coarse, 0.0).astype(np.float32), sigma, mode="nearest")
+    sw = gaussian_filter(weights, sigma, mode="nearest")
+    smooth = np.where(sw > 1e-6, sv / np.maximum(sw, 1e-6), nearest)
+
+    out = np.where(valid, coarse, smooth).astype(np.float32)
+    out = np.where(np.isfinite(out), out, nearest).astype(np.float32)
+    return out
+
+
+def _coarse_shape(width: int, height: int, coarse_max: int) -> tuple[int, int]:
+    scale = max(width / coarse_max, height / coarse_max, 1.0)
+    cw = max(1, int(round(width / scale)))
+    ch = max(1, int(round(height / scale)))
+    return ch, cw
+
+
+def _band_height(width: int, target_pixels: int = 16_000_000) -> int:
+    """Rows per streaming band.
+
+    Bounded by a pixel budget rather than bytes: filling builds float64
+    coordinate grids (2x) for ``map_coordinates`` on top of the float32 data, so
+    a full-width band of ``target_pixels`` keeps transient memory at roughly a
+    few hundred MB regardless of raster width.
+    """
+    rows = int(target_pixels // max(1, width))
+    return int(max(64, min(4096, rows)))
+
+
+# ---------------------------------------------------------------------------
+# COG writer
+# ---------------------------------------------------------------------------
+def _translate_to_cog(
+    src_tiff: Path,
+    dst_cog: Path,
+    *,
+    block_size: int,
+    overview_count: int,
+    zstd_level: int,
+    num_threads: str,
+) -> None:
+    """Convert a (temporary) GeoTIFF into a COG with internal ZSTD overviews.
+
+    The source temp GeoTIFF already carries the intended NoData (NaN for
+    none/enclosed, unset for all), so it is inherited here -- avoiding any
+    float-NaN formatting issues with the translate options.
+    """
+    if gdal.GetDriverByName("COG") is None:
+        raise RuntimeError(
+            "GDAL COG driver is unavailable (GDAL >= 3.1 required). "
+            "Update GDAL to produce FujiShaderGPU-compatible COGs."
+        )
+    creation_options = [
+        "COMPRESS=ZSTD",
+        f"LEVEL={zstd_level}",
+        "PREDICTOR=3",  # float32
+        f"BLOCKSIZE={block_size}",
+        "OVERVIEWS=IGNORE_EXISTING",
+        "OVERVIEW_RESAMPLING=AVERAGE",
+        f"OVERVIEW_COUNT={overview_count}",
+        "OVERVIEW_COMPRESS=ZSTD",
+        "BIGTIFF=YES",
+        f"NUM_THREADS={num_threads}",
+    ]
+    logger.info("Writing COG (ZSTD + AVERAGE overviews x%d): %s", overview_count, dst_cog)
+    result = gdal.Translate(str(dst_cog), str(src_tiff), format="COG", creationOptions=creation_options)
+    if result is None:
+        raise RuntimeError(f"COG translate failed: {dst_cog}")
+    result = None
+
+    ds = gdal.Open(str(dst_cog), gdal.GA_ReadOnly)
+    ov = ds.GetRasterBand(1).GetOverviewCount() if ds is not None else 0
+    ds = None
+    if ov <= 0:
+        raise RuntimeError(f"COG output unexpectedly has no overviews: {dst_cog}")
+    logger.info("COG overview levels: %d", ov)
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+def preprocess_dem_to_cog(
+    input_path: str,
+    output_path: str,
+    *,
+    fill_mode: str = "enclosed",
+    coarse_max: int = 2048,
+    block_size: int = 512,
+    overview_count: int = 8,
+    zstd_level: int = 1,
+    num_threads: str = "ALL_CPUS",
+    overwrite: bool = False,
+) -> None:
+    """Convert ``input_path`` (any GDAL raster) into a FujiShaderGPU-ready COG.
+
+    The output is a single-band float32 COG (ZSTD, ``block_size`` tiles, internal
+    AVERAGE overviews).  CRS and pixel grid are preserved; **no reprojection** is
+    performed.  Band 1 is used.  See the module docstring for ``fill_mode``.
+    """
+    fill_mode = str(fill_mode).lower()
+    if fill_mode not in FILL_MODES:
+        raise ValueError(f"Unknown fill_mode={fill_mode!r}. Choose from {FILL_MODES}.")
+
+    in_path = Path(input_path)
+    out_path = Path(output_path)
+    if not in_path.exists():
+        raise FileNotFoundError(f"Input raster not found: {in_path}")
+    if out_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"Output already exists: {out_path} (use overwrite=True / --force)."
+        )
+
+    with rasterio.open(in_path) as src:
+        if src.count < 1:
+            raise ValueError("Input raster has no bands.")
+        if src.count > 1:
+            logger.warning("Input has %d bands; only band 1 is used (DEM).", src.count)
+        width, height = int(src.width), int(src.height)
+        src_crs = src.crs
+        src_transform = src.transform
+        src_nodata = src.nodata
+        logger.info(
+            "Input: %dx%d, dtype=%s, nodata=%s, CRS=%s",
+            width, height, src.dtypes[0], src_nodata, src_crs,
+        )
+
+        # ---- 1) Build the coarse fill surface (only when filling) -----------
+        ch, cw = _coarse_shape(width, height, coarse_max)
+        coarse_ma = src.read(
+            1, out_shape=(ch, cw), resampling=Resampling.average,
+            out_dtype=np.float32, masked=True,
+        )
+        coarse = np.ma.getdata(coarse_ma).astype(np.float32, copy=False)
+        cmask = np.ma.getmaskarray(coarse_ma)
+        cvalid = (~cmask) & np.isfinite(coarse)
+        has_holes = bool((~cvalid).any())
+
+        do_fill = fill_mode != "none" and has_holes
+        surface = None
+        exterior_coarse = None
+        if do_fill:
+            surface = _fill_coarse_surface(coarse, cvalid)
+            if fill_mode == "enclosed":
+                # NoData connected to the (global) coarse border = exterior; keep it.
+                exterior_coarse = _edge_connected_mask(~cvalid)
+                n_ext = int(exterior_coarse.sum())
+                n_void = int((~cvalid).sum())
+                logger.info(
+                    "Fill=enclosed: coarse voids=%d, exterior(kept)=%d, filled=%d",
+                    n_void, n_ext, n_void - n_ext,
+                )
+            else:  # all
+                logger.info("Fill=all: every NoData cell is filled (output will be dense).")
+        elif fill_mode != "none":
+            logger.info("No NoData detected; fill is a no-op.")
+
+        # Output NoData policy: dense for 'all', NaN sentinel otherwise.
+        out_nodata: Optional[float] = None if fill_mode == "all" else float("nan")
+
+        # ---- 2) Stream full-resolution to a temporary tiled GeoTIFF ---------
+        tmp_parent = out_path.resolve().parent
+        tmp_parent.mkdir(parents=True, exist_ok=True)
+        band_rows = _band_height(width)
+
+        profile = {
+            "driver": "GTiff",
+            "height": height,
+            "width": width,
+            "count": 1,
+            "dtype": "float32",
+            "crs": src_crs,
+            "transform": src_transform,
+            "tiled": True,
+            "blockxsize": block_size,
+            "blockysize": block_size,
+            "compress": "ZSTD",
+            "zlevel": zstd_level,
+            "predictor": 3,
+            "BIGTIFF": "YES",
+            "num_threads": num_threads,
+        }
+        if out_nodata is not None:
+            profile["nodata"] = out_nodata
+
+        fd, tmp_name = tempfile.mkstemp(suffix=".tmp.tif", dir=str(tmp_parent))
+        os.close(fd)
+        tmp_tiff = Path(tmp_name)
+        try:
+            with rasterio.open(tmp_tiff, "w", **profile) as dst:
+                for row in range(0, height, band_rows):
+                    bh = min(band_rows, height - row)
+                    window = Window(0, row, width, bh)
+                    band_ma = src.read(
+                        1, window=window, out_dtype=np.float32, masked=True,
+                    )
+                    arr = np.ma.getdata(band_ma).astype(np.float32, copy=True)
+                    wmask = np.ma.getmaskarray(band_ma) | ~np.isfinite(arr)
+
+                    if do_fill and wmask.any():
+                        # Sample the global coarse surface at this band's pixel
+                        # centres (bilinear) -- seamless across bands.
+                        fill_vals, ext = _sample_coarse(
+                            surface, exterior_coarse, row, bh, width, height, ch, cw,
+                        )
+                        if fill_mode == "enclosed":
+                            fill_here = wmask & ~ext
+                        else:  # all
+                            fill_here = wmask
+                        arr = np.where(fill_here, fill_vals, arr).astype(np.float32)
+
+                    if out_nodata is None:
+                        # 'all' mode must be fully dense; replace any residual NaN.
+                        if not np.isfinite(arr).all():
+                            arr = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
+                    else:
+                        # Remaining masked cells become the NaN nodata sentinel.
+                        arr = np.where(np.isfinite(arr), arr, np.float32(np.nan))
+
+                    dst.write(arr, 1, window=window)
+
+            # ---- 3) Convert the temp GeoTIFF into the final COG ------------
+            _translate_to_cog(
+                tmp_tiff, out_path,
+                block_size=block_size,
+                overview_count=overview_count, zstd_level=zstd_level,
+                num_threads=num_threads,
+            )
+        finally:
+            tmp_tiff.unlink(missing_ok=True)
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    logger.info("[OK] COG written: %s (%.1f MB, fill=%s)", out_path, size_mb, fill_mode)
+
+
+def _sample_coarse(
+    surface: np.ndarray,
+    exterior_coarse: Optional[np.ndarray],
+    row_off: int,
+    band_h: int,
+    width: int,
+    height: int,
+    ch: int,
+    cw: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Bilinearly sample the coarse surface (and exterior mask) for a row band.
+
+    Coordinates are computed in the *global* coarse grid so that adjacent bands
+    sample identical positions -> the upsampled fill is seamless.
+    """
+    from scipy.ndimage import map_coordinates
+
+    rr = (row_off + np.arange(band_h, dtype=np.float64) + 0.5) * (ch / height) - 0.5
+    cc = (np.arange(width, dtype=np.float64) + 0.5) * (cw / width) - 0.5
+    grid_r, grid_c = np.meshgrid(rr, cc, indexing="ij")
+    coords = np.stack([grid_r, grid_c], axis=0)
+
+    fill_vals = map_coordinates(
+        surface, coords, order=1, mode="nearest", output=np.float32
+    )
+    if exterior_coarse is None:
+        ext = np.zeros((band_h, width), dtype=bool)
+    else:
+        ext = map_coordinates(
+            exterior_coarse.astype(np.float32), coords, order=1, mode="nearest"
+        ) > 0.5
+    return fill_vals, ext

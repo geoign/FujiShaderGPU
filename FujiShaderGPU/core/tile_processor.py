@@ -16,10 +16,7 @@ from ..core.tile_compute import (
 from ..io.raster_info import detect_pixel_size_from_cog, metric_pixel_scales_from_metadata
 from ..utils.types import TileResult
 from ..utils.scale_analysis import analyze_terrain_scales, _get_default_scales
-from ..utils.nodata_handler import (
-    _handle_nodata_ultra_fast,
-    fill_enclosed_nodata_holes,
-)
+from ..utils.nodata_handler import _handle_nodata_ultra_fast
 from ..io.cog_builder import _build_vrt_and_cog_ultra_fast
 from ..io.cog_validator import _validate_cog_for_qgis
 from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
@@ -1387,13 +1384,11 @@ def process_single_tile(
             elif np.isnan(dem_tile).any():
                 mask_nodata = np.isnan(dem_tile)
 
-            fill_dem_holes = (
-                str(algo_params.get("mode", "local")).lower() == "spatial"
-                and bool(algo_params.get("fill_dem_holes", True))
-            )
+            # NoData void filling is owned by the preprocessing command
+            # (`python -m FujiShaderGPU.prepare`); tiles only mask NoData here.
             if mask_nodata is not None:
                 nodata_ratio = np.count_nonzero(mask_nodata) / mask_nodata.size
-                
+
                 if nodata_ratio >= nodata_threshold:
                     return TileResult(
                         ty, tx, False,
@@ -1402,28 +1397,10 @@ def process_single_tile(
                             f"(threshold: {nodata_threshold:.1%})"
                         ),
                     )
-                
+
                 if nodata_ratio > 0.8:
                     # Avoid flooding IDLE socket with thousands of warnings on huge rasters.
                     logger.debug(f"Tile({ty}, {tx}) has high NoData ratio: {nodata_ratio:.1%}")
-
-                if fill_dem_holes:
-                    dem_tile, mask_nodata, filled_holes = fill_enclosed_nodata_holes(
-                        dem_tile,
-                        mask_nodata,
-                        max_holes_for_interpolation=int(
-                            algo_params.get("hole_fill_max_components", 256)
-                        ),
-                    )
-                    if filled_holes:
-                        logger.debug(
-                            "Tile(%d, %d) filled %d enclosed NoData holes",
-                            ty,
-                            tx,
-                            filled_holes,
-                        )
-                    if mask_nodata is not None and not np.any(mask_nodata):
-                        mask_nodata = None
 
                 if algorithm in {"rvi", "fractal_anomaly"}:
                     # RVI uses NaN-aware filters. Keep NoData as NaN to avoid boundary
@@ -1447,8 +1424,6 @@ def process_single_tile(
             algo_instance = _load_algorithm(algorithm)
             # Build per-tile params so geographic DEMs can use local latitude scaling.
             tile_algo_params = dict(algo_params)
-            tile_algo_params.pop("fill_dem_holes", None)
-            tile_algo_params.pop("hole_fill_max_components", None)
             if src_crs is not None and getattr(src_crs, "is_geographic", False):
                 try:
                     # Use core tile center latitude for local meter conversion.
@@ -1800,6 +1775,19 @@ def process_dem_tiles(
             width = src.width
             height = src.height
             profile = src.profile.copy()
+            # FujiShaderGPU expects an overview-bearing COG; warn (do not fail) and
+            # point to the preprocessing command when overviews are missing.
+            try:
+                if src.count >= 1 and not src.overviews(1):
+                    logger.warning(
+                        "[OVERVIEW] Input has no overviews; global stats/sampling reads "
+                        "will be slow. Pre-process the input into an overview-bearing COG:\n"
+                        "    python -m FujiShaderGPU.prepare %s prepared_cog.tif\n"
+                        "then run on 'prepared_cog.tif'.",
+                        input_cog_path,
+                    )
+            except Exception:
+                pass
             requested_mode = str(algo_params.get("mode", "local")).lower()
             user_radii_specified = ("radii" in algo_params) and (algo_params.get("radii") is not None)
             user_weights_specified = ("weights" in algo_params) and (algo_params.get("weights") is not None)

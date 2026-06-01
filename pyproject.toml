@@ -102,6 +102,7 @@ Issues = "https://github.com/geoign/FujiShaderGPU/issues"
 
 [project.scripts]
 fujishadergpu = "FujiShaderGPU.__main__:main"
+fujishadergpu-prepare = "FujiShaderGPU.prepare:main"
 
 [tool.setuptools.package-data]
 FujiShaderGPU = ["*.json", "*.yaml", "*.yml", "**/*.yaml", "**/*.yml", "**/*.json"]

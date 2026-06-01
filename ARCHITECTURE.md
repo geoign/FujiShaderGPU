@@ -9,13 +9,20 @@ FujiShaderGPU is a Python/CUDA terrain-visualization pipeline for very large DEM
 
 ## 2. End-to-End Flow
 ```text
-Input DEM (COG or Zarr)
+(optional) Any raster --prepare--> overview-bearing COG (+ NoData fill)
+Input DEM (COG with overviews, or Zarr)
   -> CLI (platform-specific)
   -> Core orchestration (Dask or Tile)
   -> Algorithm layer (modular per-algorithm files)
   -> Output writer (COG or Zarr)
   -> Validation / logs
 ```
+
+The main pipeline **assumes an overview-bearing COG input**.  Use the
+preprocessing command (§13) to convert arbitrary rasters and to fill NoData
+voids once, up front.  When overviews are missing the pipeline still runs but
+warns and points to the preprocessing command (decimated reads fall back to
+slow full-resolution reads).
 
 ## 3. Code Topology
 
@@ -131,6 +138,9 @@ Input DEM (COG or Zarr)
 
 ### 3.4 IO / Config / Utils
 - `io/cog_builder.py`, `io/cog_validator.py`, `io/raster_info.py`
+- `io/dem_preprocess.py` — preprocessing core: any GDAL raster -> overview-bearing
+  COG (float32, ZSTD) with optional overview-based NoData fill (see §13)
+- `prepare.py` — preprocessing CLI (`python -m FujiShaderGPU.prepare`)
 - `config/auto_tune.py` — VRAM-based dynamic performance parameter computation (single source of truth)
 - `config/gpu_config_manager.py`, `config/system_config.py`, `config/gdal_config.py`
 - `config/gpu_presets.yaml` — reference anchor values (no longer primary; `auto_tune.py` is authoritative)
@@ -356,3 +366,61 @@ Users can still override computed values via environment variables:
 - `FUJISHADER_RMM_POOL_GB` — override RMM pool size
 
 These are checked in `gpu_config_manager.py::get_preset()` and take precedence over auto_tune.
+
+## 13. Input Preprocessing (`prepare` command)
+
+### 13.1 Purpose
+
+`prepare.py` / `io/dem_preprocess.py` convert any GDAL-readable raster into a
+FujiShaderGPU-ready COG and (optionally) fill NoData voids **once, up front**.
+This decouples one-time work (format conversion, COG-ification, hole filling)
+from the per-run compute pipeline.
+
+```bash
+python -m FujiShaderGPU.prepare input.(tif|img|vrt|...) output_cog.tif
+python -m FujiShaderGPU.prepare input.tif out.tif --fill-mode all --force
+# console script equivalent: fujishadergpu-prepare input.tif out.tif
+```
+
+### 13.2 Output Contract
+
+- Single-band **float32** COG; CRS and pixel grid preserved (**no reprojection**); band 1 used.
+- ZSTD compression, `PREDICTOR=3`, `BLOCKSIZE=512` (configurable), internal
+  AVERAGE overviews (`OVERVIEW_COUNT=8` by default) — byte-compatible with what
+  the pipeline itself writes (`dask_processor.get_cog_options`).
+- NoData policy: `none`/`enclosed` emit NaN-nodata; `all` emits a dense raster
+  with no NoData.
+
+### 13.3 NoData Fill Modes (`--fill-mode`)
+
+- `none` — no filling; NoData preserved.
+- `enclosed` *(default)* — fill only interior voids (NoData **not** connected to
+  the raster border).  Border-connected NoData (ocean / dataset exterior) is kept.
+- `all` — fill every NoData cell (including exterior) and remove NoData entirely.
+  Useful when NaN/NoData is not allowed (e.g. 3D model generation); large
+  exterior fills are a coarse extrapolation.
+
+### 13.4 Method (overview-based, low-frequency fill)
+
+Hole filling is inherently low-frequency, so the expensive work runs on a small
+coarse grid and is upsampled — cost is nearly independent of full raster size:
+
+1. Read a coarse decimated grid (`--coarse-max`, default 2048; uses overviews if present).
+2. Global edge-connectivity on the coarse grid separates exterior from enclosed voids.
+3. Build a smooth coarse fill surface (nearest + valid-weighted Gaussian).
+4. Stream the full-resolution output in row bands; bilinearly sample the **global**
+   coarse surface at each pixel (seamless across bands) and fill the targeted voids.
+5. Convert the streamed temporary GeoTIFF into the final COG with overviews.
+
+Implementation streams windowed reads/writes (bounded memory) so very large
+rasters (hundreds of GB) are handled without loading the full array.
+
+### 13.5 Pipeline Input Assumption
+
+The main pipeline assumes an overview-bearing COG.  Both backends warn (not fail)
+when overviews are missing and point to this command.  NoData fill management is
+**owned solely by the preprocessing command**: the legacy per-tile/per-chunk
+hole-fill has been removed from both the Dask and tile pipelines (along with the
+`--no-fill-dem-holes` / `--hole-fill-max-components` CLI options).  The pipelines
+still *mask* NoData and use NaN-aware filters, but they no longer interpolate
+voids — run `prepare` (mode `enclosed` or `all`) first if voids must be filled.

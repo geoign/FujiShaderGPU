@@ -50,10 +50,42 @@ Installed script:
 fujishadergpu --help
 ```
 
+## Preprocessing (recommended first step)
+
+The main pipeline assumes an **overview-bearing COG** input. Convert arbitrary
+rasters (and optionally fill NoData voids) once, up front, with the preprocessing
+command:
+
+```bash
+python -m FujiShaderGPU.prepare input.(tif|img|vrt|...) output_cog.tif
+# console script: fujishadergpu-prepare input.tif output_cog.tif
+```
+
+Output is a single-band float32 COG (ZSTD + internal overviews), pipeline-compatible.
+CRS / pixel grid are preserved (no reprojection); band 1 is used.
+
+NoData fill modes (`--fill-mode`):
+
+- `none` — no filling; NoData preserved.
+- `enclosed` *(default)* — fill only interior voids; border-connected NoData
+  (ocean / dataset exterior) is kept.
+- `all` — fill every NoData cell (including exterior) and remove NoData entirely
+  (dense output; useful for 3D model generation).
+
+Filling is done on a coarse overview grid and upsampled (low-frequency), so the
+cost is nearly independent of the full raster size and streams within bounded
+memory. When the pipeline is given an input without overviews it still runs but
+warns and points to this command (decimated reads fall back to slow full-res reads).
+
+```bash
+python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --fill-mode enclosed --force
+fujishadergpu kyoto_cog.tif kyoto_rvi.tif --algorithm rvi --radii 4,32,256,2048
+```
+
 ## Input / Output
 
 - Input:
-  - COG (`.tif`, `.tiff`) on all paths
+  - COG (`.tif`, `.tiff`) on all paths — overview-bearing COG expected (see Preprocessing)
   - Zarr (`.zarr`) on Dask path
 - Output:
   - COG by default
@@ -174,11 +206,12 @@ python -m pip check
 
 ## Repository Structure (Summary)
 
+- `FujiShaderGPU/prepare.py` (preprocessing CLI: any raster -> pipeline-ready COG)
 - `FujiShaderGPU/algorithms/`
   - `dask_registry.py`
-  - `dask_shared.py` (re-export hub, 177 lines)
+  - `dask_shared.py` (re-export hub)
   - `_base.py`, `_nan_utils.py`, `_global_stats.py`, `_normalization.py` (shared utilities)
-  - `_impl_*.py` (14 algorithm implementation modules)
+  - `_impl_*.py` (per-algorithm implementation modules)
   - `tile_shared.py`
   - `common/kernels.py`
   - `common/auto_params.py`
@@ -191,6 +224,9 @@ python -m pip check
   - `tile_processor.py`
   - `tile_io.py`
   - `tile_compute.py`
+- `FujiShaderGPU/io/`
+  - `dem_preprocess.py` (preprocessing core: COG-ification + overview-based NoData fill)
+  - `cog_builder.py`, `cog_validator.py`, `raster_info.py`
 
 ## Notes
 
