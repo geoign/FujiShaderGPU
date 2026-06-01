@@ -41,9 +41,28 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
     if is_colab:
         memory_fraction = min(memory_fraction, 0.50)
         logger.info('Google Colab environment detected')
-    rmm_size = min(tuned["rmm_pool_size_gb"], int(available_gb * tuned["rmm_pool_fraction"]))
+    device_memory_fraction = max(0.1, min(float(memory_fraction), 0.95))
+    device_limit_gb = max(1.0, min(gpu_memory_gb, available_gb) * device_memory_fraction)
+    # Keep the eager RMM pool below Dask's device_memory_limit.  A pool larger
+    # than the worker limit can stall or restart the nanny during startup.
+    rmm_cap_gb = max(1, int(device_limit_gb * 0.80))
+    rmm_size = min(
+        tuned["rmm_pool_size_gb"],
+        int(available_gb * tuned["rmm_pool_fraction"]),
+        rmm_cap_gb,
+    )
+    rmm_max_gb = max(rmm_size, min(int(rmm_size * 1.2), int(device_limit_gb * 0.95)))
     spill_dir = os.environ.get('FUJISHADER_SPILL_DIR', tempfile.gettempdir())
     logger.info("Dask spill directory: %s", spill_dir)
+    logger.info(
+        "Dask CUDA memory: total=%.1fGB available=%.1fGB device_limit=%.1fGB "
+        "rmm_pool=%dGB rmm_max=%dGB",
+        gpu_memory_gb,
+        available_gb,
+        device_limit_gb,
+        rmm_size,
+        rmm_max_gb,
+    )
 
     dask_config.set({
         'distributed.worker.memory.target': 0.70,
@@ -56,13 +75,13 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
     logging.getLogger('distributed.core').setLevel(logging.WARNING)
 
     cluster_kwargs = {
-        'device_memory_limit': max(0.1, min(float(memory_fraction), 0.95)),
+        'device_memory_limit': device_memory_fraction,
         'rmm_pool_size': f'{rmm_size}GB',
         'threads_per_worker': 1,
         'silence_logs': logging.WARNING,
         'death_timeout': '60s' if is_colab else '30s',
         'interface': 'lo' if is_colab else None,
-        'rmm_maximum_pool_size': f'{int(rmm_size * 1.2)}GB',
+        'rmm_maximum_pool_size': f'{rmm_max_gb}GB',
         'enable_cudf_spill': True,
         'local_directory': spill_dir,
     }
