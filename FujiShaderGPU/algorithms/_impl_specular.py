@@ -14,6 +14,7 @@ from ._nan_utils import (
     handle_nan_for_gradient, restore_nan,
     _resolve_spatial_radii_weights,
     _combine_multiscale_dask, _smooth_for_radius,
+    large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
 )
 
 
@@ -133,17 +134,35 @@ class SpecularAlgorithm(DaskAlgorithm):
             params.get("radii"), params.get("weights", None), ps)
         agg = params.get("agg", "mean")
         if mode == "spatial":
+            is_geo = bool(params.get("is_geographic_dem", False))
+            thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
+            F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1
+            cache = {}
             responses = []
             for radius in radii:
                 depth = max(int(rs), int(float(radius) * 2 + 1))
-                responses.append(gpu_arr.map_overlap(
-                    compute_specular_spatial_block, depth=depth,
-                    boundary='reflect', dtype=cp.float32,
-                    meta=cp.empty((0, 0), dtype=cp.float32),
-                    roughness_scale=rs, shininess=sh, pixel_size=ps,
-                    pixel_scale_x=psx, pixel_scale_y=psy,
-                    roughness_norm_scale=rns, geographic_mode=geo,
-                    light_azimuth=laz, light_altitude=lal, radius=float(radius)))
+                if F > 1 and int(round(float(radius))) > thr:
+                    # Scale the roughness kernel into the coarse grid as well.
+                    rs_coarse = max(3.0, float(rs) / F)
+                    responses.append(coarse_large_radius_response(
+                        gpu_arr, block_fn=compute_specular_spatial_block,
+                        radius_kw="radius", radius=float(radius), factor=F,
+                        depth_for_radius=lambda rc, _rs=rs_coarse: max(int(_rs), int(rc * 2 + 1)),
+                        pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
+                        coarse_cache=cache,
+                        roughness_scale=rs_coarse, shininess=sh,
+                        roughness_norm_scale=rns, geographic_mode=geo,
+                        light_azimuth=laz, light_altitude=lal,
+                    ))
+                else:
+                    responses.append(gpu_arr.map_overlap(
+                        compute_specular_spatial_block, depth=depth,
+                        boundary='reflect', dtype=cp.float32,
+                        meta=cp.empty((0, 0), dtype=cp.float32),
+                        roughness_scale=rs, shininess=sh, pixel_size=ps,
+                        pixel_scale_x=psx, pixel_scale_y=psy,
+                        roughness_norm_scale=rns, geographic_mode=geo,
+                        light_azimuth=laz, light_altitude=lal, radius=float(radius)))
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
         return gpu_arr.map_overlap(
             compute_specular_block, depth=int(rs), boundary='reflect',

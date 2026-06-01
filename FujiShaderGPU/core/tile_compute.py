@@ -104,7 +104,13 @@ def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma
             'pixel_size': pixel_size,
             'sigma': sigma,
         }
-        for key in ("global_stats", "downsample_factor"):
+        for key in (
+            "global_stats", "downsample_factor",
+            # Large-radius-from-overview fast path (set by process_dem_tiles /
+            # process_single_tile); RVIAlgorithm uses these instead of `radii`.
+            "_rvi_coarse_field", "_rvi_small_radii", "_rvi_small_weights",
+            "_rvi_w_large", "_rvi_full_shape", "_rvi_field_offset",
+        ):
             if key in algo_params and algo_params[key] is not None:
                 params[key] = algo_params[key]
         return algo_instance.process(dem_in, **params)

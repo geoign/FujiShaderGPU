@@ -881,6 +881,57 @@ def _compute_rvi_global_stats_from_overview(
         return None
 
 
+def _compute_rvi_overview_coarse_field(
+    src_cog: str,
+    *,
+    large_radii: List[int],
+    large_weights: List[float],
+    sample_max: int = 2048,
+):
+    """Compute the large-radius RVI coarse field (Sum w*mean) from the COG overview.
+
+    Reading the stored overview (decimated read) avoids materialising the huge
+    full-resolution halo a large radius would otherwise require.  The returned
+    CuPy field is sampled per-block as ``W_large*block - upsample(field)``.
+    Returns ``None`` on any failure so the caller transparently falls back to the
+    full-resolution radii path.
+    """
+    if not large_radii:
+        return None
+    try:
+        from ..algorithms._impl_rvi import compute_rvi_large_coarse_field
+        from rasterio.enums import Resampling
+    except Exception as exc:
+        logger.warning("RVI overview coarse-field helpers unavailable: %s", exc)
+        return None
+    try:
+        with rasterio.open(src_cog) as src:
+            scale = max(src.width / sample_max, src.height / sample_max, 1.0)
+            sample_w = max(128, int(src.width / scale))
+            sample_h = max(128, int(src.height / scale))
+            sample_ma = src.read(
+                1, out_shape=(sample_h, sample_w), resampling=Resampling.average,
+                out_dtype=np.float32, masked=True,
+            )
+            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
+            nodata = src.nodata
+        if nodata is not None and not np.isnan(float(nodata)):
+            sample = np.where(
+                np.isclose(sample, float(nodata), rtol=0.0, atol=1e-6), np.nan, sample
+            ).astype(np.float32, copy=False)
+        coarse_dem = cp.asarray(sample, dtype=cp.float32)
+        field = compute_rvi_large_coarse_field(
+            coarse_dem, large_radii=large_radii, large_weights=large_weights,
+            decimation=float(scale),
+        )
+        logger.info(
+            "RVI large-radius overview field: decimation=%.1fx, large_radii=%s",
+            scale, list(large_radii),
+        )
+        return field
+    except Exception as exc:
+        logger.warning("Failed to compute RVI overview coarse field: %s", exc)
+        return None
 
 
 def run_pipeline(
@@ -1055,11 +1106,64 @@ def run_pipeline(
             if rvi_global_stats is not None:
                 params["global_stats"] = rvi_global_stats
 
+        # RVI large-radius-from-overview fast path: split radii at a chunk-aware
+        # threshold; compute the large-radius contribution from the COG overview
+        # (no huge per-chunk halo) and let the algorithm add it to the small-radius
+        # full-resolution RVI.  Any failure falls back to the full-resolution path.
+        if (
+            algorithm == "rvi"
+            and not is_zarr_path(src_cog)
+            and "_rvi_coarse_field" not in params
+        ):
+            try:
+                from ..algorithms._impl_rvi import (
+                    rvi_default_large_radius_threshold,
+                    split_radii_by_threshold,
+                )
+                _full_radii = list(params.get("radii") or [])
+                if _full_radii:
+                    _threshold = rvi_default_large_radius_threshold(int(chunk))
+                    _sr, _sw, _lr, _lw = split_radii_by_threshold(
+                        _full_radii, params.get("weights"), _threshold
+                    )
+                    if _lr:
+                        _field = _compute_rvi_overview_coarse_field(
+                            src_cog, large_radii=_lr, large_weights=_lw,
+                        )
+                        if _field is not None:
+                            params["_rvi_coarse_field"] = _field
+                            params["_rvi_small_radii"] = _sr
+                            params["_rvi_small_weights"] = _sw
+                            params["_rvi_w_large"] = float(sum(_lw))
+                            params["_rvi_full_shape"] = tuple(int(s) for s in gpu_arr.shape)
+                            params["_rvi_field_offset"] = (0, 0)
+                            logger.info(
+                                "RVI overview large-radius path: small=%s, large=%s "
+                                "(threshold=%dpx) -> per-chunk halo from %d to %d px",
+                                _sr, _lr, _threshold,
+                                max(_full_radii) + 16,
+                                (max(_sr) + 16) if _sr else 16,
+                            )
+            except Exception as exc:
+                logger.warning(
+                    "RVI overview large-radius path unavailable; using full-resolution radii: %s",
+                    exc,
+                )
+
         # 6-3) アルゴリズム実行（run_pipeline内）
-        logger.info(f"Computing {algorithm} with parameters: {params}")
+        # Redact bulky internal arrays (e.g. the RVI coarse field) from logs/metadata.
+        _log_params = {k: v for k, v in params.items() if not k.startswith("_rvi_coarse_field")}
+        logger.info(f"Computing {algorithm} with parameters: {_log_params}")
 
         # アルゴリズムを適用（遅延評価）
         result_gpu: da.Array = algo.process(gpu_arr, **params)
+
+        # Drop internal helper arrays so they never reach COG metadata (str(params)).
+        for _k in (
+            "_rvi_coarse_field", "_rvi_small_radii", "_rvi_small_weights",
+            "_rvi_w_large", "_rvi_full_shape", "_rvi_field_offset",
+        ):
+            params.pop(_k, None)
 
         # 6-4) GPU→CPU 戻し（改善：明示的なdtype）
         result_cpu = result_gpu.map_blocks(

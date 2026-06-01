@@ -415,7 +415,41 @@ coarse grid and is upsampled — cost is nearly independent of full raster size:
 Implementation streams windowed reads/writes (bounded memory) so very large
 rasters (hundreds of GB) are handled without loading the full array.
 
-### 13.5 Pipeline Input Assumption
+### 13.5 Large-radius-from-overview (RVI)
+
+Because the input is an overview-bearing COG, large-radius low-frequency terms
+can be taken from the stored overview instead of reading a huge per-chunk/per-tile
+halo at full resolution.  For RVI (`Σ wᵢ(block − meanᵢ)`):
+
+- Radii are split at `max(256, chunk_or_tile // 16)`.
+- **Small radii** are computed at full resolution with a small halo (as before).
+- **Large radii** contribute as `W_large·block − upsample(Σ wᵢ·meanᵢ_overview)`,
+  where the coarse mean field is computed once from the overview (decimated read).
+  The per-block part is `W_large·block` (no halo); the field is sampled at global
+  pixel coords (offset 0 for Dask chunks, tile-window origin for tiles), so the
+  result is seam-free across both backends.
+
+This cuts the per-chunk/per-tile halo from `max_radius` to `max(small_radii)`
+(e.g. 2064→272 px for radii up to 2048), roughly halving I/O for large radii.
+RVI reads the stored overview directly (biggest saving); any failure falls back
+transparently to the full-resolution radii path.
+
+The **spatial-mode algorithms** (hillshade, slope, specular, atmospheric_scattering,
+curvature, ambient_occlusion, openness, multi_light_uncertainty) apply the same
+idea via `_nan_utils.coarse_large_radius_response`: for radii above the threshold,
+the per-radius response is computed on a `da.coarsen`-downsampled copy (metric
+pixel scales scaled by the factor) and bilinearly upsampled, then combined as
+before.  Small radii keep the exact previous full-resolution code path, so typical
+runs (preset radii ≤ 64) are unchanged.  This is enabled for **projected DEMs only**
+(geographic DEMs use decimation-dependent local scaling); the coarse copy is
+derived from the same array, so it is offset-free and seam-free on both backends.
+
+Algorithms that do **not** need this: `multiscale_terrain` already caps its halo
+at `Constants.MAX_DEPTH` (150 px), and `fractal_anomaly` / `scale_space_surprise`
+/ `visual_saliency` / `npr_edges` use small scales (no large halo) and combine
+scales non-linearly (not linearly decomposable).
+
+### 13.6 Pipeline Input Assumption
 
 The main pipeline assumes an overview-bearing COG.  Both backends warn (not fail)
 when overviews are missing and point to this command.  NoData fill management is

@@ -12,6 +12,7 @@ from ._base import DaskAlgorithm
 from ._nan_utils import (
     handle_nan_for_gradient, restore_nan,
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
+    large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
     _smooth_for_radius,
 )
 
@@ -56,16 +57,29 @@ class SlopeAlgorithm(DaskAlgorithm):
             params.get("radii"), params.get("weights", None), pixel_size)
         agg = params.get("agg", "mean")
         if mode == "spatial":
+            is_geo = bool(params.get("is_geographic_dem", False))
+            thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
+            F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1
+            _depth = lambda rr: max(2, int(float(rr) * 2 + 1))
+            cache = {}
             responses = []
             for radius in radii:
-                depth = max(2, int(float(radius) * 2 + 1))
-                responses.append(gpu_arr.map_overlap(
-                    compute_slope_spatial_block, depth=depth,
-                    boundary="reflect", dtype=cp.float32,
-                    meta=cp.empty((0, 0), dtype=cp.float32),
-                    unit=unit, pixel_size=pixel_size,
-                    pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-                    radius=float(radius)))
+                if F > 1 and int(round(float(radius))) > thr:
+                    responses.append(coarse_large_radius_response(
+                        gpu_arr, block_fn=compute_slope_spatial_block,
+                        radius_kw="radius", radius=float(radius), factor=F,
+                        depth_for_radius=_depth, pixel_size=pixel_size,
+                        pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+                        coarse_cache=cache, unit=unit,
+                    ))
+                else:
+                    responses.append(gpu_arr.map_overlap(
+                        compute_slope_spatial_block, depth=_depth(radius),
+                        boundary="reflect", dtype=cp.float32,
+                        meta=cp.empty((0, 0), dtype=cp.float32),
+                        unit=unit, pixel_size=pixel_size,
+                        pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+                        radius=float(radius)))
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
         return gpu_arr.map_overlap(
             compute_slope_block, depth=1, boundary='reflect',

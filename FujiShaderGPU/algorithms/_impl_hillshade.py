@@ -13,6 +13,7 @@ from ._base import Constants, DaskAlgorithm
 from ._nan_utils import (
     handle_nan_for_gradient, restore_nan,
     _resolve_spatial_radii_weights, _smooth_for_radius,
+    large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
 )
 
 
@@ -90,18 +91,32 @@ class HillshadeAlgorithm(DaskAlgorithm):
             radii = [max(1.0, float(r)) for r in radii]
             multiscale = bool(multiscale or len(radii) > 1)
         if mode == "spatial" or (multiscale and len(radii) > 1):
+            thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
+            F = coarsen_factor_for_shape(gpu_arr.shape) if not geographic_mode else 1
+            _depth = lambda rr: max(2, int(float(rr) * 2 + 1))
+            cache = {}
             results = []
             for radius in radii:
-                depth = max(2, int(float(radius) * 2 + 1))
-                hs = gpu_arr.map_overlap(
-                    compute_hillshade_spatial_block, depth=depth,
-                    boundary='reflect', dtype=cp.float32,
-                    meta=cp.empty((0, 0), dtype=cp.float32),
-                    azimuth=azimuth, altitude=altitude, z_factor=z_factor,
-                    pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-                    pixel_scale_y=pixel_scale_y, geographic_mode=geographic_mode,
-                    radius=float(radius),
-                )
+                if F > 1 and int(round(float(radius))) > thr:
+                    hs = coarse_large_radius_response(
+                        gpu_arr, block_fn=compute_hillshade_spatial_block,
+                        radius_kw="radius", radius=float(radius), factor=F,
+                        depth_for_radius=_depth, pixel_size=pixel_size,
+                        pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+                        coarse_cache=cache,
+                        azimuth=azimuth, altitude=altitude, z_factor=z_factor,
+                        geographic_mode=geographic_mode,
+                    )
+                else:
+                    hs = gpu_arr.map_overlap(
+                        compute_hillshade_spatial_block, depth=_depth(radius),
+                        boundary='reflect', dtype=cp.float32,
+                        meta=cp.empty((0, 0), dtype=cp.float32),
+                        azimuth=azimuth, altitude=altitude, z_factor=z_factor,
+                        pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
+                        pixel_scale_y=pixel_scale_y, geographic_mode=geographic_mode,
+                        radius=float(radius),
+                    )
                 results.append(hs)
             stacked = da.stack(results, axis=0)
             if agg == "stack":

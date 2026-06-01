@@ -670,7 +670,11 @@ def _compute_global_rvi_stats(
         # otherwise (now that the 256px cap is removed) a radius can exceed the
         # whole sample and collapse the RVI signal.  Auto radii (manual_radii is
         # None) are already derived from target distances at sample_pixel_size.
-        manual_radii = algo_params.get("radii")
+        # Prefer the *full* radii (before the large-radius overview split) so the
+        # global normalization scale reflects the combined RVI, not just the
+        # small-radius part left in algo_params["radii"].
+        manual_radii = algo_params.get("_rvi_full_radii") or algo_params.get("radii")
+        manual_weights = algo_params.get("_rvi_full_weights") or algo_params.get("weights")
         if manual_radii is not None:
             manual_radii = [max(1.0, float(r) / max(scale, 1.0)) for r in manual_radii]
         radii, rvi_weights = _normalize_rvi_radii_and_weights(
@@ -678,7 +682,7 @@ def _compute_global_rvi_stats(
             weights=weights,
             pixel_size=sample_pixel_size,
             manual_radii=manual_radii,
-            manual_weights=algo_params.get("weights"),
+            manual_weights=manual_weights,
         )
         if not radii:
             return None
@@ -694,6 +698,58 @@ def _compute_global_rvi_stats(
         return (std_global,)
     except Exception as exc:
         logger.warning(f"Failed to compute global RVI stats; fallback to per-run stats: {exc}")
+        return None
+
+
+def _compute_rvi_overview_coarse_field_tile(
+    input_cog_path: str,
+    *,
+    large_radii: List[int],
+    large_weights: List[float],
+    nodata: Optional[float],
+    elevation_scale: float = 1.0,
+    sample_max: int = 2048,
+):
+    """Large-radius RVI coarse field (Sum w*mean) from the COG overview, for tiles.
+
+    A single global field (shared by every tile) keeps the large-radius RVI
+    contribution seam-free while letting each tile read only a small halo for the
+    small radii.  Returns a CuPy 2D field, or ``None`` on any failure (caller
+    then keeps the full-resolution radii path).
+    """
+    if not large_radii:
+        return None
+    try:
+        from ..algorithms._impl_rvi import compute_rvi_large_coarse_field
+    except Exception as exc:
+        logger.warning(f"RVI overview coarse-field helper unavailable: {exc}")
+        return None
+    try:
+        with rasterio.open(input_cog_path, "r") as src:
+            scale = max(src.width / sample_max, src.height / sample_max, 1.0)
+            sample_w = max(128, int(src.width / scale))
+            sample_h = max(128, int(src.height / scale))
+            sample_ma = src.read(
+                1, out_shape=(sample_h, sample_w), resampling=Resampling.average,
+                out_dtype=np.float32, masked=True,
+            )
+            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
+            if nodata is None:
+                nodata = src.nodata
+        if nodata is not None:
+            sample = _replace_nodata_with_nan(sample, nodata)
+        coarse_dem = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
+        field = compute_rvi_large_coarse_field(
+            coarse_dem, large_radii=large_radii, large_weights=large_weights,
+            decimation=float(scale),
+        )
+        logger.info(
+            "RVI large-radius overview field (tile): decimation=%.1fx, large_radii=%s",
+            scale, list(large_radii),
+        )
+        return field
+    except Exception as exc:
+        logger.warning(f"Failed to compute tile RVI overview coarse field: {exc}")
         return None
 
 
@@ -1424,6 +1480,10 @@ def process_single_tile(
             algo_instance = _load_algorithm(algorithm)
             # Build per-tile params so geographic DEMs can use local latitude scaling.
             tile_algo_params = dict(algo_params)
+            # RVI overview large-radius path: tell the algorithm this tile's global
+            # origin so the shared coarse field is sampled at the correct position.
+            if "_rvi_coarse_field" in tile_algo_params:
+                tile_algo_params["_rvi_field_offset"] = (int(win_y_off), int(win_x_off))
             if src_crs is not None and getattr(src_crs, "is_geographic", False):
                 try:
                     # Use core tile center latitude for local meter conversion.
@@ -1647,6 +1707,62 @@ def process_dem_tiles(
                 algo_params["weights"] = None
         if adj_warn:
             logger.warning(adj_warn)
+
+    # RVI large-radius-from-overview fast path (tile).  Split radii at a
+    # tile-size-aware threshold; the large radii are taken from a single global
+    # overview-derived coarse field (seam-free, no large per-tile halo), so the
+    # tile padding only needs to cover the small radii.  Projected-only: on
+    # geographic DEMs each tile uses a local-latitude elevation_scale, which a
+    # single global field cannot match, so the optimization is skipped there.
+    if algorithm == "rvi":
+        try:
+            with rasterio.open(input_cog_path, "r") as _src:
+                _sx, _sy, _pxm, _is_geo, _lat = metric_pixel_scales_from_metadata(
+                    transform=_src.transform, crs=_src.crs, bounds=_src.bounds,
+                )
+                _full_w_px, _full_h_px = int(_src.width), int(_src.height)
+            if not _is_geo:
+                from ..algorithms._impl_rvi import (
+                    rvi_default_large_radius_threshold,
+                    split_radii_by_threshold,
+                )
+                _full_r, _full_w = _normalize_rvi_radii_and_weights(
+                    target_distances=target_distances,
+                    weights=weights,
+                    pixel_size=float(pixel_size),
+                    manual_radii=algo_params.get("radii"),
+                    manual_weights=algo_params.get("weights"),
+                )
+                if _full_r:
+                    _thr = rvi_default_large_radius_threshold(int(tile_size))
+                    _sr, _sw, _lr, _lw = split_radii_by_threshold(_full_r, _full_w, _thr)
+                    if _lr:
+                        _field = _compute_rvi_overview_coarse_field_tile(
+                            input_cog_path, large_radii=_lr, large_weights=_lw,
+                            nodata=nodata_override, elevation_scale=1.0,
+                        )
+                        if _field is not None:
+                            # Keep the full radii for the global normalization stat,
+                            # but use small radii for padding + per-tile compute.
+                            algo_params["_rvi_full_radii"] = list(_full_r)
+                            algo_params["_rvi_full_weights"] = list(_full_w)
+                            algo_params["radii"] = _sr
+                            algo_params["weights"] = _sw
+                            algo_params["_rvi_coarse_field"] = _field
+                            algo_params["_rvi_small_radii"] = _sr
+                            algo_params["_rvi_small_weights"] = _sw
+                            algo_params["_rvi_w_large"] = float(sum(_lw))
+                            algo_params["_rvi_full_shape"] = (_full_h_px, _full_w_px)
+                            logger.info(
+                                "RVI overview large-radius path (tile): small=%s, large=%s "
+                                "(threshold=%dpx)",
+                                _sr, _lr, _thr,
+                            )
+        except Exception as exc:
+            logger.warning(
+                "RVI tile overview large-radius path unavailable; using full radii: %s",
+                exc,
+            )
 
     required_padding = _required_padding_for_algorithm(
         algorithm=algorithm,

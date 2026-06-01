@@ -154,6 +154,111 @@ def _combine_multiscale_dask(
     return da.mean(stacked, axis=0)
 
 
+# ---------------------------------------------------------------------------
+# Large-radius-from-overview helpers (shared by spatial-mode algorithms)
+# ---------------------------------------------------------------------------
+def large_radius_threshold(gpu_arr: da.Array, fallback: int) -> int:
+    """Radii above this are computed from a coarsened copy (no large halo).
+
+    Default = max(256, min_chunk // 16), matching the RVI threshold.
+    """
+    try:
+        min_chunk = min(min(gpu_arr.chunks[0]), min(gpu_arr.chunks[1]))
+    except Exception:
+        min_chunk = int(fallback)
+    return int(max(256, int(min_chunk) // 16))
+
+
+def coarsen_factor_for_shape(shape, coarse_max: int = 2048) -> int:
+    """Power-of-two decimation so the longest side is <= ``coarse_max``."""
+    longest = max(int(shape[0]), int(shape[1]))
+    if longest <= int(coarse_max):
+        return 1
+    return 1 << int(np.ceil(np.log2(longest / float(coarse_max))))
+
+
+def _upsample_coarse_response_block(block, *, coarse, full_h, full_w, block_info=None):
+    """Bilinearly sample a small coarse response at this block's global coords.
+
+    The coarse response is derived from the *same* array (Dask: the full raster;
+    tile: the per-tile padded window), so sampling at block-local coordinates is
+    correct and seam-free -- no global offset is needed.
+    """
+    from cupyx.scipy.ndimage import map_coordinates
+
+    if block_info is not None and block_info.get(0) is not None:
+        loc = block_info[0]["array-location"]
+        r0, r1 = int(loc[0][0]), int(loc[0][1])
+        c0, c1 = int(loc[1][0]), int(loc[1][1])
+    else:  # pragma: no cover - non-dask fallback
+        r0, c0 = 0, 0
+        r1, c1 = block.shape[0], block.shape[1]
+    ch, cw = coarse.shape
+    rr = (cp.arange(r0, r1, dtype=cp.float64) + 0.5) * (ch / float(full_h)) - 0.5
+    cc = (cp.arange(c0, c1, dtype=cp.float64) + 0.5) * (cw / float(full_w)) - 0.5
+    grid_r, grid_c = cp.meshgrid(rr, cc, indexing="ij")
+    out = map_coordinates(coarse, cp.stack([grid_r, grid_c]), order=1, mode="nearest")
+    return out.astype(cp.float32)
+
+
+def coarse_large_radius_response(
+    gpu_arr: da.Array,
+    *,
+    block_fn,
+    radius_kw: str,
+    radius: float,
+    factor: int,
+    depth_for_radius,
+    pixel_size: float = 1.0,
+    pixel_scale_x: Optional[float] = None,
+    pixel_scale_y: Optional[float] = None,
+    coarse_cache: Optional[dict] = None,
+    **block_kwargs,
+) -> da.Array:
+    """One large-radius spatial response computed on a coarsened DEM, upsampled.
+
+    The DEM is da.coarsen-downsampled by ``factor`` (NaN-aware mean), the block
+    function runs there with the radius / metric spacing scaled by ``factor``,
+    and the small coarse result is bilinearly upsampled to full resolution.
+    Intended for projected DEMs (metric pixel scales scale linearly with factor).
+    ``coarse_cache`` (a dict) avoids re-coarsening the array for multiple radii.
+    """
+    H, W = int(gpu_arr.shape[0]), int(gpu_arr.shape[1])
+    if coarse_cache is not None and "coarse" in coarse_cache:
+        coarse = coarse_cache["coarse"]
+    else:
+        coarse = da.coarsen(cp.nanmean, gpu_arr, {0: factor, 1: factor}, trim_excess=True)
+        if coarse_cache is not None:
+            coarse_cache["coarse"] = coarse
+
+    r_coarse = max(1, int(round(float(radius) / float(factor))))
+    kw = dict(block_kwargs)
+    kw[radius_kw] = r_coarse
+    kw["pixel_size"] = float(pixel_size) * float(factor)
+    if pixel_scale_x is not None:
+        kw["pixel_scale_x"] = float(pixel_scale_x) * float(factor)
+    if pixel_scale_y is not None:
+        kw["pixel_scale_y"] = float(pixel_scale_y) * float(factor)
+
+    coarse_resp = coarse.map_overlap(
+        block_fn,
+        depth=int(depth_for_radius(r_coarse)),
+        boundary="reflect",
+        dtype=cp.float32,
+        meta=cp.empty((0, 0), dtype=cp.float32),
+        **kw,
+    ).compute()
+
+    return gpu_arr.map_blocks(
+        _upsample_coarse_response_block,
+        dtype=cp.float32,
+        meta=cp.empty((0, 0), dtype=cp.float32),
+        coarse=coarse_resp,
+        full_h=H,
+        full_w=W,
+    )
+
+
 def _smooth_for_radius(
     block: cp.ndarray,
     radius: float,
@@ -280,4 +385,7 @@ __all__ = [
     "_downsample_nan_aware",
     "_upsample_to_shape",
     "restore_nan",
+    "large_radius_threshold",
+    "coarsen_factor_for_shape",
+    "coarse_large_radius_response",
 ]

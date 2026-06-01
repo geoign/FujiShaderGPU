@@ -100,6 +100,94 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
     return rvi_combined
 
 
+def rvi_default_large_radius_threshold(min_chunk: int) -> int:
+    """Radii above this are computed from the COG overview (no large halo).
+
+    Default = max(256, min_chunk // 16): radii within this are cheap to halo at
+    full resolution; larger radii are low-frequency and better taken from the
+    stored overview.
+    """
+    return int(max(256, int(min_chunk) // 16))
+
+
+def split_radii_by_threshold(radii, weights, threshold):
+    """Split (radii, weights) into (small, large) groups by ``threshold`` px.
+
+    Weights are NOT renormalized: each group keeps its absolute weights so the
+    two partial RVI sums add back to the original full-radii RVI.
+    """
+    n = len(radii)
+    if weights is None or len(weights) != n:
+        weights = [1.0 / n] * n
+    small_r, small_w, large_r, large_w = [], [], [], []
+    for r, w in zip(radii, weights):
+        if int(r) > int(threshold):
+            large_r.append(int(r)); large_w.append(float(w))
+        else:
+            small_r.append(int(r)); small_w.append(float(w))
+    return small_r, small_w, large_r, large_w
+
+
+def compute_rvi_large_coarse_field(
+    coarse_dem: cp.ndarray,
+    *,
+    large_radii: List[int],
+    large_weights: List[float],
+    decimation: float,
+) -> cp.ndarray:
+    """Weighted sum of large-radius local means on the coarse (overview) grid.
+
+    Returns ``Sum_i w_i * mean_{r_i}(coarse_dem)`` (NaN-aware), where ``r_i`` is
+    the full-resolution radius scaled into the coarse grid by ``decimation``.
+    The full large-radius RVI is then ``W_large * block - upsample(field)``.
+    """
+    field = None
+    for r, w in zip(large_radii, large_weights):
+        r_coarse = max(1, int(round(float(r) / max(decimation, 1.0))))
+        if r_coarse <= 1:
+            mean_c, _ = handle_nan_with_gaussian(coarse_dem, sigma=1.0, mode="nearest")
+        else:
+            mean_c, _ = handle_nan_with_uniform(coarse_dem, size=2 * r_coarse + 1, mode="reflect")
+        term = cp.float32(w) * mean_c
+        field = term if field is None else field + term
+    return field.astype(cp.float32)
+
+
+def _rvi_add_large_block(
+    block: cp.ndarray,
+    *,
+    coarse_field: cp.ndarray,
+    w_large: float,
+    off_r: int,
+    off_c: int,
+    full_h: int,
+    full_w: int,
+    block_info=None,
+) -> cp.ndarray:
+    """Large-radius RVI contribution for one block: W_large*block - upsample(field).
+
+    The coarse field is sampled at the block's *global* pixel positions
+    (block-local location + (off_r, off_c)) so the result is seam-free across
+    chunks (Dask, offset 0) and tiles (offset = tile window origin).
+    """
+    from cupyx.scipy.ndimage import map_coordinates
+
+    if block_info is not None and block_info.get(0) is not None:
+        (r0, r1), (c0, c1) = block_info[0]["array-location"][0], block_info[0]["array-location"][1]
+    else:  # pragma: no cover - direct (non-dask) call fallback
+        r0, c0 = 0, 0
+        r1, c1 = block.shape[0], block.shape[1]
+    r0 += int(off_r); r1 += int(off_r)
+    c0 += int(off_c); c1 += int(off_c)
+
+    ch, cw = coarse_field.shape
+    rr = (cp.arange(r0, r1, dtype=cp.float64) + 0.5) * (ch / float(full_h)) - 0.5
+    cc = (cp.arange(c0, c1, dtype=cp.float64) + 0.5) * (cw / float(full_w)) - 0.5
+    grid_r, grid_c = cp.meshgrid(rr, cc, indexing="ij")
+    up = map_coordinates(coarse_field, cp.stack([grid_r, grid_c]), order=1, mode="nearest")
+    return (cp.float32(w_large) * block - up).astype(cp.float32)
+
+
 def multiscale_rvi(gpu_arr: da.Array, *,
                    radii: List[int],
                    weights: Optional[List[float]] = None,
@@ -222,7 +310,38 @@ class RVIAlgorithm(DaskAlgorithm):
 
         if radii is None:
             radii = self._determine_optimal_radii(pixel_size)
-        rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights, pixel_size=pixel_size)
+
+        # Large-radius-from-overview fast path: when the orchestrator supplies a
+        # precomputed coarse field (Sum w*mean for large radii on the overview),
+        # large radii contribute as `W_large*block - upsample(field)` (no halo),
+        # and only the small radii are computed at full resolution.  Seam-free
+        # via global coords (offset 0 for Dask, tile-window origin for tiles).
+        coarse_field = params.get("_rvi_coarse_field", None)
+        if coarse_field is not None:
+            small_r = params.get("_rvi_small_radii", [])
+            small_w = params.get("_rvi_small_weights", None)
+            w_large = float(params.get("_rvi_w_large", 0.0))
+            off_r, off_c = params.get("_rvi_field_offset", (0, 0))
+            full_h, full_w = params.get("_rvi_full_shape", gpu_arr.shape)
+            large_part = gpu_arr.map_blocks(
+                _rvi_add_large_block,
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                coarse_field=coarse_field,
+                w_large=w_large,
+                off_r=int(off_r),
+                off_c=int(off_c),
+                full_h=int(full_h),
+                full_w=int(full_w),
+            )
+            if small_r:
+                rvi = multiscale_rvi(
+                    gpu_arr, radii=small_r, weights=small_w, pixel_size=pixel_size,
+                ) + large_part
+            else:
+                rvi = large_part
+        else:
+            rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights, pixel_size=pixel_size)
 
         # Prefer externally supplied global stats (tile backend computes once).
         stats = params.get("global_stats", None)
@@ -281,4 +400,7 @@ __all__ = [
     "compute_rvi_efficient_block",
     "multiscale_rvi",
     "RVIAlgorithm",
+    "rvi_default_large_radius_threshold",
+    "split_radii_by_threshold",
+    "compute_rvi_large_coarse_field",
 ]

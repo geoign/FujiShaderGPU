@@ -12,6 +12,7 @@ from ._base import Constants, DaskAlgorithm
 from ._nan_utils import (
     restore_nan,
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
+    large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
     _smooth_for_radius,
 )
 
@@ -67,19 +68,33 @@ class CurvatureAlgorithm(DaskAlgorithm):
             params.get("radii"), params.get("weights", None), ps)
         agg = params.get("agg", "mean")
         if mode == "spatial":
-            def _curv_spatial(block, *, radius, curvature_type, pixel_size):
+            def _curv_spatial(block, *, radius, curvature_type, pixel_size,
+                              pixel_scale_x=None, pixel_scale_y=None):
                 smoothed = _smooth_for_radius(block, radius,
                     pixel_size=pixel_size, algorithm_name="curvature")
                 return compute_curvature_block(smoothed,
                     curvature_type=curvature_type, pixel_size=pixel_size)
+            is_geo = bool(params.get("is_geographic_dem", False))
+            thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
+            F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1
+            _depth = lambda rr: max(3, int(float(rr) * 2 + 2))
+            cache = {}
             responses = []
             for radius in radii:
-                depth = max(3, int(float(radius) * 2 + 2))
-                responses.append(gpu_arr.map_overlap(
-                    _curv_spatial, depth=depth, boundary='reflect',
-                    dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
-                    radius=float(radius), curvature_type=ct,
-                    pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy))
+                if F > 1 and int(round(float(radius))) > thr:
+                    responses.append(coarse_large_radius_response(
+                        gpu_arr, block_fn=_curv_spatial,
+                        radius_kw="radius", radius=float(radius), factor=F,
+                        depth_for_radius=_depth, pixel_size=ps,
+                        pixel_scale_x=psx, pixel_scale_y=psy, coarse_cache=cache,
+                        curvature_type=ct,
+                    ))
+                else:
+                    responses.append(gpu_arr.map_overlap(
+                        _curv_spatial, depth=_depth(radius), boundary='reflect',
+                        dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
+                        radius=float(radius), curvature_type=ct,
+                        pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy))
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
         return gpu_arr.map_overlap(
             compute_curvature_block, depth=2, boundary='reflect',
