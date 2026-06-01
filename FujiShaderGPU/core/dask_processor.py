@@ -61,6 +61,65 @@ def _format_gib(num_bytes: int) -> str:
     return f"{num_bytes / (1024**3):.1f}GB"
 
 
+def _configure_gdal_read_performance() -> None:
+    """Enable multi-threaded COG decoding and block caching for input reads.
+
+    Call this *before* the Dask-CUDA cluster is created: ``LocalCUDACluster``
+    spawns its worker (nanny) processes from this process, so they inherit the
+    environment configured here, which is where the chunked input reads actually
+    run.  ``setdefault`` is used so explicit user environment overrides win.
+    """
+    try:
+        avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        avail_gb = 8.0
+    # GDAL interprets a bare integer < 100000 as megabytes.
+    cache_mb = int(max(1024, min(16384, avail_gb * 1024 * 0.1)))
+
+    read_opts = {
+        "GDAL_NUM_THREADS": "ALL_CPUS",          # multi-threaded (de)compression
+        "GDAL_CACHEMAX": str(cache_mb),
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
+        "VSI_CACHE": "YES",
+        "GDAL_BAND_BLOCK_CACHE": "HASHSET",
+    }
+    for key, value in read_opts.items():
+        os.environ.setdefault(key, value)
+        try:
+            gdal.SetConfigOption(key, os.environ.get(key, value))
+        except Exception:
+            pass
+    logger.info(
+        "GDAL read performance configured: NUM_THREADS=%s, CACHEMAX=%sMB",
+        os.environ.get("GDAL_NUM_THREADS"),
+        os.environ.get("GDAL_CACHEMAX"),
+    )
+
+
+def _log_overview_availability(src_cog: str) -> None:
+    """Log whether the input COG carries an overview pyramid.
+
+    Decimated reads (global stats, terrain sampling) and downstream viewers are
+    far faster when overviews exist; warn when they do not so the user can add
+    them with ``gdaladdo`` ahead of time.
+    """
+    try:
+        if is_zarr_path(src_cog):
+            return
+        with rasterio.open(src_cog) as src:
+            ov = src.overviews(1) if src.count >= 1 else []
+        if ov:
+            logger.info("Input overviews available: %s (used for decimated sampling)", ov)
+        else:
+            logger.warning(
+                "Input COG has no overviews; decimated stat/sampling reads will be slower. "
+                "Consider pre-building them: gdaladdo -r average %s 2 4 8 16 32 64 128 256",
+                src_cog,
+            )
+    except Exception as exc:
+        logger.debug("Overview availability check skipped: %s", exc)
+
+
 def _select_chunk_temp_parent(data_nbytes: int) -> Path:
     """Choose and diagnose the temporary directory for chunk GeoTIFFs."""
     selected_from = None
@@ -464,92 +523,140 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         with tempfile.TemporaryDirectory(dir=tmp_parent) as tmpdir:
             # チャンクごとに処理
             chunk_files = []
-            
-            # Dask配列のチャンクを取得
-            if hasattr(data.data, 'to_delayed'):
-                # data.dataがDask配列の場合
-                delayed_chunks = data.data.to_delayed()
-                
-                # チャンク情報の検証
-                if not hasattr(data, 'chunks') or data.chunks is None:
-                    logger.warning("No chunk information found, falling back to regular processing")
-                    _write_cog_da_original(data, dst, show_progress)
-                    return
-                
-                # 進捗表示の準備
-                total_chunks = delayed_chunks.shape[0] * delayed_chunks.shape[1]
-                
-                # チャンクの形状を保持しながら処理
-                chunk_idx = 0
-                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
-                    for i in range(delayed_chunks.shape[0]):
-                        for j in range(delayed_chunks.shape[1]):
-                            chunk_file = Path(tmpdir) / f"chunk_{chunk_idx}.tif"
-                            try:
-                                # チャンクを計算
-                                chunk_data = delayed_chunks[i, j].compute()
-                                
-                                # チャンクの実際のサイズを取得
-                                chunk_height, chunk_width = chunk_data.shape
-                                
-                                # チャンクの開始位置を計算
-                                y_start = sum(data.chunks[0][:i])
-                                x_start = sum(data.chunks[1][:j])
-                                
-                                # チャンクの終了位置を計算
-                                y_end = y_start + chunk_height
-                                x_end = x_start + chunk_width
-                                
-                                # チャンクをDataArrayとして作成
-                                chunk_da = xr.DataArray(
-                                    chunk_data,
-                                    dims=data.dims,
-                                    coords={
-                                        data.dims[0]: data.coords[data.dims[0]].isel({data.dims[0]: slice(y_start, y_end)}),
-                                        data.dims[1]: data.coords[data.dims[1]].isel({data.dims[1]: slice(x_start, x_end)})
-                                    },
-                                    attrs=data.attrs
-                                )
 
-                                # 座標参照系を設定（存在する場合のみ）
-                                if hasattr(data, 'rio') and data.rio.crs is not None:
-                                    chunk_da.rio.write_crs(data.rio.crs, inplace=True)
-                                
-                                # チャンクをGeoTIFFとして保存
-                                chunk_da.rio.to_raster(
-                                    chunk_file,
-                                    driver="GTiff",
-                                    compress="ZSTD",
-                                    zstd_level=1,
-                                    predictor=3,
-                                    tiled=True,
-                                    blockxsize=512,
-                                    blockysize=512,
-                                    BIGTIFF="YES",
-                                    num_threads="ALL_CPUS",
-                                )
-                                chunk_files.append(chunk_file)
-                                
-                                # メモリ解放
-                                del chunk_data, chunk_da
-                                chunk_idx += 1
-
-                                # 10チャンクごとに軽量クリーンアップ
-                                if chunk_idx % 10 == 0:
-                                    cp.get_default_memory_pool().free_all_blocks()
-                                
-                                # 進捗更新
-                                pbar.update(1)
-                                pbar.set_postfix({"saved": f"{len(chunk_files)}", "size_MB": f"{os.path.getsize(chunk_file)/(1024**2):.1f}"})
-                                
-                            except Exception as e:
-                                logger.error(f"Failed to process chunk {i},{j}: {e}")
-                                raise
-            else:
-                # Dask配列でない場合は通常の処理にフォールバック
+            # Dask配列でない場合は通常の処理にフォールバック
+            if not hasattr(data.data, 'to_delayed'):
                 logger.info("Data is not chunked with Dask, falling back to regular processing")
                 _write_cog_da_original(data, dst, show_progress)
                 return
+
+            # チャンク情報の検証
+            if not hasattr(data, 'chunks') or data.chunks is None:
+                logger.warning("No chunk information found, falling back to regular processing")
+                _write_cog_da_original(data, dst, show_progress)
+                return
+
+            delayed_chunks = data.data.to_delayed()
+            n_rows = int(delayed_chunks.shape[0])
+            n_cols = int(delayed_chunks.shape[1])
+            total_chunks = n_rows * n_cols
+
+            y_dim, x_dim = data.dims[0], data.dims[1]
+            src_crs = data.rio.crs if hasattr(data, 'rio') else None
+
+            def _persist_chunk(idx: int, i: int, j: int, chunk_data) -> Path:
+                """Write one computed chunk to a temporary GeoTIFF; return its path."""
+                chunk_height, chunk_width = chunk_data.shape[0], chunk_data.shape[1]
+                y_start = sum(data.chunks[0][:i])
+                x_start = sum(data.chunks[1][:j])
+                y_end = y_start + chunk_height
+                x_end = x_start + chunk_width
+                chunk_da = xr.DataArray(
+                    chunk_data,
+                    dims=data.dims,
+                    coords={
+                        y_dim: data.coords[y_dim].isel({y_dim: slice(y_start, y_end)}),
+                        x_dim: data.coords[x_dim].isel({x_dim: slice(x_start, x_end)}),
+                    },
+                    attrs=data.attrs,
+                )
+                if src_crs is not None:
+                    chunk_da.rio.write_crs(src_crs, inplace=True)
+                chunk_file = Path(tmpdir) / f"chunk_{idx}.tif"
+                chunk_da.rio.to_raster(
+                    chunk_file,
+                    driver="GTiff",
+                    compress="ZSTD",
+                    zstd_level=1,
+                    predictor=3,
+                    tiled=True,
+                    blockxsize=512,
+                    blockysize=512,
+                    BIGTIFF="YES",
+                    num_threads="ALL_CPUS",
+                )
+                del chunk_da
+                return chunk_file
+
+            # 並列ストリーミング書き込み:
+            # チャンクグラフは embarrassingly parallel なので、複数の Dask-CUDA
+            # ワーカー（=GPU）が別チャンクを並行計算する間にクライアントが完了分を
+            # 書き出す。distributed クライアントが取得できない場合は直列処理に戻す。
+            client = None
+            try:
+                client = get_client()
+            except Exception:
+                client = None
+
+            if client is not None:
+                try:
+                    n_workers = max(1, len(client.scheduler_info().get("workers", {})))
+                except Exception:
+                    n_workers = 1
+                max_inflight = max(2, n_workers * 2)
+                from distributed import as_completed as _as_completed
+
+                coords_flat = [(i, j) for i in range(n_rows) for j in range(n_cols)]
+                task_iter = iter(enumerate(coords_flat))
+                fut_meta = {}
+                inflight = _as_completed()
+
+                def _submit_next() -> bool:
+                    try:
+                        idx, (i, j) = next(task_iter)
+                    except StopIteration:
+                        return False
+                    fut = client.compute(delayed_chunks[i, j])
+                    fut_meta[fut] = (idx, i, j)
+                    inflight.add(fut)
+                    return True
+
+                logger.info(
+                    "Parallel chunk write: %d chunks, %d worker(s), up to %d in flight",
+                    total_chunks, n_workers, max_inflight,
+                )
+                done = 0
+                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                    for _ in range(min(max_inflight, total_chunks)):
+                        if not _submit_next():
+                            break
+                    for fut in inflight:
+                        idx, i, j = fut_meta.pop(fut)
+                        try:
+                            chunk_data = fut.result()
+                            chunk_files.append(_persist_chunk(idx, i, j, chunk_data))
+                            del chunk_data
+                        except Exception as e:
+                            logger.error(f"Failed to process chunk {i},{j}: {e}")
+                            raise
+                        finally:
+                            del fut
+                        done += 1
+                        if done % 10 == 0:
+                            try:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            except Exception:
+                                pass
+                        pbar.update(1)
+                        pbar.set_postfix({"saved": f"{len(chunk_files)}"})
+                        _submit_next()
+            else:
+                # 直列フォールバック（distributed クライアントが無い場合）
+                idx = 0
+                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                    for i in range(n_rows):
+                        for j in range(n_cols):
+                            try:
+                                chunk_data = delayed_chunks[i, j].compute()
+                                chunk_files.append(_persist_chunk(idx, i, j, chunk_data))
+                                del chunk_data
+                            except Exception as e:
+                                logger.error(f"Failed to process chunk {i},{j}: {e}")
+                                raise
+                            idx += 1
+                            if idx % 10 == 0:
+                                cp.get_default_memory_pool().free_all_blocks()
+                            pbar.update(1)
                 
             # VRTで統合してCOGに変換
             if not chunk_files:
@@ -856,12 +963,16 @@ def run_pipeline(
     
     # 入力検証
     validate_inputs(src_cog)
-    
+
+    # GDAL読み込み最適化（クラスタ生成前に設定 → spawnされるワーカーが継承）
+    _configure_gdal_read_performance()
+    _log_overview_availability(src_cog)
+
     # メモリ状況の確認
     mem = psutil.virtual_memory()
     logger.info(f"System memory: {mem.total / 2**30:.1f} GB total, "
                 f"{mem.available / 2**30:.1f} GB available")
-    
+
     # メモリフラクションの取得（algo_paramsから、なければデフォルト）
     memory_fraction = algo_params.pop('memory_fraction', None)
     cluster, client = make_cluster(memory_fraction)  # dask_cluster.py 直接呼び出し

@@ -109,7 +109,12 @@ def multiscale_rvi(gpu_arr: da.Array, *,
         raise ValueError("At least one radius value is required")
 
     max_radius = max(radii)
-    depth = max_radius * 2 + 1
+    # A uniform mean of radius R needs exactly R pixels of halo on each side, so
+    # R + a small margin is seam-free for the trimmed core (results identical to
+    # the previous 2*R+1 halo) while reading ~half the data per chunk for large
+    # radii.  Dask map_overlap auto-rechunks when the halo exceeds an edge chunk,
+    # exactly as it did for the old (larger) depth.
+    depth = int(max_radius + 16)
 
     result = gpu_arr.map_overlap(
         compute_rvi_efficient_block,

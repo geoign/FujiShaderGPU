@@ -117,13 +117,13 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
                      'pixel_scale_x': pixel_scale_x,
                      'pixel_scale_y': pixel_scale_y, 'normalize': False},
                     downsample_factor=params.get('downsample_factor', None),
-                    depth=int(max_scale * 8))
+                    depth=int(max_scale * 5))
             else:
                 stats = (0.0, 1.0)
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
             stats = (0.0, 1.0)
         return gpu_arr.map_overlap(
-            compute_visual_saliency_block, depth=int(max_scale * 8),
+            compute_visual_saliency_block, depth=int(max_scale * 5),
             boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             scales=scales, pixel_size=pixel_size,

@@ -39,8 +39,11 @@ def _normalize_rvi_radii_and_weights(
             radius = int(round(numeric))
         if radius < 2:
             radius = 2
-        if radius > 256:
-            radius = 256
+        # NOTE: The previous hard cap (radius <= 256) that limited the per-tile
+        # halo on the Windows/tile backend has been removed so user-specified
+        # radii are honoured as-is.  Large radii enlarge the per-tile window and
+        # its GPU memory footprint; process_dem_tiles emits an explicit VRAM
+        # warning when that footprint is likely to exceed available VRAM.
         resolved.append(radius)
 
     if not resolved:

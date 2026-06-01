@@ -155,7 +155,11 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         if len(radii) < 5:
             radii = [4, 8, 16, 32, 64]
         max_r = max(radii)
-        depth = max_r * 3 + 1
+        # Roughness uses a Gaussian with sigma = r/2 (window_mult=3, /6), whose
+        # 4-sigma kernel needs ~2r of halo.  The extra +16 covers the feature
+        # smoothing (smoothing_sigma) and the size-3 median.  The previous 3r
+        # read ~1.5x more halo than required (core results unchanged).
+        depth = max_r * 2 + 16
         stats = params.get('global_stats', None)
         stats_ok = (isinstance(stats, (tuple, list)) and len(stats) >= 2
                      and float(stats[1]) > 1e-9)

@@ -64,7 +64,12 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
         scales = params.get('scales', [1.0, 2.0, 4.0, 8.0, 16.0])
         enhancement = float(params.get('enhancement', 2.0))
         normalize = bool(params.get('normalize', True))
-        depth = int(max(1, cp.ceil(max(scales) * 3).item())) + 1
+        # 4-sigma Gaussian kernel needs ~4*max_scale of halo for a seam-free
+        # core (was 3-sigma, which left a slight tile-boundary discontinuity).
+        depth = int(max(1, cp.ceil(max(scales) * 4).item())) + 1
+        # map_overlap reflect cannot use a halo >= the array size; clamp for
+        # small inputs (large rasters keep the full 4-sigma halo).
+        depth = max(1, min(depth, int(min(gpu_arr.shape)) - 1))
         stats = params.get('global_stats', None)
         stats_ok = isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9
         if normalize and not stats_ok:

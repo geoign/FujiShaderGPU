@@ -84,8 +84,9 @@ def _sanitize_spatial_radii_weights_for_tile(
     if not isinstance(radii, (list, tuple)) or len(radii) == 0:
         return None, weights, None
 
-    # AO / openness are depth-heavy in spatial mode; cap only these two.
-    # Other algorithms are intentionally left unclamped here.
+    # Algorithms with a lightweight per-radius path (Gaussian smoothing) only
+    # need integer sanitisation; downstream `_resolve_spatial_radii_weights`
+    # handles de-duplication and weights.
     if algorithm not in {"ambient_occlusion", "openness"}:
         out_no_cap: List[int] = []
         for v in radii:
@@ -99,13 +100,12 @@ def _sanitize_spatial_radii_weights_for_tile(
         if not out_no_cap:
             return None, weights, None
         return out_no_cap, weights, None
-    generic_cap = max(2, min(512, int(max(64, tile_size // 3))))
-    if algorithm == "ambient_occlusion":
-        algo_cap = min(generic_cap, 256)
-    else:
-        # openness is lighter than AO but still depth-heavy.
-        algo_cap = min(generic_cap, 512)
 
+    # AO / openness previously capped radii (256 / 512 px) to bound per-tile
+    # padding and VRAM.  That cap is removed so user-specified radii are honoured
+    # as-is; the VRAM fit check in process_dem_tiles warns when the resulting
+    # tile window is likely to exceed available VRAM.  We still de-duplicate
+    # radii and realign weights so the algorithm receives a clean profile.
     out_r: List[int] = []
     out_w: List[float] = []
     for i, rv in enumerate(radii):
@@ -115,7 +115,6 @@ def _sanitize_spatial_radii_weights_for_tile(
             continue
         if r <= 0:
             continue
-        r = min(r, algo_cap)
         if r < 2:
             r = 2
         out_r.append(r)
@@ -144,19 +143,16 @@ def _sanitize_spatial_radii_weights_for_tile(
         if s > 0:
             dedup_w = [w / s for w in w2]
 
-    changed = False
+    warn = None
     try:
         src_r = [int(round(float(v))) for v in radii]
-        changed = src_r != dedup_r
+        if src_r != dedup_r:
+            warn = (
+                f"Spatial radii de-duplicated for {algorithm}: "
+                f"{list(radii)} -> {dedup_r}"
+            )
     except Exception:
-        changed = True
-
-    warn = None
-    if changed:
-        warn = (
-            f"Spatial radii adjusted for {algorithm}: "
-            f"{list(radii)} -> {dedup_r} (tile-safe cap={algo_cap}px)"
-        )
+        pass
     return dedup_r, dedup_w, warn
 
 
@@ -234,7 +230,10 @@ def _required_padding_for_algorithm(
             max_scale = max(float(s) for s in scales)
         except Exception:
             max_scale = 16.0
-        required = max(required, int(math.ceil(max_scale * 8.0)))
+        # Saliency uses Gaussian center-surround at sigma up to max_scale.
+        # gaussian_filter truncates at 4 sigma, so 5*sigma halo is exact (the
+        # previous 8*sigma read ~1.6x more data per tile for no accuracy gain).
+        required = max(required, int(math.ceil(max_scale * 5.0)))
     elif algorithm == "rvi":
         radii, _ = _normalize_rvi_radii_and_weights(
             target_distances=target_distances,
@@ -244,7 +243,11 @@ def _required_padding_for_algorithm(
             manual_weights=algo_params.get("weights"),
         )
         if radii:
-            required = max(required, int(max(radii) * 2 + 1))
+            # RVI uses a uniform (box) mean of radius R, which needs exactly R
+            # pixels of real neighbour context -- not 2R.  R + small margin keeps
+            # adjacent tile cores identical (seam-free) while halving the per-tile
+            # halo read.  Matches the Dask map_overlap depth (max_radius + 16).
+            required = max(required, int(max(radii) + 16))
     elif algorithm == "multiscale_terrain":
         scales = algo_params.get("scales", [1, 10, 50, 100])
         try:
@@ -258,8 +261,11 @@ def _required_padding_for_algorithm(
             max_scale = max(float(s) for s in scales if float(s) > 0)
         except Exception:
             max_scale = 16.0
-        # Align with shared algorithm depth: int(max(scales)*3)+1
-        required = max(required, int(math.ceil(max_scale * 3.0)) + 1)
+        # The surprise kernel blurs at sigma up to max_scale; gaussian_filter
+        # truncates at 4 sigma, so 4*max_scale of halo is needed for a seam-free
+        # tile core.  (Was 3*max_scale, which left a slight boundary mismatch.)
+        # Matches the shared algorithm depth: int(max(scales)*4)+1.
+        required = max(required, int(math.ceil(max_scale * 4.0)) + 1)
     elif algorithm == "fractal_anomaly":
         radii = algo_params.get("radii")
         if not radii:
@@ -272,8 +278,10 @@ def _required_padding_for_algorithm(
             max_radius = max(int(round(float(r))) for r in radii if float(r) > 0)
         except Exception:
             max_radius = 64
-        # Keep tile halo aligned with fractal map_overlap depth=max_radius*3+1.
-        required = max(required, int(max_radius * 3 + 1))
+        # Aligned with the fractal map_overlap depth (2r + 16): roughness uses a
+        # Gaussian of sigma = r/2 whose 4-sigma kernel needs ~2r of halo; +16
+        # covers feature smoothing and the size-3 median.  (Was 3r = ~1.5x.)
+        required = max(required, int(max_radius * 2 + 16))
 
     mode = str(algo_params.get("mode", "local")).lower()
     spatial_algorithms = {
@@ -298,8 +306,16 @@ def _required_padding_for_algorithm(
             max_radius = max(int(round(float(r))) for r in radii if float(r) > 0)
         except Exception:
             max_radius = 32
-        # Align with spatial smoothing + local compute depth.
-        required = max(required, int(max_radius * 2 + 2))
+        if algorithm in {"ambient_occlusion", "openness"}:
+            # Directional-search algorithms only sample up to R pixels away, so
+            # they need ~R of halo (the Dask map_overlap depth is R+1), not the
+            # 2R required by Gaussian radius-smoothing algorithms.  This halves
+            # the per-tile halo read for AO/openness in spatial mode.
+            required = max(required, int(max_radius + 16))
+        else:
+            # Gaussian radius smoothing uses sigma = r/2, whose 4-sigma kernel
+            # needs ~2R of halo; keep 2R + a couple pixels for the local compute.
+            required = max(required, int(max_radius * 2 + 2))
 
     # Keep alignment with current tiling preferences.
     return max(32, ((required + 31) // 32) * 32)
@@ -652,11 +668,19 @@ def _compute_global_rvi_stats(
             sample = _replace_nodata_with_nan(sample, nodata)
 
         sample_pixel_size = float(pixel_size * scale)
+        # Manual radii are full-resolution pixel counts.  The stats sample is
+        # decimated by `scale`, so scale the radii down to the sample grid;
+        # otherwise (now that the 256px cap is removed) a radius can exceed the
+        # whole sample and collapse the RVI signal.  Auto radii (manual_radii is
+        # None) are already derived from target distances at sample_pixel_size.
+        manual_radii = algo_params.get("radii")
+        if manual_radii is not None:
+            manual_radii = [max(1.0, float(r) / max(scale, 1.0)) for r in manual_radii]
         radii, rvi_weights = _normalize_rvi_radii_and_weights(
             target_distances=target_distances,
             weights=weights,
             pixel_size=sample_pixel_size,
-            manual_radii=algo_params.get("radii"),
+            manual_radii=manual_radii,
             manual_weights=algo_params.get("weights"),
         )
         if not radii:
@@ -1699,6 +1723,68 @@ def process_dem_tiles(
                 f"(tile={effective_span}px, VRAM={_vram:.0f}GB)"
             )
             max_workers = recommended_workers
+
+        # VRAM fit check.  The Windows/tile backend loads the whole padded tile
+        # window onto the GPU, so large radii / halos can push a single tile past
+        # available VRAM.  The RVI radius cap was intentionally removed, so warn
+        # explicitly (rather than silently clamping) when an OOM is likely.
+        _complexity = float(ALGORITHM_COMPLEXITY.get(algorithm, 1.0))
+        est_tile_vram_gb = (effective_span ** 2 * 4.0 * 15.0 * _complexity) / (1024 ** 3)
+        usable_vram_gb = max(0.1, _vram * 0.70)
+        try:
+            _radii_for_msg = algo_params.get("radii")
+            _max_radius_for_msg = (
+                int(max(int(round(float(r))) for r in _radii_for_msg if float(r) > 0))
+                if isinstance(_radii_for_msg, (list, tuple)) and _radii_for_msg
+                else None
+            )
+        except Exception:
+            _max_radius_for_msg = None
+
+        if est_tile_vram_gb > usable_vram_gb * 0.6:
+            # Suggest a core tile size that would bring one tile within budget.
+            _budget_span = int(math.sqrt(
+                usable_vram_gb * (1024 ** 3) / (4.0 * 15.0 * _complexity)
+            ))
+            _suggested_tile = _budget_span - 2 * int(padding)
+            severity = "高い" if est_tile_vram_gb > usable_vram_gb else "中程度"
+            crash_clause = (
+                "処理途中で CUDA out of memory により異常終了する可能性が高いです。"
+                if est_tile_vram_gb > usable_vram_gb
+                else "VRAMがひっ迫し、ワーカー数の自動削減や、環境によっては"
+                     "out of memory が発生する可能性があります。"
+            )
+            radius_clause = (
+                f"最大半径 {_max_radius_for_msg}px が支配的です。"
+                if _max_radius_for_msg is not None
+                else "大きな空間スケール指定（--radii / scales）が要因です。"
+            )
+            if _suggested_tile >= 512:
+                tile_advice = f"--tile-size を {_suggested_tile}px 程度以下に下げる"
+            else:
+                tile_advice = (
+                    "ハロー(padding)がタイル本体を上回っているため --tile-size の縮小だけでは不足です。"
+                    "最大半径そのものを小さくしてください"
+                )
+            logger.warning(
+                "[VRAM] 1タイルあたりのGPUメモリ需要が利用可能VRAMに対して%sリスクです。\n"
+                "  - タイル窓: %dx%d px（コア %d px + ハロー %d px × 2）。%s\n"
+                "  - 推定ピークVRAM/タイル: 約 %.1f GB に対し、利用可能は約 %.1f GB"
+                "（検出VRAM %.0f GB の 70%%）。\n"
+                "  - 原因: Windows(タイル)バックエンドは、パディング込みのタイル窓を"
+                "GPUへ丸ごと載せて計算します。空間スケール(--radii / scales)の上限キャップは"
+                "無効化済みのため、指定値はそのまま使われ、ハロー(padding)がスケールに比例して"
+                "増え、タイル窓が二次関数的に拡大します。\n"
+                "  - 想定される影響: %s\n"
+                "  - 対処: (1) %s, (2) 最大の --radii を小さくする, "
+                "(3) よりVRAMの大きいGPUを使う, (4) 非常に大きな半径が必要な場合は "
+                "Linux の Dask-CUDA バックエンド（チャンク分散で大半径に強い）で実行する。",
+                severity,
+                effective_span, effective_span, int(tile_size), int(padding), radius_clause,
+                est_tile_vram_gb, usable_vram_gb, _vram,
+                crash_clause,
+                tile_advice,
+            )
 
     logger.info(f"Processing profile: {gpu_config['description']}")
     logger.info(
