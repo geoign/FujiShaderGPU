@@ -263,7 +263,7 @@ def coarse_large_radius_response(
         **kw,
     ).compute()
 
-    return gpu_arr.map_blocks(
+    upsampled = gpu_arr.map_blocks(
         _upsample_coarse_response_block,
         dtype=cp.float32,
         meta=cp.empty((0, 0), dtype=cp.float32),
@@ -271,6 +271,10 @@ def coarse_large_radius_response(
         full_h=H,
         full_w=W,
     )
+    # The coarse field was filled (cliff-free) where the DEM is NoData; restore
+    # NaN at the true NoData footprint so the large-radius response does not leak
+    # finite values into the exterior.
+    return da.where(da.isnan(gpu_arr), cp.float32(cp.nan), upsampled)
 
 
 def _smooth_for_radius(
@@ -352,21 +356,56 @@ def _radius_to_downsample_factor(
 
 
 def _downsample_nan_aware(block: cp.ndarray, factor: int) -> cp.ndarray:
+    """Downsample by ``factor`` without leaking NoData across the data boundary.
+
+    The previous implementation filled every NoData cell with the *global* block
+    mean before decimating.  Near an irregular data boundary that injects a flat
+    plateau whose elevation is unrelated to the local terrain, so the subsequent
+    spatial operator (AO occlusion, gradient, blur, ...) sees an artificial cliff
+    and renders a dark halo just inside the boundary.
+
+    Instead we compute a **valid-weighted mean** (each coarse cell averages only
+    its finite contributors, so boundary cells are not diluted by NoData) and
+    fill the remaining voids with a smooth, valid-weighted extrapolation -- the
+    same low-frequency strategy used by the preprocessing fill.  The result is
+    finite and *cliff-free*; the true NoData footprint is reapplied to the final
+    output by the pipeline's nodata pass.
+    """
     if factor <= 1:
         return block
     nan_mask = cp.isnan(block)
     h, w = block.shape[:2]
     out_h = max(1, (int(h) + int(factor) - 1) // int(factor))
     out_w = max(1, (int(w) + int(factor) - 1) // int(factor))
-    if nan_mask.any():
-        fill = cp.nanmean(block)
-        fill = cp.where(cp.isfinite(fill), fill, 0.0)
-        work = cp.where(nan_mask, fill, block).astype(cp.float32)
-    else:
-        work = block.astype(cp.float32, copy=False)
     sy = out_h / max(1, h)
     sx = out_w / max(1, w)
-    return zoom(work, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
+
+    if not nan_mask.any():
+        work = block.astype(cp.float32, copy=False)
+        return zoom(work, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
+
+    # Valid-weighted decimation: average finite contributors only.
+    valid = (~nan_mask).astype(cp.float32)
+    filled0 = cp.where(nan_mask, cp.float32(0), block).astype(cp.float32)
+    num = zoom(filled0, zoom=(sy, sx), order=1, mode="nearest")
+    den = zoom(valid, zoom=(sy, sx), order=1, mode="nearest")
+    coarse = cp.where(den > 1e-6, num / cp.maximum(den, cp.float32(1e-6)),
+                      cp.float32(cp.nan)).astype(cp.float32)
+
+    # Smoothly extrapolate any coarse voids from surrounding valid cells so the
+    # downsampled surface stays continuous at the data boundary (no cliff).
+    cnan = cp.isnan(coarse)
+    if bool(cnan.any()):
+        cvalid = (~cnan).astype(cp.float32)
+        sigma = max(1.0, float(min(coarse.shape[:2])) / 64.0)
+        sv = gaussian_filter(cp.where(cnan, cp.float32(0), coarse).astype(cp.float32),
+                             sigma=sigma, mode="nearest")
+        sw = gaussian_filter(cvalid, sigma=sigma, mode="nearest")
+        gmean = cp.nanmean(coarse)
+        gmean = cp.where(cp.isfinite(gmean), gmean, cp.float32(0))
+        smooth = cp.where(sw > 1e-6, sv / cp.maximum(sw, cp.float32(1e-6)), gmean)
+        coarse = cp.where(cnan, smooth, coarse).astype(cp.float32)
+    return coarse.astype(cp.float32)
 
 
 def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int]) -> cp.ndarray:

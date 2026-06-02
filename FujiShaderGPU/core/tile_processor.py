@@ -1458,18 +1458,13 @@ def process_single_tile(
                     # Avoid flooding IDLE socket with thousands of warnings on huge rasters.
                     logger.debug(f"Tile({ty}, {tx}) has high NoData ratio: {nodata_ratio:.1%}")
 
-                if algorithm in {"rvi", "fractal_anomaly"}:
-                    # RVI uses NaN-aware filters. Keep NoData as NaN to avoid boundary
-                    # virtual-fill outliers that can dominate normalization.
-                    dem_tile_processed = dem_tile.astype(np.float32, copy=True)
-                    if mask_nodata is not None:
-                        dem_tile_processed[mask_nodata] = np.nan
-                else:
-                    dem_tile_processed = (
-                        _handle_nodata_ultra_fast(dem_tile, mask_nodata)
-                        if mask_nodata is not None
-                        else dem_tile
-                    )
+                # Keep NoData as NaN for *all* algorithms so the shared NaN-aware
+                # kernels handle the boundary (no virtual-fill cliff -> no dark
+                # halo).  This matches the Dask-CUDA backend, which always feeds
+                # NaN, and apply_nodata_mask restores the NoData footprint below.
+                dem_tile_processed = dem_tile.astype(np.float32, copy=True)
+                if mask_nodata is not None:
+                    dem_tile_processed[mask_nodata] = np.nan
             else:
                 dem_tile_processed = dem_tile
 

@@ -395,7 +395,9 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                 # CRS情報を引き継ぐ
                 if hasattr(data, 'rio') and data.rio.crs is not None:
                     computed_da.rio.write_crs(data.rio.crs, inplace=True)
-                
+                # NoData=NaN を出力に明示（境界の黒帯を防ぐ）
+                computed_da.rio.write_nodata(np.float32(np.nan), inplace=True)
+
                 # COG書き込み
                 logger.info("Writing to COG...")
                 computed_da.rio.to_raster(
@@ -646,6 +648,15 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             if result is None:
                 raise ValueError("Chunk consolidation failed")
             result = None
+
+            # NoData=NaN を中間GeoTIFFへ明示設定。これでオーバービュー(AVERAGE)が
+            # NoData を除外し、最終COGも nodata タグを継承する(境界の黒帯を防ぐ)。
+            _mds = gdal.Open(str(merged_tif), gdal.GA_Update)
+            if _mds is not None:
+                try:
+                    _mds.GetRasterBand(1).SetNoDataValue(float("nan"))
+                finally:
+                    _mds = None
 
             # フル解像度データは merged_tmp.tif に揃ったので、チャンクとVRTを
             # 即座に削除してディスクを解放してから重い後段(オーバービュー+COG)へ進む。
@@ -1180,6 +1191,16 @@ def run_pipeline(
 
         # アルゴリズムを適用（遅延評価）
         result_gpu: da.Array = algo.process(gpu_arr, **params)
+
+        # Re-apply the input NoData footprint: keep NaN exactly where the source
+        # DEM is NoData.  Algorithms are NaN-aware internally, but multiscale /
+        # large-radius paths fill voids (cliff-free) for stability; this final
+        # mask guarantees the exterior stays NoData with no boundary halo.
+        # (Skip when the algorithm changed the shape, e.g. agg='stack'.)
+        if result_gpu.shape == gpu_arr.shape:
+            result_gpu = da.where(
+                da.isnan(gpu_arr), cp.float32(cp.nan), result_gpu
+            )
 
         # Drop internal helper arrays so they never reach COG metadata (str(params)).
         for _k in (
