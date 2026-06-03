@@ -62,6 +62,13 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         )
 
         parser.add_argument(
+            "--nodata",
+            type=str,
+            default=None,
+            help="NoData値を明示指定 (例: -9999, 0, nan)。指定値は処理前にfloat NaNへ置換"
+        )
+
+        parser.add_argument(
             "--verbose",
             action="store_true",
             help="詳細なログ出力を有効化"
@@ -444,6 +451,19 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if not getattr(args, 'radii', None) and not getattr(args, 'auto_radii', True):
                 self.parser.error("radiiを指定するか、--auto-radiiを有効にしてください")
 
+    @staticmethod
+    def _parse_nodata_override(raw_value):
+        """Parse --nodata into a float (or None). 'nan' is accepted (no-op)."""
+        if raw_value is None:
+            return None
+        text = str(raw_value).strip().lower()
+        if text in {"nan", "+nan", "-nan"}:
+            return float("nan")
+        try:
+            return float(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --nodata value: {raw_value}") from exc
+
     def execute(self, args: argparse.Namespace):
         """Dask-CUDA処理を実行"""
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.70"
@@ -699,6 +719,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 chunk=getattr(args, 'chunk', None),
                 show_progress=params['show_progress'],
                 memory_fraction=getattr(args, 'memory_fraction', None),
+                nodata_override=self._parse_nodata_override(getattr(args, 'nodata', None)),
                 **rvi_params,
                 **algo_params
             )

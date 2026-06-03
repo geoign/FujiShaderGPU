@@ -81,6 +81,45 @@ def _fill_coarse_surface(coarse: np.ndarray, valid: np.ndarray) -> np.ndarray:
     return out
 
 
+def _detect_border_nodata(
+    sample: np.ndarray,
+    valid: np.ndarray,
+    *,
+    min_border_fraction: float = 0.5,
+    min_total_fraction: float = 0.02,
+) -> Optional[float]:
+    """Guess an *undeclared* NoData value from a dominant constant border.
+
+    Many DEMs ship with a wide constant frame (sea / dataset exterior) whose
+    NoData tag was lost during conversion.  When a single finite value occupies
+    a large fraction of the raster's outer ring -- and a non-trivial share of the
+    whole grid -- it is almost certainly that forgotten sentinel rather than real
+    terrain.  Returns the value, or ``None`` when no clear constant frame exists.
+
+    ``sample`` must be a NEAREST-resampled coarse grid (no averaging) so exterior
+    cells keep the *exact* sentinel value; ``valid`` excludes cells already masked
+    by the declared NoData (so an already-tagged sentinel is not re-reported).
+    """
+    h, w = sample.shape
+    if h < 8 or w < 8:
+        return None
+    ring = np.concatenate([sample[0, :], sample[-1, :], sample[1:-1, 0], sample[1:-1, -1]])
+    ring_valid = np.concatenate([valid[0, :], valid[-1, :], valid[1:-1, 0], valid[1:-1, -1]])
+    ring = ring[ring_valid & np.isfinite(ring)]
+    if ring.size == 0:
+        return None
+    vals, counts = np.unique(ring, return_counts=True)
+    i = int(np.argmax(counts))
+    cand = float(vals[i])
+    if counts[i] / ring.size < float(min_border_fraction):
+        return None
+    # Require the value to cover a non-trivial share of the whole grid, so a thin
+    # genuine coastal strip on one edge is not mistaken for a NoData frame.
+    if float(np.mean(sample == np.float32(cand))) < float(min_total_fraction):
+        return None
+    return cand
+
+
 def _coarse_shape(width: int, height: int, coarse_max: int) -> tuple[int, int]:
     scale = max(width / coarse_max, height / coarse_max, 1.0)
     cw = max(1, int(round(width / scale)))
@@ -163,12 +202,24 @@ def preprocess_dem_to_cog(
     zstd_level: int = 1,
     num_threads: str = "ALL_CPUS",
     overwrite: bool = False,
+    nodata_override: Optional[float] = None,
+    detect_nodata: bool = True,
+    nodata_border_fraction: float = 0.5,
 ) -> None:
     """Convert ``input_path`` (any GDAL raster) into a FujiShaderGPU-ready COG.
 
     The output is a single-band float32 COG (ZSTD, ``block_size`` tiles, internal
     AVERAGE overviews).  CRS and pixel grid are preserved; **no reprojection** is
     performed.  Band 1 is used.  See the module docstring for ``fill_mode``.
+
+    NoData handling (all converted to float NaN *before* filling):
+    - the raster's declared NoData (read via masked I/O);
+    - ``nodata_override`` -- an explicit sentinel to treat as NoData even when the
+      raster declares none (or declares a different one);
+    - when ``detect_nodata`` is true (default), a *dominant constant border* is
+      auto-detected and treated as an undeclared NoData sentinel.  Disable with
+      ``detect_nodata=False``; ``nodata_border_fraction`` (default 0.5) is the
+      minimum share of the raster's outer ring the value must occupy.
     """
     fill_mode = str(fill_mode).lower()
     if fill_mode not in FILL_MODES:
@@ -205,6 +256,41 @@ def preprocess_dem_to_cog(
         )
         coarse = np.ma.getdata(coarse_ma).astype(np.float32, copy=False)
         cmask = np.ma.getmaskarray(coarse_ma)
+
+        # ---- Extra NoData sentinels -> NaN (override + auto-detected) --------
+        # The declared NoData is already masked by the masked read above.  Here
+        # we additionally honour an explicit override and, by default, sniff out
+        # an *undeclared* constant border (a NoData frame whose tag was lost in
+        # conversion) so it is not treated as real terrain by the fill / pipeline.
+        extra_nodata: list[float] = []
+        if nodata_override is not None and np.isfinite(nodata_override):
+            extra_nodata.append(float(nodata_override))
+            logger.info("NoData override: %s -> NaN", float(nodata_override))
+        if detect_nodata:
+            nn_ma = src.read(
+                1, out_shape=(ch, cw), resampling=Resampling.nearest,
+                out_dtype=np.float32, masked=True,
+            )
+            nn = np.ma.getdata(nn_ma).astype(np.float32, copy=False)
+            nn_valid = (~np.ma.getmaskarray(nn_ma)) & np.isfinite(nn)
+            detected = _detect_border_nodata(
+                nn, nn_valid, min_border_fraction=nodata_border_fraction,
+            )
+            if detected is not None:
+                already = any(np.isclose(detected, v) for v in extra_nodata)
+                declared = src_nodata is not None and np.isclose(detected, float(src_nodata))
+                if not already and not declared:
+                    extra_nodata.append(float(detected))
+                    logger.warning(
+                        "Auto-detected undeclared NoData from constant border: %s -> NaN "
+                        "(disable with --no-detect-nodata / detect_nodata=False)",
+                        float(detected),
+                    )
+
+        # Fold the sentinels into the coarse mask so the fill surface, edge
+        # connectivity (enclosed), and hole detection treat them as NoData.
+        for v in extra_nodata:
+            cmask = cmask | (coarse == np.float32(v))
         cvalid = (~cmask) & np.isfinite(coarse)
         has_holes = bool((~cvalid).any())
 
@@ -268,6 +354,14 @@ def preprocess_dem_to_cog(
                     )
                     arr = np.ma.getdata(band_ma).astype(np.float32, copy=True)
                     wmask = np.ma.getmaskarray(band_ma) | ~np.isfinite(arr)
+                    for v in extra_nodata:
+                        wmask = wmask | (arr == np.float32(v))
+                    # Normalise every NoData cell to NaN up front, so finite
+                    # sentinels (e.g. -9999) are handled identically to declared
+                    # NoData regardless of fill mode (the fill step below then
+                    # overwrites only the cells it is meant to fill).
+                    if wmask.any():
+                        arr = np.where(wmask, np.float32(np.nan), arr).astype(np.float32)
 
                     if do_fill and wmask.any():
                         # Sample the global coarse surface at this band's pixel

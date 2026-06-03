@@ -81,6 +81,25 @@ NoData 穴埋めモード (--fill-mode):
         help="GDAL の並列スレッド数 (default: ALL_CPUS)",
     )
     parser.add_argument(
+        "--nodata",
+        type=str,
+        default=None,
+        help="NoData値を明示指定 (例: -9999, 0, nan)。指定値はNaNに置換してから穴埋め",
+    )
+    parser.add_argument(
+        "--no-detect-nodata",
+        dest="detect_nodata",
+        action="store_false",
+        help="外周の固定値からの未指定NoData自動検出を無効化 (default: 有効)",
+    )
+    parser.set_defaults(detect_nodata=True)
+    parser.add_argument(
+        "--nodata-border-fraction",
+        type=float,
+        default=0.5,
+        help="自動検出: 値が外周リングを占める最小割合 (default: 0.5)",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="出力が存在する場合も上書き",
@@ -92,6 +111,20 @@ NoData 穴埋めモード (--fill-mode):
         help="ログレベル (default: INFO)",
     )
     return parser
+
+
+def _parse_nodata(raw_value):
+    """Parse a --nodata string into a float (or None). 'nan' is accepted but is a
+    no-op for filling (already NaN); finite values are converted to NaN."""
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip().lower()
+    if text in {"nan", "+nan", "-nan"}:
+        return float("nan")
+    try:
+        return float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid --nodata value: {raw_value}") from exc
 
 
 def main(argv=None) -> None:
@@ -113,6 +146,9 @@ def main(argv=None) -> None:
             zstd_level=args.zstd_level,
             num_threads=args.num_threads,
             overwrite=args.force,
+            nodata_override=_parse_nodata(args.nodata),
+            detect_nodata=args.detect_nodata,
+            nodata_border_fraction=args.nodata_border_fraction,
         )
     except Exception as exc:
         logger.error("前処理に失敗しました: %s", exc)

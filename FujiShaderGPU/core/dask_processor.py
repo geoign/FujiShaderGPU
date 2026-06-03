@@ -1000,6 +1000,8 @@ def run_pipeline(
 
     # メモリフラクションの取得（algo_paramsから、なければデフォルト）
     memory_fraction = algo_params.pop('memory_fraction', None)
+    # NoData override: 指定値を読み込み後に float NaN へ置換（アルゴリズムには渡さない）
+    nodata_override = algo_params.pop('nodata_override', None)
     cluster, client = make_cluster(memory_fraction)  # dask_cluster.py 直接呼び出し
     
     try:
@@ -1030,7 +1032,12 @@ def run_pipeline(
         
         # 6-1) DEM 遅延ロード (COG または Zarr)
         dem: xr.DataArray = load_input_dataarray(src_cog, chunk)
-        
+
+        # 手動 NoData 指定: 一致セルを NaN に置換（遅延・チャンク維持）。
+        if nodata_override is not None and np.isfinite(nodata_override):
+            dem = dem.where(dem != np.float32(nodata_override))
+            logger.info("Applied --nodata override: %s -> NaN", float(nodata_override))
+
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
 
