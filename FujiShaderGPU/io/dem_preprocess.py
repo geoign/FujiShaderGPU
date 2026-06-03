@@ -142,6 +142,36 @@ def _band_height(width: int, target_pixels: int = 16_000_000) -> int:
 # ---------------------------------------------------------------------------
 # COG writer
 # ---------------------------------------------------------------------------
+def _cog_creation_options(
+    *,
+    block_size: int,
+    overview_count: int,
+    zstd_level: int,
+    num_threads: str,
+) -> list[str]:
+    return [
+        "COMPRESS=ZSTD",
+        f"LEVEL={zstd_level}",
+        "PREDICTOR=3",  # float32
+        f"BLOCKSIZE={block_size}",
+        "OVERVIEWS=IGNORE_EXISTING",
+        "OVERVIEW_RESAMPLING=AVERAGE",
+        f"OVERVIEW_COUNT={overview_count}",
+        "OVERVIEW_COMPRESS=ZSTD",
+        "BIGTIFF=YES",
+        f"NUM_THREADS={num_threads}",
+    ]
+
+
+def _validate_cog_overviews(dst_cog: Path) -> None:
+    ds = gdal.Open(str(dst_cog), gdal.GA_ReadOnly)
+    ov = ds.GetRasterBand(1).GetOverviewCount() if ds is not None else 0
+    ds = None
+    if ov <= 0:
+        raise RuntimeError(f"COG output unexpectedly has no overviews: {dst_cog}")
+    logger.info("COG overview levels: %d", ov)
+
+
 def _translate_to_cog(
     src_tiff: Path,
     dst_cog: Path,
@@ -162,30 +192,109 @@ def _translate_to_cog(
             "GDAL COG driver is unavailable (GDAL >= 3.1 required). "
             "Update GDAL to produce FujiShaderGPU-compatible COGs."
         )
-    creation_options = [
-        "COMPRESS=ZSTD",
-        f"LEVEL={zstd_level}",
-        "PREDICTOR=3",  # float32
-        f"BLOCKSIZE={block_size}",
-        "OVERVIEWS=IGNORE_EXISTING",
-        "OVERVIEW_RESAMPLING=AVERAGE",
-        f"OVERVIEW_COUNT={overview_count}",
-        "OVERVIEW_COMPRESS=ZSTD",
-        "BIGTIFF=YES",
-        f"NUM_THREADS={num_threads}",
-    ]
+    creation_options = _cog_creation_options(
+        block_size=block_size,
+        overview_count=overview_count,
+        zstd_level=zstd_level,
+        num_threads=num_threads,
+    )
     logger.info("Writing COG (ZSTD + AVERAGE overviews x%d): %s", overview_count, dst_cog)
-    result = gdal.Translate(str(dst_cog), str(src_tiff), format="COG", creationOptions=creation_options)
+    result = gdal.Translate(
+        str(dst_cog),
+        str(src_tiff),
+        format="COG",
+        creationOptions=creation_options,
+    )
     if result is None:
         raise RuntimeError(f"COG translate failed: {dst_cog}")
     result = None
 
-    ds = gdal.Open(str(dst_cog), gdal.GA_ReadOnly)
-    ov = ds.GetRasterBand(1).GetOverviewCount() if ds is not None else 0
-    ds = None
-    if ov <= 0:
-        raise RuntimeError(f"COG output unexpectedly has no overviews: {dst_cog}")
-    logger.info("COG overview levels: %d", ov)
+    _validate_cog_overviews(dst_cog)
+
+
+def _translate_source_to_cog_fast(
+    src_path: Path,
+    dst_cog: Path,
+    *,
+    block_size: int,
+    overview_count: int,
+    zstd_level: int,
+    num_threads: str,
+    src_nodata: Optional[float],
+    dst_nodata: Optional[float],
+) -> None:
+    """Translate source band 1 directly to COG when Python-side fill is a no-op."""
+    if gdal.GetDriverByName("COG") is None:
+        raise RuntimeError(
+            "GDAL COG driver is unavailable (GDAL >= 3.1 required). "
+            "Update GDAL to produce FujiShaderGPU-compatible COGs."
+        )
+
+    creation_options = _cog_creation_options(
+        block_size=block_size,
+        overview_count=overview_count,
+        zstd_level=zstd_level,
+        num_threads=num_threads,
+    )
+    dst_cog.parent.mkdir(parents=True, exist_ok=True)
+
+    translate_src = str(src_path)
+    vrt_path: Optional[str] = None
+    if src_nodata is not None and dst_nodata is not None:
+        # BuildVRT has srcNodata support while TranslateOptions does not.  The
+        # VRT keeps the fast path inside GDAL while preserving the NaN NoData
+        # contract used by the streaming path.
+        vrt_path = f"/vsimem/fujishader_prepare_{os.getpid()}_{id(src_path)}.vrt"
+        vrt = gdal.BuildVRT(
+            vrt_path,
+            [str(src_path)],
+            bandList=[1],
+            srcNodata=float(src_nodata),
+            VRTNodata=float(dst_nodata),
+        )
+        if vrt is None:
+            raise RuntimeError(f"VRT build failed for fast COG translate: {src_path}")
+        vrt = None
+        translate_src = vrt_path
+
+    try:
+        kwargs = {
+            "format": "COG",
+            "outputType": gdal.GDT_Float32,
+            "bandList": [1],
+            "creationOptions": creation_options,
+        }
+        if dst_nodata is not None:
+            kwargs["noData"] = float(dst_nodata)
+        logger.info(
+            "Writing COG directly from source (ZSTD + AVERAGE overviews x%d): %s",
+            overview_count,
+            dst_cog,
+        )
+        result = gdal.Translate(str(dst_cog), translate_src, **kwargs)
+        if result is None:
+            raise RuntimeError(f"Direct COG translate failed: {dst_cog}")
+        result = None
+    finally:
+        if vrt_path is not None:
+            gdal.Unlink(vrt_path)
+
+    _validate_cog_overviews(dst_cog)
+
+
+def _dedupe_finite_nodata_values(
+    src_nodata: Optional[float],
+    extra_nodata: list[float],
+) -> list[float]:
+    values: list[float] = []
+    if src_nodata is not None and np.isfinite(src_nodata):
+        values.append(float(src_nodata))
+    for value in extra_nodata:
+        if not np.isfinite(value):
+            continue
+        if not any(np.isclose(value, existing) for existing in values):
+            values.append(float(value))
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +424,58 @@ def preprocess_dem_to_cog(
 
         # Output NoData policy: dense for 'all', NaN sentinel otherwise.
         out_nodata: Optional[float] = None if fill_mode == "all" else float("nan")
+
+        # If filling is disabled or the raster has no holes, keep the whole
+        # conversion inside GDAL.  This avoids the full-resolution Python
+        # read/modify/write staging pass and the temporary GeoTIFF.
+        nodata_values = _dedupe_finite_nodata_values(src_nodata, extra_nodata)
+        if not do_fill:
+            fast_src_nodata: Optional[float] = None
+            fast_dst_nodata = out_nodata
+            can_fast_translate = True
+            if out_nodata is None:
+                # 'all' mode promises a dense output with no NoData metadata.
+                # Without a fill pass, that is only equivalent when there is no
+                # declared or inferred NoData to clear.
+                can_fast_translate = (
+                    not nodata_values
+                    and not (src_nodata is not None and not np.isfinite(src_nodata))
+                )
+            elif len(nodata_values) > 1:
+                # GDAL's direct Translate path can set one source NoData value
+                # via a VRT.  Multiple finite sentinels still need the existing
+                # streaming normalisation loop.
+                can_fast_translate = False
+            elif nodata_values:
+                fast_src_nodata = nodata_values[0]
+
+            if can_fast_translate:
+                if fill_mode == "none":
+                    logger.info("Fill=none: using direct COG translate fast path.")
+                else:
+                    logger.info("Fill is a no-op; using direct COG translate fast path.")
+                _translate_source_to_cog_fast(
+                    in_path,
+                    out_path,
+                    block_size=block_size,
+                    overview_count=overview_count,
+                    zstd_level=zstd_level,
+                    num_threads=num_threads,
+                    src_nodata=fast_src_nodata,
+                    dst_nodata=fast_dst_nodata,
+                )
+                size_mb = os.path.getsize(out_path) / (1024 * 1024)
+                logger.info(
+                    "[OK] COG written: %s (%.1f MB, fill=%s)",
+                    out_path,
+                    size_mb,
+                    fill_mode,
+                )
+                return
+
+            logger.info(
+                "No fill required, but NoData normalisation needs the streaming path."
+            )
 
         # ---- 2) Stream full-resolution to a temporary tiled GeoTIFF ---------
         tmp_parent = out_path.resolve().parent
