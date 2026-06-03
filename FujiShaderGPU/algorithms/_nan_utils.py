@@ -392,8 +392,16 @@ def _downsample_nan_aware(block: cp.ndarray, factor: int) -> cp.ndarray:
     coarse = cp.where(den > 1e-6, num / cp.maximum(den, cp.float32(1e-6)),
                       cp.float32(cp.nan)).astype(cp.float32)
 
-    # Smoothly extrapolate any coarse voids from surrounding valid cells so the
-    # downsampled surface stays continuous at the data boundary (no cliff).
+    # Fill only thin, well-enclosed coarse voids; preserve NaN over the large
+    # exterior NoData (sea / dataset outside).  The previous behaviour
+    # extrapolated *every* void -- including the border-connected exterior --
+    # falling back to the coarse global mean where the Gaussian support did not
+    # reach.  That injected a flat plateau at the mean elevation just outside the
+    # data boundary.  The downstream large-radius operators (RVI mean-subtraction,
+    # AO occlusion) are NaN-aware and would down-weight a NaN exterior to zero,
+    # but a *finite* plateau is not excluded: it leaks into the interior valid
+    # pixels and renders a broad halo along the periphery that destroys detail.
+    # Keeping the exterior as NaN lets those NaN-aware operators ignore it.
     cnan = cp.isnan(coarse)
     if bool(cnan.any()):
         cvalid = (~cnan).astype(cp.float32)
@@ -401,10 +409,12 @@ def _downsample_nan_aware(block: cp.ndarray, factor: int) -> cp.ndarray:
         sv = gaussian_filter(cp.where(cnan, cp.float32(0), coarse).astype(cp.float32),
                              sigma=sigma, mode="nearest")
         sw = gaussian_filter(cvalid, sigma=sigma, mode="nearest")
-        gmean = cp.nanmean(coarse)
-        gmean = cp.where(cp.isfinite(gmean), gmean, cp.float32(0))
-        smooth = cp.where(sw > 1e-6, sv / cp.maximum(sw, cp.float32(1e-6)), gmean)
-        coarse = cp.where(cnan, smooth, coarse).astype(cp.float32)
+        # A void is "enclosed" only when valid terrain dominates its local
+        # Gaussian support (sw > 0.5).  The broad exterior NoData has sw ~ 0 and
+        # is intentionally left as NaN so it cannot contaminate the boundary.
+        enclosed = cnan & (sw > cp.float32(0.5))
+        smooth = sv / cp.maximum(sw, cp.float32(1e-6))
+        coarse = cp.where(enclosed, smooth, coarse).astype(cp.float32)
     return coarse.astype(cp.float32)
 
 
@@ -415,7 +425,20 @@ def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int]) -> cp.n
         return block.astype(cp.float32, copy=False)
     sy = th / max(1, h)
     sx = tw / max(1, w)
-    out = zoom(block, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
+    nan_mask = cp.isnan(block)
+    if not bool(nan_mask.any()):
+        out = zoom(block, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
+        return out[:th, :tw]
+    # NaN-aware bilinear upsample: interpolate valid contributors only so the
+    # exterior NoData (now preserved as NaN by _downsample_nan_aware) does not
+    # bleed a NaN fringe into the interior valid pixels.  Cells whose upsampled
+    # valid weight is ~0 (the true exterior) are restored to NaN.
+    valid = (~nan_mask).astype(cp.float32)
+    filled = cp.where(nan_mask, cp.float32(0), block).astype(cp.float32)
+    num = zoom(filled, zoom=(sy, sx), order=1, mode="nearest")
+    den = zoom(valid, zoom=(sy, sx), order=1, mode="nearest")
+    out = cp.where(den > cp.float32(1e-3), num / cp.maximum(den, cp.float32(1e-6)),
+                   cp.float32(cp.nan)).astype(cp.float32)
     return out[:th, :tw]
 
 
