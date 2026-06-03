@@ -28,13 +28,16 @@ def get_gpu_context():
     return _thread_local.mempool, _thread_local.pinned_mempool
 
 @contextlib.contextmanager
-def gpu_memory_pool():
+def gpu_memory_pool(release: bool = False, synchronize: bool = False):
     """Context manager for the GPU memory pool (improved)."""
     mempool, pinned_mempool = get_gpu_context()
     try:
         yield
     finally:
-        # More efficient memory cleanup
-        cp.cuda.Stream.null.synchronize()  # ensure GPU work has finished
-        mempool.free_all_blocks()
-        pinned_mempool.free_all_blocks()
+        # Keep allocator caches hot on the tile backend. Full cleanup is still
+        # available for explicit low-memory recovery paths.
+        if synchronize:
+            cp.cuda.Stream.null.synchronize()
+        if release:
+            mempool.free_all_blocks()
+            pinned_mempool.free_all_blocks()

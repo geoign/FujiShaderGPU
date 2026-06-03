@@ -1028,10 +1028,10 @@ def _compute_global_scale_space_surprise_stats(
             normalize=False,
             nan_mask=cp.isnan(sample_gpu),
         )
-        valid = cp.asnumpy(raw[~cp.isnan(raw)])
+        valid = raw[~cp.isnan(raw)]
         if valid.size == 0:
             return None
-        scale = float(np.percentile(np.maximum(valid, 0.0), NORMAL_PERCENTILE))
+        scale = float(cp.percentile(cp.maximum(valid, 0.0), NORMAL_PERCENTILE))
         if not np.isfinite(scale) or scale <= 1e-9:
             return None
         return (0.0, scale)
@@ -1382,7 +1382,7 @@ def process_single_tile(
     _quantize_dtype = algo_params.pop("_quantize_dtype", None)
 
     try:
-        with gpu_memory_pool():
+        with gpu_memory_pool(release=False):
             # Memory-mapped read (optimized)
             window = Window(win_x_off, win_y_off, win_w, win_h)
             dem_tile = read_tile_window(input_cog_path, window)
@@ -1473,28 +1473,27 @@ def process_single_tile(
             output_nodata_for_mask = np.nan if algorithm in SIGNED_NORMALIZATION_ALGOS else nodata
             result_gpu = apply_nodata_mask(result_gpu, mask_nodata, output_nodata_for_mask)
 
-            # CPU transfer (optimized)
-            result_tile = cp.asnumpy(result_gpu)
-            if vram_monitor:
-                used_gb = cp.get_default_memory_pool().used_bytes() / (1024**3)
-                logger.debug(f"Tile ({ty}, {tx}) VRAM used: {used_gb:.2f} GB")
-            del dem_gpu, result_gpu
-
-            # Extract the core region (also supports multi-band output)
+            # Crop on GPU before PCIe transfer; the padded halo is discarded.
             core_x_in_win = core_x - win_x_off
             core_y_in_win = core_y - win_y_off
-            if result_tile.ndim == 3:
-                # Multi-band output in HxWxC layout
-                result_core = result_tile[
+            if result_gpu.ndim == 3:
+                result_core_gpu = result_gpu[
                     core_y_in_win : core_y_in_win + core_h,
                     core_x_in_win : core_x_in_win + core_w,
                     :,
                 ]
             else:
-                result_core = result_tile[
+                result_core_gpu = result_gpu[
                     core_y_in_win : core_y_in_win + core_h,
                     core_x_in_win : core_x_in_win + core_w,
                 ]
+
+            # CPU transfer (optimized)
+            result_core = cp.asnumpy(result_core_gpu)
+            if vram_monitor:
+                used_gb = cp.get_default_memory_pool().used_bytes() / (1024**3)
+                logger.debug(f"Tile ({ty}, {tx}) VRAM used: {used_gb:.2f} GB")
+            del dem_gpu, result_gpu, result_core_gpu
             if tile_algo_params.get("_apply_global_stats_post", False):
                 core_mask_nodata = None
                 if mask_nodata is not None:
@@ -1639,7 +1638,14 @@ def process_dem_tiles(
         target_distances, weights = None, None
 
     # Get GPU configuration
-    gpu_config = get_gpu_config(gpu_type, sigma, multiscale_mode, pixel_size, target_distances)
+    gpu_config = get_gpu_config(
+        gpu_type,
+        sigma,
+        multiscale_mode,
+        pixel_size,
+        target_distances,
+        algorithm=algorithm,
+    )
     user_padding_provided = padding is not None
     
     # Parameter optimization

@@ -27,6 +27,7 @@ def get_gpu_config(
     multiscale_mode: bool = True,
     pixel_size: float = 0.5,
     target_distances: Optional[List[float]] = None,
+    algorithm: str = "",
 ) -> dict:
     """GPU type and system specs aware runtime config."""
     sys_config = detect_optimal_system_config()
@@ -43,7 +44,12 @@ def get_gpu_config(
     vram_gb = float(sys_config.get("vram_gb", 8.0))
     cpu_count = int(sys_config.get("cpu_count", 4))
     is_colab_env = bool(sys_config.get("is_colab", False))
-    tuned = auto_tune(vram_gb, cpu_count=cpu_count, is_colab=is_colab_env)
+    tuned = auto_tune(
+        vram_gb,
+        algorithm=algorithm,
+        cpu_count=cpu_count,
+        is_colab=is_colab_env,
+    )
 
     if multiscale_mode:
         if target_distances:
