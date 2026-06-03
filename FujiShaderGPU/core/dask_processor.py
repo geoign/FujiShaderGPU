@@ -44,7 +44,7 @@ except ImportError:
 
 from ..algorithms.common.auto_params import determine_optimal_radii
 from ..io.raster_info import metric_pixel_scales_from_metadata
-from ..config.auto_tune import compute_dask_chunk
+from ..config.auto_tune import compute_dask_chunk, compute_memory_fraction
 from .dask_cluster import make_cluster
 from .dask_io import (
     is_zarr_path,
@@ -1016,17 +1016,42 @@ def run_pipeline(
                     total_pixels = src.width * src.height
                     total_gb = (total_pixels * 4) / (1024**3)
                 
-            # VRAM-aware dynamic chunk sizing
+            # VRAM-aware dynamic chunk sizing.
+            #
+            # The chunk must be sized for the RMM pool the worker actually
+            # receives, not the full card.  make_cluster derives the pool from
+            # device_memory_limit = min(total, free) * memory_fraction, so a
+            # user-lowered --memory-fraction shrinks the pool.  The chunk anchors
+            # (auto_tune) pair, e.g., chunk=8192 with a ~28-32GB pool; if we keep
+            # sizing the chunk against the full VRAM while the pool is halved,
+            # the halo-heavy spatial passes OOM the pool.  Scale the VRAM budget
+            # by the ratio of the requested to the auto-tuned memory_fraction so
+            # the chunk tracks the pool (no change when memory_fraction is the
+            # default / unset).
             try:
                 _meminfo = cp.cuda.runtime.memGetInfo()
                 _vram_gb = _meminfo[1] / (1024**3)
             except Exception:
                 _vram_gb = 16.0
-            chunk = compute_dask_chunk(
-                _vram_gb, data_gb=total_gb, algorithm=algorithm,
+            _default_mf = compute_memory_fraction(
+                _vram_gb, is_colab=('google.colab' in sys.modules)
             )
-            
-            logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
+            if memory_fraction is not None:
+                _effective_mf = max(0.1, min(float(memory_fraction), 0.95))
+            else:
+                _effective_mf = _default_mf
+            _budget_vram_gb = max(
+                4.0, _vram_gb * (_effective_mf / max(_default_mf, 1e-3))
+            )
+            chunk = compute_dask_chunk(
+                _budget_vram_gb, data_gb=total_gb, algorithm=algorithm,
+            )
+
+            logger.info(
+                f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk} "
+                f"(VRAM={_vram_gb:.0f}GB, mem_frac={_effective_mf:.2f}, "
+                f"budget={_budget_vram_gb:.0f}GB)"
+            )
         
         # 6-1) DEM 遅延ロード (COG または Zarr)
         dem: xr.DataArray = load_input_dataarray(src_cog, chunk)
