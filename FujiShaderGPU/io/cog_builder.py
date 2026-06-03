@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import List, Optional
 
 from osgeo import gdal
@@ -311,7 +312,11 @@ def _create_cog_gtiff_ultra_fast(
 ) -> None:
     """Fallback COG creation path using a staged GTiff with overviews."""
     start = time.time()
-    temp_tiff_path = output_cog_path.replace(".tif", "_temp.tif")
+    # Insert "_temp" before the final suffix rather than string-replacing ".tif",
+    # which would mangle paths where ".tif" also appears earlier (e.g. a parent
+    # directory named "...tif/" or an output like "foo.tif.bak.tif").
+    _out_path = Path(output_cog_path)
+    temp_tiff_path = str(_out_path.with_name(f"{_out_path.stem}_temp{_out_path.suffix}"))
 
     gtiff_options = [
         "TILED=YES",

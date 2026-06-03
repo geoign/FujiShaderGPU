@@ -29,7 +29,6 @@ from ._base import (
     Constants,
     DaskAlgorithm,
     classify_resolution,
-    get_gradient_scale_factor,
 )
 
 # --- _nan_utils.py ---

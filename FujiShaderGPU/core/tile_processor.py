@@ -203,8 +203,6 @@ def _normalization_target_range(algorithm: str) -> str:
     """Return output normalization policy: 'none' | 'unit' | 'signed'."""
     if algorithm in NO_NORMALIZATION_ALGOS:
         return "none"
-    if algorithm == "specular":
-        return "unit_specular"
     if algorithm == "scale_space_surprise":
         return "unit_surprise"
     if algorithm in SIGNED_NORMALIZATION_ALGOS:
@@ -461,14 +459,6 @@ def _normalize_by_global_stats(
     if arr.ndim == 2 and isinstance(stats, (tuple, list)) and len(stats) == 2 and not isinstance(stats[0], (tuple, list)):
         lo, scale = float(stats[0]), float(stats[1])
         src = arr.astype(np.float32, copy=False)
-        if target_range == "unit_specular":
-            if np.isfinite(lo) and np.isfinite(scale) and scale > lo:
-                # Keep flat areas near middle-gray while expanding subtle contrast globally.
-                center = 0.5 * (lo + scale)
-                half = max(0.5 * (scale - lo), 1e-6)
-                out = 0.5 + 0.45 * np.tanh((src - center) / (0.75 * half))
-                return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
-            return arr
         if target_range == "signed":
             if np.isfinite(lo) and np.isfinite(scale) and scale > lo:
                 center = 0.5 * (lo + scale)
@@ -480,46 +470,6 @@ def _normalize_by_global_stats(
             out = np.clip((src - lo) / scale, 0.0, OVERFLOW_LIMIT)
             if target_range == "unit_surprise":
                 return np.power(out, 1.0 / 2.0).astype(np.float32, copy=False)
-            return np.clip(out, 0.0, OVERFLOW_LIMIT).astype(np.float32, copy=False)
-        return arr
-
-    if arr.ndim == 2 and isinstance(stats, (tuple, list)) and len(stats) >= 3 and not isinstance(stats[0], (tuple, list)):
-        mn, mx = float(stats[0]), float(stats[1])
-        gamma_hint = float(stats[2])
-        if np.isfinite(mn) and np.isfinite(mx) and mx > mn:
-            src = arr.astype(np.float32, copy=False)
-            if target_range == "unit_specular":
-                # Specular-specific global remap using robust quantiles:
-                # stats = (p10, p50, p90). Keep p50 bright enough for plains.
-                p10 = mn
-                p50 = mx
-                p90 = gamma_hint
-                if np.isfinite(p10) and np.isfinite(p50) and np.isfinite(p90) and p90 > p10:
-                    lo_span = max(p50 - p10, 1e-6)
-                    hi_span = max(p90 - p50, 1e-6)
-                    out = np.empty_like(src, dtype=np.float32)
-
-                    lo_mask = src <= p50
-                    lo_t = np.clip((src[lo_mask] - p10) / lo_span, 0.0, 1.0)
-                    # Map lower half to [0.12, 0.65], slightly lifted near plains.
-                    out[lo_mask] = 0.12 + 0.53 * np.power(lo_t, 0.75)
-
-                    hi_mask = ~lo_mask
-                    hi_t = np.clip((src[hi_mask] - p50) / hi_span, 0.0, 1.0)
-                    # Map upper half to [0.65, 0.95], stronger roll-off near highlights.
-                    out[hi_mask] = 0.65 + 0.30 * np.power(hi_t, 1.08)
-
-                    return np.clip(out, 0.0, 1.0).astype(np.float32, copy=False)
-                return src
-            if target_range == "unit_surprise":
-                # Keep low-end latitude: avoid hard floor clipping at mn.
-                # Use a partial floor subtraction to suppress noise while preserving gradation.
-                floor = 0.2 * mn
-                denom = max(mx - floor, 1e-6)
-                out = np.clip((src - floor) / denom, 0.0, OVERFLOW_LIMIT)
-                gamma = max(1e-3, gamma_hint)
-                return np.power(out, 1.0 / gamma).astype(np.float32, copy=False)
-            out = (src - mn) / (mx - mn)
             return np.clip(out, 0.0, OVERFLOW_LIMIT).astype(np.float32, copy=False)
         return arr
 
@@ -695,7 +645,12 @@ def _compute_global_rvi_stats(
             return None
 
         sample_gpu = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
-        rvi_sample = compute_rvi_efficient_block(sample_gpu, radii=radii, weights=rvi_weights)
+        # Pass the sample-grid pixel size so the internal radius->downsample-factor
+        # logic matches the full-resolution tiles (decimated overview => larger
+        # metric pixel size); omitting it defaulted to 1.0 and skewed the factor.
+        rvi_sample = compute_rvi_efficient_block(
+            sample_gpu, radii=radii, weights=rvi_weights, pixel_size=sample_pixel_size,
+        )
         stats = rvi_stat_func(rvi_sample)
         if not stats:
             return None
@@ -1200,18 +1155,6 @@ def _compute_generic_global_algorithm_stats(
         )
         result = cp.asnumpy(probe_result)
         if result.ndim == 2:
-            if algorithm == "specular":
-                valid = result[np.isfinite(result)]
-                if valid.size == 0:
-                    return None
-                p10 = float(np.percentile(valid, 10.0))
-                p50 = float(np.percentile(valid, 50.0))
-                p90 = float(np.percentile(valid, 90.0))
-                if not (np.isfinite(p10) and np.isfinite(p50) and np.isfinite(p90)):
-                    return None
-                if p90 <= p10:
-                    return None
-                return (p10, p50, p90)
             return _unsigned_p80_stats_np(result)
         if result.ndim == 3:
             stats: List[Tuple[float, float]] = []

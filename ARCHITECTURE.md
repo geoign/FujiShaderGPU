@@ -42,7 +42,7 @@ slow full-resolution reads).
   - Implementations are split into the modules below (Phase 1–3 refactor complete).
   - Used by both Dask (`dask/*.py`) and Tile (`tile/*.py` via bridge) backends.
 - **Phase 1 shared-foundation modules**:
-  - `_base.py` — `Constants`, `DaskAlgorithm` ABC, `classify_resolution`, `get_gradient_scale_factor`
+  - `_base.py` — `Constants`, `DaskAlgorithm` ABC, `classify_resolution`
   - `_nan_utils.py` — NaN handling, spatial smoothing, down/up-sampling, `restore_nan`
   - `_global_stats.py` — `determine_optimal_downsample_factor`, `compute_global_stats`, `apply_global_normalization`
   - `_normalization.py` — per-algorithm stats/normalization functions (`rvi_stat_func`, `npr_stat_func`, etc.)
