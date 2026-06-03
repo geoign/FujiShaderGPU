@@ -18,6 +18,7 @@ from ._nan_utils import (
     handle_nan_with_gaussian, handle_nan_with_uniform,
     restore_nan,
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
+    _bilinear_sample_coarse,
 )
 from ._global_stats import (
     apply_global_normalization,
@@ -170,8 +171,6 @@ def _rvi_add_large_block(
     (block-local location + (off_r, off_c)) so the result is seam-free across
     chunks (Dask, offset 0) and tiles (offset = tile window origin).
     """
-    from cupyx.scipy.ndimage import map_coordinates
-
     if block_info is not None and block_info.get(0) is not None:
         (r0, r1), (c0, c1) = block_info[0]["array-location"][0], block_info[0]["array-location"][1]
     else:  # pragma: no cover - direct (non-dask) call fallback
@@ -180,11 +179,7 @@ def _rvi_add_large_block(
     r0 += int(off_r); r1 += int(off_r)
     c0 += int(off_c); c1 += int(off_c)
 
-    ch, cw = coarse_field.shape
-    rr = (cp.arange(r0, r1, dtype=cp.float64) + 0.5) * (ch / float(full_h)) - 0.5
-    cc = (cp.arange(c0, c1, dtype=cp.float64) + 0.5) * (cw / float(full_w)) - 0.5
-    grid_r, grid_c = cp.meshgrid(rr, cc, indexing="ij")
-    up = map_coordinates(coarse_field, cp.stack([grid_r, grid_c]), order=1, mode="nearest")
+    up = _bilinear_sample_coarse(coarse_field, r0, r1, c0, c1, full_h, full_w)
     return (cp.float32(w_large) * block - up).astype(cp.float32)
 
 

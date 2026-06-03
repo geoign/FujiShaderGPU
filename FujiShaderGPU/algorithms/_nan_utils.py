@@ -177,6 +177,34 @@ def coarsen_factor_for_shape(shape, coarse_max: int = 2048) -> int:
     return 1 << int(np.ceil(np.log2(longest / float(coarse_max))))
 
 
+def _bilinear_sample_coarse(
+    coarse: cp.ndarray,
+    r0: int, r1: int, c0: int, c1: int,
+    full_h: int, full_w: int,
+) -> cp.ndarray:
+    """Bilinearly sample ``coarse`` at the full-res pixel window [r0:r1, c0:c1].
+
+    The (2, h, w) coordinate array is built by broadcast assignment into a
+    preallocated float32 buffer rather than ``meshgrid`` + ``stack``.  The latter
+    materialises *three* full h*w arrays in float64 (two grids + the stacked
+    copy); on a large chunk (e.g. 8192^2) the stacked array alone is 1 GiB, which
+    exhausts the RMM pool.  float32 coordinates stay accurate to well under a
+    coarse-grid pixel for raster dimensions up to ~16M (float32 integer-exact
+    range), so the sampled result is unchanged while peak memory drops ~3x.
+    """
+    from cupyx.scipy.ndimage import map_coordinates
+
+    ch, cw = coarse.shape
+    h = int(r1 - r0)
+    w = int(c1 - c0)
+    rr = (cp.arange(r0, r1, dtype=cp.float32) + cp.float32(0.5)) * cp.float32(ch / float(full_h)) - cp.float32(0.5)
+    cc = (cp.arange(c0, c1, dtype=cp.float32) + cp.float32(0.5)) * cp.float32(cw / float(full_w)) - cp.float32(0.5)
+    coords = cp.empty((2, h, w), dtype=cp.float32)
+    coords[0] = rr[:, None]
+    coords[1] = cc[None, :]
+    return map_coordinates(coarse, coords, order=1, mode="nearest").astype(cp.float32)
+
+
 def _upsample_coarse_response_block(block, *, coarse, full_h, full_w, block_info=None):
     """Bilinearly sample a small coarse response at this block's global coords.
 
@@ -184,8 +212,6 @@ def _upsample_coarse_response_block(block, *, coarse, full_h, full_w, block_info
     tile: the per-tile padded window), so sampling at block-local coordinates is
     correct and seam-free -- no global offset is needed.
     """
-    from cupyx.scipy.ndimage import map_coordinates
-
     if block_info is not None and block_info.get(0) is not None:
         loc = block_info[0]["array-location"]
         r0, r1 = int(loc[0][0]), int(loc[0][1])
@@ -193,12 +219,7 @@ def _upsample_coarse_response_block(block, *, coarse, full_h, full_w, block_info
     else:  # pragma: no cover - non-dask fallback
         r0, c0 = 0, 0
         r1, c1 = block.shape[0], block.shape[1]
-    ch, cw = coarse.shape
-    rr = (cp.arange(r0, r1, dtype=cp.float64) + 0.5) * (ch / float(full_h)) - 0.5
-    cc = (cp.arange(c0, c1, dtype=cp.float64) + 0.5) * (cw / float(full_w)) - 0.5
-    grid_r, grid_c = cp.meshgrid(rr, cc, indexing="ij")
-    out = map_coordinates(coarse, cp.stack([grid_r, grid_c]), order=1, mode="nearest")
-    return out.astype(cp.float32)
+    return _bilinear_sample_coarse(coarse, r0, r1, c0, c1, full_h, full_w)
 
 
 def _nanmean_dispatch(a, axis=None, **kwargs):
@@ -464,4 +485,5 @@ __all__ = [
     "large_radius_threshold",
     "coarsen_factor_for_shape",
     "coarse_large_radius_response",
+    "_bilinear_sample_coarse",
 ]
