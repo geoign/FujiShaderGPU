@@ -24,21 +24,21 @@ class BaseCLI(ABC):
             epilog=self.get_epilog(),
         )
 
-        parser.add_argument("input", help="入力DEM (COG形式)")
-        parser.add_argument("output", help="出力ファイル (COG形式)")
+        parser.add_argument("input", help="Input DEM (COG format)")
+        parser.add_argument("output", help="Output file (COG format)")
 
         parser.add_argument(
             "--algorithm",
             "--algo",
             default=default_algorithm,
             choices=supported_algorithms,
-            help=f"使用するアルゴリズム (default: {default_algorithm})",
+            help=f"Algorithm to use (default: {default_algorithm})",
         )
 
         parser.add_argument(
             "--tmp-dir",
             default="tiles_tmp",
-            help="一時ファイル用ディレクトリ (default: tiles_tmp)",
+            help="Directory for temporary files (default: tiles_tmp)",
         )
 
         parser.add_argument(
@@ -52,19 +52,19 @@ class BaseCLI(ABC):
             "--log-level",
             choices=["DEBUG", "INFO", "WARNING", "ERROR"],
             default="INFO",
-            help="ログレベル (default: INFO)",
+            help="Log level (default: INFO)",
         )
 
         parser.add_argument(
             "--no-progress",
             action="store_true",
-            help="進捗表示を無効化",
+            help="Disable progress display",
         )
 
         parser.add_argument(
             "--force",
             action="store_true",
-            help="出力ファイルが存在する場合も上書き",
+            help="Overwrite the output file even if it exists",
         )
 
         self._add_platform_specific_args(parser)
@@ -111,12 +111,12 @@ class BaseCLI(ABC):
         import os
 
         if not getattr(parsed_args, "_skip_input_check", False) and not os.path.exists(parsed_args.input):
-            self.logger.error(f"入力ファイルが存在しません: {parsed_args.input}")
+            self.logger.error(f"Input file does not exist: {parsed_args.input}")
             raise FileNotFoundError(f"Input file not found: {parsed_args.input}")
 
         if os.path.exists(parsed_args.output) and not parsed_args.force:
-            self.logger.error(f"出力ファイルが既に存在します: {parsed_args.output}")
-            self.logger.error("上書きする場合は --force オプションを使用してください")
+            self.logger.error(f"Output file already exists: {parsed_args.output}")
+            self.logger.error("Use the --force option to overwrite")
             raise FileExistsError(f"Output file already exists: {parsed_args.output}")
 
         self.execute(parsed_args)

@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/config/auto_tune.py
 
-VRAM・アルゴリズム複雑度から全パフォーマンスパラメータを動的に算出する。
-検証済みアンカーポイント（旧gpu_presets.yaml由来）からの補間で任意のGPUに対応。
+Dynamically compute all performance parameters from VRAM and algorithm complexity.
+Interpolates from validated anchor points (originally from gpu_presets.yaml) to support any GPU.
 """
 
 import math

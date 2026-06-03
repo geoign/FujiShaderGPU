@@ -3,9 +3,9 @@ FujiShaderGPU/utils/types.py
 """
 from typing import Optional, NamedTuple
 
-# タイル処理結果を格納するクラス
+# Class that holds a tile processing result
 class TileResult(NamedTuple):
-    """タイル処理結果を格納"""
+    """Holds a tile processing result."""
     tile_y: int
     tile_x: int
     success: bool

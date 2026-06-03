@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_atmospheric_scattering.py
 
-Atmospheric Scattering (大気散乱効果) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 3)。
+Atmospheric Scattering algorithm implementation.
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 from typing import Optional
@@ -22,7 +22,7 @@ def compute_atmospheric_scattering_block(block, *, scattering_strength=0.5,
                                         intensity=None, pixel_size=1.0,
                                         pixel_scale_x=None,
                                         pixel_scale_y=None):
-    """大気散乱によるシェーディング（Rayleigh散乱の簡易版）"""
+    """Shading from atmospheric scattering (simplified Rayleigh scattering)."""
     if intensity is not None:
         scattering_strength = intensity
     nan_mask = cp.isnan(block)
@@ -58,7 +58,7 @@ def compute_atmospheric_scattering_spatial_block(
 
 
 class AtmosphericScatteringAlgorithm(DaskAlgorithm):
-    """大気散乱効果アルゴリズム"""
+    """Atmospheric scattering algorithm."""
     def process(self, gpu_arr, **params):
         ss = params.get('scattering_strength', 0.5)
         intensity = params.get('intensity', None)

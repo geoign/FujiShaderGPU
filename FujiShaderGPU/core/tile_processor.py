@@ -1,6 +1,6 @@
 """
 FujiShaderGPU/core/tile_processor.py
-タイルベース地形解析処理のコア実装（Windows/macOS向け）
+Core implementation of tile-based terrain analysis (for Windows/macOS).
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed, FIRST_COMPLETED, wait
 from importlib import import_module
@@ -19,6 +19,13 @@ from ..utils.scale_analysis import analyze_terrain_scales, _get_default_scales
 from ..utils.nodata_handler import _handle_nodata_ultra_fast
 from ..io.cog_builder import _build_vrt_and_cog_ultra_fast
 from ..io.cog_validator import _validate_cog_for_qgis
+from ..io.output_encoding import (
+    SUPPORTED_OUTPUT_DTYPES,
+    resolve_output_range,
+    quantize_params,
+    quantize_array,
+    apply_scale_offset,
+)
 from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 import os
 import math
@@ -37,7 +44,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# デフォルトで利用可能なアルゴリズム（Windows/macOS）
+# Algorithms available by default (Windows/macOS)
 DEFAULT_ALGORITHMS = {
     # Canonical names aligned with Dask registry
     "rvi": "RVIAlgorithm",
@@ -1423,17 +1430,21 @@ def process_single_tile(
     **algo_params
 ) -> TileResult:
     """
-    単一タイル処理（アルゴリズム選択対応版）
+    Single-tile processing (with algorithm selection).
     """
     ty, tx, core_x, core_y, core_w, core_h, win_x_off, win_y_off, win_w, win_h = tile_info
-    
+
+    # Output quantization params (popped up front so they are not passed to the algorithm)
+    _quantize_qp = algo_params.pop("_quantize_qp", None)
+    _quantize_dtype = algo_params.pop("_quantize_dtype", None)
+
     try:
         with gpu_memory_pool():
-            # メモリマップド読み込み（最適化）
+            # Memory-mapped read (optimized)
             window = Window(win_x_off, win_y_off, win_w, win_h)
             dem_tile = read_tile_window(input_cog_path, window)
                 
-            # NoData処理とスキップ判定（最適化）
+            # NoData handling and skip decision (optimized)
             mask_nodata = None
             if nodata is not None:
                 mask_nodata = _build_nodata_mask(dem_tile, nodata)
@@ -1468,10 +1479,10 @@ def process_single_tile(
             else:
                 dem_tile_processed = dem_tile
 
-            # GPU転送（最適化）
+            # GPU transfer (optimized)
             dem_gpu = cp.asarray(dem_tile_processed, dtype=cp.float32)
 
-            # アルゴリズム選択と実行
+            # Algorithm selection and execution
             algo_instance = _load_algorithm(algorithm)
             # Build per-tile params so geographic DEMs can use local latitude scaling.
             tile_algo_params = dict(algo_params)
@@ -1515,22 +1526,22 @@ def process_single_tile(
                 tile_algo_params,
             )
 
-            # NoData復元（必要時のみ）
+            # Restore NoData (only when needed)
             output_nodata_for_mask = np.nan if algorithm in SIGNED_NORMALIZATION_ALGOS else nodata
             result_gpu = apply_nodata_mask(result_gpu, mask_nodata, output_nodata_for_mask)
 
-            # CPU転送（最適化）
+            # CPU transfer (optimized)
             result_tile = cp.asnumpy(result_gpu)
             if vram_monitor:
                 used_gb = cp.get_default_memory_pool().used_bytes() / (1024**3)
                 logger.debug(f"Tile ({ty}, {tx}) VRAM used: {used_gb:.2f} GB")
             del dem_gpu, result_gpu
 
-            # コア領域抽出（多バンド出力にも対応）
+            # Extract the core region (also supports multi-band output)
             core_x_in_win = core_x - win_x_off
             core_y_in_win = core_y - win_y_off
             if result_tile.ndim == 3:
-                # HxWxC 形式の多バンド出力
+                # Multi-band output in HxWxC layout
                 result_core = result_tile[
                     core_y_in_win : core_y_in_win + core_h,
                     core_x_in_win : core_x_in_win + core_w,
@@ -1566,7 +1577,12 @@ def process_single_tile(
                 nodata=nodata,
             )
 
-            # 最適化されたタイルプロファイル
+            # Output dtype quantization (int16/uint8): NaN (NoData) -> 0, valid values to [DN range].
+            if _quantize_qp is not None and _quantize_dtype is not None:
+                result_core = quantize_array(result_core, _quantize_qp, _quantize_dtype)
+                output_nodata = 0.0
+
+            # Optimized tile profile
             core_transform = rasterio.windows.transform(
                 Window(core_x, core_y, core_w, core_h), src_transform
             )
@@ -1585,7 +1601,7 @@ def process_single_tile(
                 tmp_tile_dir, f"tile_{ty:03d}_{tx:03d}.tif"
             )
 
-            # 高速書き込み
+            # Fast write
             write_tile_output(tile_filename, result_core, tile_profile)
 
             return TileResult(ty, tx, True, tile_filename)
@@ -1599,7 +1615,7 @@ def process_dem_tiles(
     input_cog_path: str,
     output_cog_path: str,
     tmp_tile_dir: str = "tiles_tmp",
-    algorithm: str = "rvi",  # アルゴリズム選択を追加
+    algorithm: str = "rvi",  # added algorithm selection
     tile_size: Optional[int] = None,
     padding: Optional[int] = None,
     sigma: float = 10.0,
@@ -1613,12 +1629,12 @@ def process_dem_tiles(
     nodata_override: Optional[float] = None,
     cog_backend: str = "internal",
     gdal_bin_dir: Optional[str] = None,
-    **algo_params  # アルゴリズム固有のパラメータ
+    **algo_params  # algorithm-specific parameters
 ):
     """
-    タイルベースDEM処理メイン関数（アルゴリズム選択対応版）
+    Main tile-based DEM processing function (with algorithm selection).
     """
-    # COG生成のみの場合
+    # COG-generation-only case
     if cog_only:
         resume_cog_generation(
             tmp_tile_dir, 
@@ -1632,9 +1648,36 @@ def process_dem_tiles(
         )
         return
     
-    logger.info(f"=== DEM→{algorithm.upper()}処理開始 ===")
-    
-    # ピクセルサイズ検出
+    logger.info(f"=== DEM -> {algorithm.upper()} processing start ===")
+
+    # Output encoding: float32 (default)/int16/uint8. Not passed to the algorithm.
+    output_dtype = str(algo_params.pop("output_dtype", "float32") or "float32").lower()
+    output_range = algo_params.pop("output_range", None)
+    if output_dtype not in SUPPORTED_OUTPUT_DTYPES:
+        raise ValueError(
+            f"Unsupported output_dtype={output_dtype!r}. Choose from {SUPPORTED_OUTPUT_DTYPES}."
+        )
+    quantize_scale_offset = None
+    if output_dtype in ("int16", "uint8"):
+        _vr = resolve_output_range(algorithm, params=algo_params, override=output_range)
+        if _vr is None:
+            logger.warning(
+                "No fixed output range for %s (unit=%s); writing float32 instead of %s.",
+                algorithm, algo_params.get("unit", ""), output_dtype,
+            )
+        else:
+            _qp = quantize_params(float(_vr[0]), float(_vr[1]), output_dtype)
+            algo_params["_quantize_qp"] = _qp
+            algo_params["_quantize_dtype"] = output_dtype
+            quantize_scale_offset = (_qp["scale"], _qp["offset"])
+            logger.info(
+                "Output dtype=%s (%s): range [%.6g, %.6g] -> DN [%d, %d], NoData=0 "
+                "(scale=%.6g, offset=%.6g)",
+                output_dtype, "signed" if _qp["signed"] else "unsigned",
+                _vr[0], _vr[1], _qp["dn_min"], _qp["dn_max"], _qp["scale"], _qp["offset"],
+            )
+
+    # Pixel-size detection
     if pixel_size is None:
         pixel_size = detect_pixel_size_from_cog(input_cog_path)
 
@@ -1644,7 +1687,7 @@ def process_dem_tiles(
         algo_params.setdefault("contrast_enhance", False)
         algo_params.setdefault("z_factor", 1.0)
     
-    # スケール分析（RVIの場合のみ）
+    # Scale analysis (RVI only)
     if algorithm == "rvi" and multiscale_mode and auto_scale_analysis:
         target_distances, weights = analyze_terrain_scales(input_cog_path, pixel_size)
     elif algorithm == "rvi" and multiscale_mode:
@@ -1652,11 +1695,11 @@ def process_dem_tiles(
     else:
         target_distances, weights = None, None
 
-    # GPU設定取得
+    # Get GPU configuration
     gpu_config = get_gpu_config(gpu_type, sigma, multiscale_mode, pixel_size, target_distances)
     user_padding_provided = padding is not None
     
-    # パラメータ最適化
+    # Parameter optimization
     if tile_size is None:
         tile_size = gpu_config["tile_size"]
     if padding is None:
@@ -1833,38 +1876,38 @@ def process_dem_tiles(
                 usable_vram_gb * (1024 ** 3) / (4.0 * 15.0 * _complexity)
             ))
             _suggested_tile = _budget_span - 2 * int(padding)
-            severity = "高い" if est_tile_vram_gb > usable_vram_gb else "中程度"
+            severity = "high" if est_tile_vram_gb > usable_vram_gb else "moderate"
             crash_clause = (
-                "処理途中で CUDA out of memory により異常終了する可能性が高いです。"
+                "There is a high chance of crashing mid-run with CUDA out of memory."
                 if est_tile_vram_gb > usable_vram_gb
-                else "VRAMがひっ迫し、ワーカー数の自動削減や、環境によっては"
-                     "out of memory が発生する可能性があります。"
+                else "VRAM is tight; workers may be auto-reduced and, depending on the environment, "
+                     "out of memory may occur."
             )
             radius_clause = (
-                f"最大半径 {_max_radius_for_msg}px が支配的です。"
+                f"The maximum radius {_max_radius_for_msg}px is dominant."
                 if _max_radius_for_msg is not None
-                else "大きな空間スケール指定（--radii / scales）が要因です。"
+                else "Large spatial-scale settings (--radii / scales) are the cause."
             )
             if _suggested_tile >= 512:
-                tile_advice = f"--tile-size を {_suggested_tile}px 程度以下に下げる"
+                tile_advice = f"lower --tile-size to about {_suggested_tile}px or less"
             else:
                 tile_advice = (
-                    "ハロー(padding)がタイル本体を上回っているため --tile-size の縮小だけでは不足です。"
-                    "最大半径そのものを小さくしてください"
+                    "The halo (padding) exceeds the tile body, so shrinking --tile-size alone is not enough. "
+                    "Reduce the maximum radius itself"
                 )
             logger.warning(
-                "[VRAM] 1タイルあたりのGPUメモリ需要が利用可能VRAMに対して%sリスクです。\n"
-                "  - タイル窓: %dx%d px（コア %d px + ハロー %d px × 2）。%s\n"
-                "  - 推定ピークVRAM/タイル: 約 %.1f GB に対し、利用可能は約 %.1f GB"
-                "（検出VRAM %.0f GB の 70%%）。\n"
-                "  - 原因: Windows(タイル)バックエンドは、パディング込みのタイル窓を"
-                "GPUへ丸ごと載せて計算します。空間スケール(--radii / scales)の上限キャップは"
-                "無効化済みのため、指定値はそのまま使われ、ハロー(padding)がスケールに比例して"
-                "増え、タイル窓が二次関数的に拡大します。\n"
-                "  - 想定される影響: %s\n"
-                "  - 対処: (1) %s, (2) 最大の --radii を小さくする, "
-                "(3) よりVRAMの大きいGPUを使う, (4) 非常に大きな半径が必要な場合は "
-                "Linux の Dask-CUDA バックエンド（チャンク分散で大半径に強い）で実行する。",
+                "[VRAM] Per-tile GPU memory demand is a %s risk against available VRAM.\n"
+                "  - Tile window: %dx%d px (core %d px + halo %d px x 2). %s\n"
+                "  - Estimated peak VRAM/tile: ~%.1f GB vs. ~%.1f GB available"
+                " (70%% of the detected %.0f GB VRAM).\n"
+                "  - Cause: the Windows (tile) backend loads the padded tile window "
+                "onto the GPU in full. The spatial-scale (--radii / scales) upper cap is "
+                "disabled, so the given values are used as-is and the halo (padding) grows with scale, "
+                "expanding the tile window quadratically.\n"
+                "  - Expected impact: %s\n"
+                "  - Remedies: (1) %s, (2) reduce the largest --radii, "
+                "(3) use a GPU with more VRAM, (4) if very large radii are required, "
+                "run on the Linux Dask-CUDA backend (chunk-distributed, strong for large radii).",
                 severity,
                 effective_span, effective_span, int(tile_size), int(padding), radius_clause,
                 est_tile_vram_gb, usable_vram_gb, _vram,
@@ -1878,7 +1921,7 @@ def process_dem_tiles(
         f"effective: {effective_span}x{effective_span}, workers: {max_workers}"
     )
 
-    # 一時ディレクトリ準備 (Windows pythonw/IDLE環境を含む書き込み不可CWDに対応)
+    # Prepare temp directory (handles read-only CWDs incl. Windows pythonw/IDLE)
     tmp_tile_dir = _resolve_writable_tmp_dir(tmp_tile_dir, output_cog_path, input_cog_path)
 
     try:
@@ -2128,9 +2171,9 @@ def process_dem_tiles(
                 gpu_config=gpu_config,
             )
 
-            logger.info(f"処理タイル数: {n_tiles_x} x {n_tiles_y} = {total_tiles}")
+            logger.info(f"Tile count: {n_tiles_x} x {n_tiles_y} = {total_tiles}")
 
-            # タイル情報事前計算
+            # Precompute tile info
             tile_infos = []
             for ty in range(n_tiles_y):
                 for tx in range(n_tiles_x):
@@ -2150,20 +2193,20 @@ def process_dem_tiles(
                                win_x_off, win_y_off, win_w, win_h)
                     tile_infos.append(tile_info)
 
-            # 並列処理
+            # Parallel processing
             processed_tiles = []
             skipped_tiles = []
             error_tiles = []
             completed_count = 0
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # メモリ節約: 全 Future を一括生成せずストリーミング投入
+                # Save memory: stream-submit tasks instead of creating all Futures at once
                 pending = set()
                 tile_iter = iter(tile_infos)
-                max_pending = max_workers * 2  # 先行投入上限
+                max_pending = max_workers * 2  # max look-ahead submissions
 
                 def _submit_next():
-                    """待機キューにタスクを追加。追加成功で True を返す。"""
+                    """Add a task to the pending queue; return True on success."""
                     info = next(tile_iter, None)
                     if info is None:
                         return False
@@ -2178,7 +2221,7 @@ def process_dem_tiles(
                     pending.add(fut)
                     return True
 
-                # 初回バッチ投入
+                # Initial batch submission
                 for _ in range(min(max_pending, total_tiles)):
                     if not _submit_next():
                         break
@@ -2203,20 +2246,20 @@ def process_dem_tiles(
                                 f"[success={len(processed_tiles)}, skipped={len(skipped_tiles)}, error={len(error_tiles)}]"
                             )
 
-                        # 完了した分だけ新しいタスクを補充
+                        # Refill with new tasks as ones complete
                         _submit_next()
 
-            logger.info(f"処理結果: 成功{len(processed_tiles)}, スキップ{len(skipped_tiles)}, エラー{len(error_tiles)}")
+            logger.info(f"Results: success={len(processed_tiles)}, skipped={len(skipped_tiles)}, error={len(error_tiles)}")
 
             if error_tiles:
-                error_details = "\n".join([f"タイル({t.tile_y}, {t.tile_x}): {t.error_message}" 
+                error_details = "\n".join([f"Tile ({t.tile_y}, {t.tile_x}): {t.error_message}" 
                                          for t in error_tiles[:3]])
-                raise RuntimeError(f"タイル処理エラー:\n{error_details}")
+                raise RuntimeError(f"Tile processing error:\n{error_details}")
 
             if not processed_tiles:
-                raise ValueError("処理されたタイルがありません")
+                raise ValueError("No tiles were processed")
 
-        # COG生成
+        # COG generation
         _build_vrt_and_cog_ultra_fast(
             tmp_tile_dir,
             output_cog_path,
@@ -2225,18 +2268,23 @@ def process_dem_tiles(
             gdal_bin_dir=gdal_bin_dir,
         )
         
-        # COG品質検証
+        # COG quality validation
         _validate_cog_for_qgis(output_cog_path)
-        _apply_output_display_hints(output_cog_path, algorithm)
+        # Quantized output is in DN space, so skip float-oriented display hints (e.g. RVI -1/1).
+        if quantize_scale_offset is None:
+            _apply_output_display_hints(output_cog_path, algorithm)
+        else:
+            # Record scale/offset for DN -> physical recovery (non-essential).
+            apply_scale_offset(output_cog_path, quantize_scale_offset[0], quantize_scale_offset[1])
 
     except Exception as e:
         if os.path.exists(tmp_tile_dir):
-            logger.error(f"エラーが発生しました ({e})。タイルディレクトリを保持します: {tmp_tile_dir}")
-            logger.info("COG生成のみ実行するには: --cog-only オプションを使用してください")
+            logger.error(f"An error occurred ({e}). Keeping the tile directory: {tmp_tile_dir}")
+            logger.info("To run COG generation only: use the --cog-only option")
         raise
     
-    logger.info("=== 処理完了 ===")
-    logger.info("[INFO] 生成されたCOGは最適化済みです")
+    logger.info("=== Processing complete ===")
+    logger.info("[INFO] The generated COG is optimized")
 
 
 def resume_cog_generation(
@@ -2250,40 +2298,40 @@ def resume_cog_generation(
     gdal_bin_dir: Optional[str] = None,
 ):
     """
-    既存のタイルからCOG生成のみを実行する関数
+    Function that only generates a COG from existing tiles.
     """
-    logger.info("=== タイルからCOG生成再開 ===")
+    logger.info("=== Resuming COG generation from tiles ===")
     
-    # タイル存在確認
+    # Check tile existence
     if not os.path.exists(tmp_tile_dir):
-        raise ValueError(f"タイルディレクトリが存在しません: {tmp_tile_dir}")
+        raise ValueError(f"Tile directory does not exist: {tmp_tile_dir}")
     
     tile_files = sorted(glob.glob(os.path.join(tmp_tile_dir, "tile_*.tif")))
     if not tile_files:
-        raise ValueError(f"タイルファイルが見つかりません: {tmp_tile_dir}")
+        raise ValueError(f"No tile files found: {tmp_tile_dir}")
     
-    logger.info(f"発見されたタイル数: {len(tile_files)}")
+    logger.info(f"Tiles found: {len(tile_files)}")
     
-    # 最初のタイルから基本情報を取得
+    # Get basic info from the first tile
     sample_tile = tile_files[0]
     try:
         with rasterio.open(sample_tile) as src:
-            logger.info(f"タイル例: {os.path.basename(sample_tile)}")
-            logger.info(f"  サイズ: {src.width} x {src.height}")
+            logger.info(f"Example tile: {os.path.basename(sample_tile)}")
+            logger.info(f"  Size: {src.width} x {src.height}")
             logger.info(f"  CRS: {src.crs}")
-            logger.info(f"  データ型: {src.dtypes[0]}")
+            logger.info(f"  Data type: {src.dtypes[0]}")
     except Exception as e:
-        logger.warning(f"タイル情報取得警告: {e}")
+        logger.warning(f"Tile info retrieval warning: {e}")
     
-    # GPU設定取得（元の処理設定を考慮）
+    # Get GPU configuration (considering the original processing settings)
     try:
         target_distances, weights = _get_default_scales()
         gpu_config = get_gpu_config(gpu_type, sigma, multiscale_mode, pixel_size, target_distances)
     except Exception as e:
-        logger.warning(f"GPU設定警告: {e}, デフォルト設定を使用")
+        logger.warning(f"GPU configuration warning: {e}; using default settings")
         gpu_config = get_gpu_config(gpu_type)
     
-    # COG生成実行
+    # Run COG generation
     try:
         _build_vrt_and_cog_ultra_fast(
             tmp_tile_dir,
@@ -2293,14 +2341,14 @@ def resume_cog_generation(
             gdal_bin_dir=gdal_bin_dir,
         )
         _validate_cog_for_qgis(output_cog_path)
-        logger.info("[OK] COG生成完了")
+        logger.info("[OK] COG generation complete")
         
-        # 成功時のクリーンアップ提案
-        logger.info("\n[TIP] COG生成が完了しました。")
-        logger.info("一時タイルディレクトリを削除しますか？")
-        logger.info(f"削除コマンド: rm -rf {tmp_tile_dir}")
+        # Cleanup suggestion on success
+        logger.info("\n[TIP] COG generation completed.")
+        logger.info("Delete the temporary tile directory?")
+        logger.info(f"Delete command: rm -rf {tmp_tile_dir}")
         
     except Exception as e:
-        logger.error(f"COG生成エラー: {e}")
-        logger.error(f"タイルディレクトリは保持されています: {tmp_tile_dir}")
+        logger.error(f"COG generation error: {e}")
+        logger.error(f"The tile directory is kept: {tmp_tile_dir}")
         raise

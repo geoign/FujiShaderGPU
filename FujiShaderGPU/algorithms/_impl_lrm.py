@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_lrm.py
 
-LRM (Local Relief Model) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 3)。
+LRM (Local Relief Model) algorithm implementation.
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import cupy as cp
@@ -35,7 +35,7 @@ def compute_lrm_block(block, *, kernel_size=25, pixel_size=1.0,
 
 
 class LRMAlgorithm(DaskAlgorithm):
-    """局所起伏モデルアルゴリズム"""
+    """Local relief model algorithm."""
     def process(self, gpu_arr, **params):
         kernel_size = params.get('kernel_size', 25)
         stats = params.get('global_stats', None)

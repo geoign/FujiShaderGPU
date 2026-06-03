@@ -1,11 +1,11 @@
 ﻿# -*- coding: utf-8 -*-
 """
 FujiShaderGPU/core/dask_processor.py
-Dask-CUDA地形解析処理のコア実装
+Core implementation of Dask-CUDA terrain analysis.
 """
 
 ###############################################################################
-# 依存ライブラリ
+# Dependencies
 ###############################################################################
 from __future__ import annotations
 
@@ -34,16 +34,22 @@ import xarray as xr
 from tqdm.auto import tqdm
 
 
-# アルゴリズムのインポート
+# Algorithm imports
 try:
     from ..algorithms.dask_registry import ALGORITHMS
 except ImportError:
-    # algorithms registry が存在しない場合の仮の定義
+    # Fallback definition when the algorithms registry is unavailable
     ALGORITHMS = {}
     logging.warning("dask registry module not found. No algorithms available.")
 
 from ..algorithms.common.auto_params import determine_optimal_radii
 from ..io.raster_info import metric_pixel_scales_from_metadata
+from ..io.output_encoding import (
+    SUPPORTED_OUTPUT_DTYPES,
+    output_nodata_for_dtype,
+    resolve_output_range,
+    quantize_params,
+)
 from ..config.auto_tune import compute_dask_chunk
 from .dask_cluster import make_cluster
 from .dask_io import (
@@ -52,7 +58,7 @@ from .dask_io import (
     write_zarr_output,
 )
 
-# ロギング設定
+# Logging configuration
 logger = logging.getLogger(__name__)
 
 
@@ -189,17 +195,17 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
 
 
 ###############################################################################
-# 1. Dask-CUDA クラスタ
-#    make_cluster() は dask_cluster.py から直接インポート済み
+# 1. Dask-CUDA cluster
+#    make_cluster() is imported directly from dask_cluster.py
 ###############################################################################
 
 ###############################################################################
-# 3. 地形解析による自動パラメータ決定
+# 3. Automatic parameter determination via terrain analysis
 ###############################################################################
 
 def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01) -> dict:
-    """地形の特性を統合的に解析"""
-    # サンプリング処理（共通部分）
+    """Analyze terrain characteristics holistically."""
+    # Sampling (shared part)
     h, w = dem_arr.shape
     sample_size = int(min(h, w) * sample_ratio)
     sample_size = max(512, min(4096, sample_size))
@@ -212,7 +218,7 @@ def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.0
     
     sample = dem_arr[y1:y2, x1:x2].compute()
     
-    # 基本統計（共通部分）
+    # Basic statistics (shared part)
     valid_mask = ~cp.isnan(sample)
     if not valid_mask.any():
         raise ValueError("No valid elevation data found")
@@ -224,7 +230,7 @@ def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.0
         'sample_size': sample.shape
     }
     
-    # 勾配計算（共通部分）
+    # Gradient computation (shared part)
     dy, dx = cp.gradient(sample)
     slope = cp.sqrt(dy**2 + dx**2)
     valid_slope = slope[valid_mask]
@@ -232,7 +238,7 @@ def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.0
     stats['max_slope'] = float(cp.percentile(valid_slope, 95))
     
 
-    # auto-parameter 推定の共通指標
+    # Common metrics for auto-parameter estimation
     stats["complexity_score"] = float(stats["mean_slope"] * stats["std_dev"])
     return stats
 
@@ -240,11 +246,11 @@ def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.0
 
 
 ###############################################################################
-# 4. 直接 COG 出力 (GDAL >= 3.8) - 改善版
+# 4. Direct COG output (GDAL >= 3.8) - improved
 ###############################################################################
 
 def get_cog_options(dtype: str) -> dict:
-    """データ型に応じた最適なCOGオプションを返す"""
+    """Return optimal COG options for the given data type."""
     base_options = {
         "COMPRESS": "ZSTD",
         "LEVEL": "1",
@@ -257,17 +263,17 @@ def get_cog_options(dtype: str) -> dict:
         "NUM_THREADS": "ALL_CPUS",
     }
     
-    # データ型に応じてPREDICTORを設定
+    # Set PREDICTOR according to data type
     if dtype in ['float32', 'float64']:
-        base_options["PREDICTOR"] = "3"  # 浮動小数点用
+        base_options["PREDICTOR"] = "3"  # floating point
     elif dtype in ['int16', 'int32', 'uint16', 'uint32']:
-        base_options["PREDICTOR"] = "2"  # 整数用
-    # uint8やその他の型ではPREDICTORを使用しない
+        base_options["PREDICTOR"] = "2"  # integer
+    # Do not use PREDICTOR for uint8 or other types
     
     return base_options
 
 def check_gdal_version() -> tuple:
-    """GDAL バージョンをチェック（整数演算で安全にパース）"""
+    """Check the GDAL version (parse safely with integer arithmetic)."""
     ver_num = int(gdal.VersionInfo("VERSION_NUM"))
     major = ver_num // 1_000_000
     minor = (ver_num % 1_000_000) // 10_000
@@ -347,7 +353,7 @@ def _build_zstd_overviews(path: Path, cog_options: dict):
 
 
 def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = True):
-    """DataArray を直接 COG として保存（進捗表示付き）"""
+    """Save a DataArray directly as a COG (with progress display)."""
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
     
@@ -362,9 +368,9 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
             logger.info(f"Using COG driver (GDAL {major}.{minor}) with dtype={dtype_str}")
             with rasterio.Env(GDAL_CACHEMAX=512):
                 if show_progress:
-                    # より詳細な進捗表示
+                    # More detailed progress display
                     logger.info("Computing result chunks...")
-                    # tqdmを使用した進捗表示                    
+                    # Progress display using tqdm
                     class TqdmCallback(Callback):
                         def __init__(self):
                             self.tqdm = None
@@ -383,7 +389,7 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                 else:
                     computed_data = data.compute()
                 
-                # 計算済みデータをxarrayに戻す
+                # Wrap the computed data back into xarray
                 computed_da = xr.DataArray(
                     computed_data,
                     dims=data.dims,
@@ -392,13 +398,14 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
                     name=data.name
                 )
                 
-                # CRS情報を引き継ぐ
+                # Carry over CRS information
                 if hasattr(data, 'rio') and data.rio.crs is not None:
                     computed_da.rio.write_crs(data.rio.crs, inplace=True)
-                # NoData=NaN を出力に明示（境界の黒帯を防ぐ）
-                computed_da.rio.write_nodata(np.float32(np.nan), inplace=True)
+                # Set NoData explicitly on the output (prevents a black border): 0 for integer output, NaN for float.
+                _nd = output_nodata_for_dtype(computed_da.dtype)
+                computed_da.rio.write_nodata(_nd, inplace=True)
 
-                # COG書き込み
+                # Write the COG
                 logger.info("Writing to COG...")
                 computed_da.rio.to_raster(
                     dst,
@@ -418,18 +425,18 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
         _fallback_cog_write(data, dst, cog_options)
 
 def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: bool = True):
-    """大規模データ用のチャンク単位書き込み実装"""
+    """Chunked write implementation for large datasets."""
     major, minor = check_gdal_version()
     use_cog_driver = major > 3 or (major == 3 and minor >= 8)
     dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
-    # VRAM実残量に基づいてメモリ解放を判断（プール内free_bytesではなく実VRAM使用）
+    # Decide memory release from actual free VRAM (real VRAM usage, not pool free_bytes)
     try:
         _free_bytes, _total_bytes = cp.cuda.runtime.memGetInfo()
         available_vram_gb = _free_bytes / (1024**3)
     except Exception:
-        available_vram_gb = 10.0  # 安全なデフォルト値
+        available_vram_gb = 10.0  # safe default
     if available_vram_gb < 10:
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
@@ -440,39 +447,39 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         except Exception:
             pass
 
-    # DRAMの空き容量を確認してプリフェッチを有効化
+    # Check free DRAM and enable prefetch
     mem_info = psutil.virtual_memory()
     available_ram_gb = mem_info.available / (1024**3)
     
-    if available_ram_gb > 20:  # 20GB以上空いている場合
+    if available_ram_gb > 20:  # when more than 20GB is free
         logger.info(f"Enabling chunk prefetching (available DRAM: {available_ram_gb:.1f}GB)")
         
-        # Daskのスケジューラーヒントを設定
+        # Set Dask scheduler hints
         prefetch_config = {
-            "optimization.fuse.active": False,  # チャンクの融合を無効化
-            "distributed.worker.memory.pause": 0.90,  # メモリ使用率90%まで許可
-            "distributed.worker.memory.spill": 0.95,  # 95%でスピル
+            "optimization.fuse.active": False,  # disable chunk fusion
+            "distributed.worker.memory.pause": 0.90,  # allow up to 90% memory usage
+            "distributed.worker.memory.spill": 0.95,  # spill at 95%
         }
     else:
         logger.info(f"Prefetching disabled (available DRAM: {available_ram_gb:.1f}GB < 20GB)")
         prefetch_config = {}
     
-    # プリフェッチ設定を適用してチャンク処理を実行
+    # Apply prefetch settings and run chunk processing
     with dask_config.set(prefetch_config):
 
-        # 一時ディレクトリ作成
+        # Create a temporary directory
         tmp_parent = _select_chunk_temp_parent(int(data.nbytes))
         with tempfile.TemporaryDirectory(dir=tmp_parent) as tmpdir:
-            # チャンクごとに処理
+            # Process per chunk
             chunk_files = []
 
-            # Dask配列でない場合は通常の処理にフォールバック
+            # Fall back to normal processing when not a Dask array
             if not hasattr(data.data, 'to_delayed'):
                 logger.info("Data is not chunked with Dask, falling back to regular processing")
                 _write_cog_da_original(data, dst, show_progress)
                 return
 
-            # チャンク情報の検証
+            # Validate chunk information
             if not hasattr(data, 'chunks') or data.chunks is None:
                 logger.warning("No chunk information found, falling back to regular processing")
                 _write_cog_da_original(data, dst, show_progress)
@@ -510,7 +517,7 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                     driver="GTiff",
                     compress="ZSTD",
                     zstd_level=1,
-                    predictor=3,
+                    predictor=int(cog_options.get("PREDICTOR", 1)),
                     tiled=True,
                     blockxsize=512,
                     blockysize=512,
@@ -520,10 +527,10 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                 del chunk_da
                 return chunk_file
 
-            # 並列ストリーミング書き込み:
-            # チャンクグラフは embarrassingly parallel なので、複数の Dask-CUDA
-            # ワーカー（=GPU）が別チャンクを並行計算する間にクライアントが完了分を
-            # 書き出す。distributed クライアントが取得できない場合は直列処理に戻す。
+            # Parallel streaming write:
+            # The chunk graph is embarrassingly parallel, so multiple Dask-CUDA
+            # workers (= GPUs) compute different chunks in parallel while the client
+            # writes the finished ones. Fall back to serial when no distributed client is available.
             client = None
             try:
                 client = get_client()
@@ -583,7 +590,7 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                         pbar.set_postfix({"saved": f"{len(chunk_files)}"})
                         _submit_next()
             else:
-                # 直列フォールバック（distributed クライアントが無い場合）
+                # Serial fallback (when no distributed client is available)
                 idx = 0
                 with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
                     for i in range(n_rows):
@@ -600,7 +607,7 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                                 cp.get_default_memory_pool().free_all_blocks()
                             pbar.update(1)
                 
-            # VRTで統合 -> 単一中間GeoTIFF -> オーバービュー -> COG
+            # Consolidate via VRT -> single intermediate GeoTIFF -> overviews -> COG
             if not chunk_files:
                 raise ValueError("No chunks were successfully processed")
 
@@ -608,7 +615,7 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             vrt_file = Path(tmpdir) / "merged.vrt"
             gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
 
-            # GDALの進捗コールバック
+            # GDAL progress callback
             pbar = tqdm(total=100, desc="Consolidating", unit="%")
             def gdal_progress_callback(complete, _message, _cb_data):
                 pbar.n = int(complete * 100)
@@ -617,12 +624,12 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                     pbar.close()
                 return 1
 
-            # ディスク占有削減: チャンク群を1枚の中間GeoTIFFへ統合してから、
-            # オーバービュー生成・COG変換の前にチャンク(=フル解像度1コピー分)と
-            # VRTを解放する。こうしないと「チャンク + 中間 + 最終COG」の3つの巨大
-            # コピーが同一ディスク上に同時存在し、ピークが ~3.66x に膨らむ
-            # (VRTを直接COG化してもドライバが内部一時ファイルを作るため同じ)。
-            # 統合後にチャンクを消すことでピークを ~2.66x に抑える。
+            # Reduce disk footprint: consolidate the chunks into one intermediate GeoTIFF,
+            # then free the chunks (= one full-resolution copy) and the VRT before the
+            # heavy overview/COG stage. Otherwise three large copies "chunks + intermediate
+            # + final COG" coexist on the same disk and the peak grows to ~3.66x
+            # (translating the VRT directly to COG is the same, since the driver makes an internal temp file).
+            # Deleting the chunks after consolidation keeps the peak at ~2.66x.
             merged_tif = Path(tmpdir) / "merged_tmp.tif"
             logger.info("Consolidating %d chunks into single GeoTIFF: %s",
                         len(chunk_files), merged_tif)
@@ -649,17 +656,20 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                 raise ValueError("Chunk consolidation failed")
             result = None
 
-            # NoData=NaN を中間GeoTIFFへ明示設定。これでオーバービュー(AVERAGE)が
-            # NoData を除外し、最終COGも nodata タグを継承する(境界の黒帯を防ぐ)。
+            # Set NoData explicitly on the intermediate GeoTIFF so the (AVERAGE) overviews
+            # exclude NoData and the final COG inherits the nodata tag (prevents a black border).
+            # 0 for integer output, NaN for float.
             _mds = gdal.Open(str(merged_tif), gdal.GA_Update)
             if _mds is not None:
                 try:
-                    _mds.GetRasterBand(1).SetNoDataValue(float("nan"))
+                    _mds.GetRasterBand(1).SetNoDataValue(
+                        float(output_nodata_for_dtype(data.dtype))
+                    )
                 finally:
                     _mds = None
 
-            # フル解像度データは merged_tmp.tif に揃ったので、チャンクとVRTを
-            # 即座に削除してディスクを解放してから重い後段(オーバービュー+COG)へ進む。
+            # The full-resolution data is now in merged_tmp.tif, so delete the chunks and VRT
+            # immediately to free disk before the heavy stage (overviews + COG).
             freed = 0
             for f in chunk_files:
                 try:
@@ -676,11 +686,11 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             logger.info("Freed %s of chunk staging before COG build",
                         _format_gib(freed))
 
-            # 単一GeoTIFF -> in-placeオーバービュー -> COG(FORCE_USE_EXISTING)
+            # Single GeoTIFF -> in-place overviews -> COG (FORCE_USE_EXISTING)
             logger.info("Converting consolidated GeoTIFF to COG format...")
             build_cog_with_overviews(merged_tif, dst, cog_options)
 
-            # 中間GeoTIFFも解放(TemporaryDirectoryの後始末を待たずに最終出力分の余裕を確保)
+            # Free the intermediate GeoTIFF too (reserve room for the final output without waiting for TemporaryDirectory cleanup)
             try:
                 merged_tif.unlink()
             except OSError:
@@ -689,42 +699,42 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             logger.info(f"Successfully created COG from {n_done} chunks")
 
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
-    """COG書き出し（メモリ容量に応じて自動選択）"""
+    """Write COG (auto-selected by available memory)."""
     total_gb = data.nbytes / (1024**3)
     
-    # システムメモリに基づいて閾値を自動決定
+    # Auto-determine the threshold from system memory
     mem_info = psutil.virtual_memory()
     total_ram_gb = mem_info.total / (1024**3)
     available_ram_gb = mem_info.available / (1024**3)
     
-    # Google Colab環境の検出
+    # Detect the Google Colab environment
     is_colab = 'google.colab' in sys.modules
     
-    # 安全係数の設定
+    # Set the safety factor
     if is_colab:
-        # Colabは保守的に（利用可能メモリの40%）
+        # Colab is conservative (40% of available memory)
         safety_factor = 0.4
-        # ただし、最低でも20GB、最高でも60GBに制限
+        # but clamped to a minimum of 20GB and a maximum of 60GB
         min_threshold = 20
         max_threshold = 60
     else:
-        # ローカル環境はもう少し積極的に（60%）
+        # Local environments are a bit more aggressive (60%)
         safety_factor = 0.6
         min_threshold = 30
         max_threshold = 100
     
-    # 閾値の計算
-    # 現在利用可能なメモリベースで計算（より現実的）
+    # Compute the threshold
+    # Base it on currently available memory (more realistic)
     chunk_threshold = available_ram_gb * safety_factor
     
-    # 範囲内に収める
+    # Clamp to range
     chunk_threshold = max(min_threshold, min(chunk_threshold, max_threshold))
     
-    # ログ出力
+    # Log output
     logger.info(f"System RAM: {total_ram_gb:.1f}GB total, {available_ram_gb:.1f}GB available")
     logger.info(f"Memory threshold: {chunk_threshold:.1f}GB (safety factor: {safety_factor*100:.0f}%)")
     
-    # GPU情報も参考に表示
+    # Also display GPU info for reference
     try:
         meminfo = cp.cuda.runtime.memGetInfo()
         vram_free_gb = meminfo[0] / (1024**3)
@@ -733,7 +743,7 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
     except Exception:
         pass
     
-    # データサイズと閾値の比較
+    # Compare data size against the threshold
     if total_gb > chunk_threshold:
         logger.info(f"Large dataset ({total_gb:.1f}GB) > threshold ({chunk_threshold:.1f}GB)")
         logger.info("Using chunked writing to avoid memory issues")
@@ -744,10 +754,10 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
         _write_cog_da_original(data, dst, show_progress)
 
 def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
-    """フォールバック：一時ファイル経由でCOG作成"""
+    """Fallback: create the COG via a temporary file."""
     tmp = dst.with_suffix(".tmp.tif")
     try:
-        # COG固有のオプションを除外
+        # Exclude COG-specific options
         tiff_options = {
             k: v for k, v in cog_options.items()
             if k not in [
@@ -758,12 +768,12 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
             ]
         }
         
-        # 進捗表示付きで計算してから書き込み        
+        # Compute with progress display, then write
         logger.info("Computing result...")
         with ProgressBar():
             computed_data = data.compute()
         
-        # 計算済みデータをxarrayに戻す
+        # Wrap the computed data back into xarray
         computed_da = xr.DataArray(
             computed_data,
             dims=data.dims,
@@ -772,10 +782,15 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
             name=data.name
         )
         
-        # CRS情報を引き継ぐ
+        # Carry over CRS information
         if hasattr(data, 'rio') and data.rio.crs is not None:
             computed_da.rio.write_crs(data.rio.crs, inplace=True)
-        
+        # Set NoData explicitly (0 for integer output, NaN for float). The (AVERAGE) overviews
+        # exclude NoData and the final COG inherits the nodata tag.
+        computed_da.rio.write_nodata(
+            output_nodata_for_dtype(computed_da.dtype), inplace=True,
+        )
+
         logger.info("Writing temporary TIFF...")
         computed_da.rio.to_raster(
             tmp,
@@ -789,12 +804,12 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
         tmp.unlink(missing_ok=True)
 
 ###############################################################################
-# 5. gdal_translate/gdaladdo フォールバック関数
+# 5. gdal_translate/gdaladdo fallback functions
 ###############################################################################
 
 def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
-    """旧版 GDAL 用: 一時 TIFF にoverviewを作成してからCOGへ変換"""
-    # CPU数を取得して並列処理
+    """For older GDAL: build overviews on a temporary TIFF, then convert to COG."""
+    # Get CPU count for parallel processing
     num_cpus = os.cpu_count() or 1
 
     _build_zstd_overviews(src, cog_options)
@@ -812,7 +827,7 @@ def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
         f"OVERVIEW_RESAMPLING={cog_options.get('OVERVIEW_RESAMPLING', 'AVERAGE')}",
     ]
     
-    # PREDICTORがある場合のみ追加
+    # Add PREDICTOR only when present
     if 'PREDICTOR' in cog_options:
         translate_options.append(f"PREDICTOR={cog_options['PREDICTOR']}")
 
@@ -828,11 +843,11 @@ def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
     _assert_has_overviews(dst)
 
 ###############################################################################
-# 6. メインパイプライン
+# 6. Main pipeline
 ###############################################################################
 
 def validate_inputs(src_cog: str):
-    """入力パラメータの検証"""
+    """Validate input parameters."""
     if not Path(src_cog).exists():
         raise FileNotFoundError(f"Input file not found: {src_cog}")
 
@@ -968,6 +983,56 @@ def _compute_rvi_overview_coarse_field(
         return None
 
 
+def _quantize_block_cp(block, *, a_coef: float, b_coef: float,
+                       dn_min: int, dn_max: int, cp_dtype):
+    """Linearly encode a float32 CuPy block to integer codes (NaN/NoData -> 0).
+
+    ``DN = clip(round(a_coef*value + b_coef), dn_min, dn_max)``.  Mapping params
+    (signed/unsigned, centring) come from ``output_encoding.quantize_params``.
+    """
+    dn = cp.rint(cp.float32(a_coef) * block + cp.float32(b_coef))
+    dn = cp.clip(dn, cp.float32(dn_min), cp.float32(dn_max))
+    dn = cp.where(cp.isnan(block), cp.float32(0.0), dn)
+    return dn.astype(cp_dtype)
+
+
+def _estimate_output_range(result_gpu: da.Array,
+                           *, lo_pct: float = 1.0, hi_pct: float = 99.0,
+                           max_samples: int = 4_000_000):
+    """Robust [p1, p99] range from a strided sample (unbounded-output fallback)."""
+    try:
+        n = int(result_gpu.size)
+        step = max(1, int((n / float(max_samples)) ** 0.5))
+        sample = result_gpu[::step, ::step].compute()
+        valid = sample[cp.isfinite(sample)]
+        if valid.size == 0:
+            return (0.0, 1.0)
+        lo = float(cp.percentile(valid, lo_pct))
+        hi = float(cp.percentile(valid, hi_pct))
+        if not (hi > lo):
+            hi = lo + 1.0
+        return (lo, hi)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Output range estimation failed (%s); using [0, 1]", exc)
+        return (0.0, 1.0)
+
+
+def _apply_scale_offset(path: Path, scale: float, offset: float) -> None:
+    """Best-effort: record GDAL band scale/offset so DN -> physical is recoverable."""
+    try:
+        ds = gdal.Open(str(path), gdal.GA_Update)
+        if ds is None:
+            return
+        try:
+            band = ds.GetRasterBand(1)
+            band.SetScale(float(scale))
+            band.SetOffset(float(offset))
+        finally:
+            ds = None
+    except Exception as exc:  # pragma: no cover - metadata is non-critical
+        logger.warning("Could not write scale/offset metadata: %s", exc)
+
+
 def run_pipeline(
     src_cog: str,
     dst_cog: str,
@@ -979,33 +1044,41 @@ def run_pipeline(
     auto_radii: bool = True,
     **algo_params
 ):
-    """改善されたメインパイプライン"""
-    # アルゴリズムの確認
+    """Improved main pipeline."""
+    # Check the algorithm
     if algorithm not in ALGORITHMS:
         raise ValueError(f"Unknown algorithm: {algorithm}. Available: {list(ALGORITHMS.keys())}")
     
     algo = ALGORITHMS[algorithm]
     
-    # 入力検証
+    # Validate input
     validate_inputs(src_cog)
 
-    # GDAL読み込み最適化（クラスタ生成前に設定 → spawnされるワーカーが継承）
+    # GDAL read optimization (set before cluster creation so spawned workers inherit it)
     _configure_gdal_read_performance()
     _log_overview_availability(src_cog)
 
-    # メモリ状況の確認
+    # Check memory status
     mem = psutil.virtual_memory()
     logger.info(f"System memory: {mem.total / 2**30:.1f} GB total, "
                 f"{mem.available / 2**30:.1f} GB available")
 
-    # メモリフラクションの取得（algo_paramsから、なければデフォルト）
+    # Get the memory fraction (from algo_params, else default)
     memory_fraction = algo_params.pop('memory_fraction', None)
-    # NoData override: 指定値を読み込み後に float NaN へ置換（アルゴリズムには渡さない）
+    # NoData override: replace the given value with float NaN after load (not passed to the algorithm)
     nodata_override = algo_params.pop('nodata_override', None)
-    cluster, client = make_cluster(memory_fraction)  # dask_cluster.py 直接呼び出し
+    # Output encoding: float32 (default) / int16 / uint8. Not passed to the algorithm.
+    output_dtype = str(algo_params.pop('output_dtype', 'float32') or 'float32').lower()
+    output_range = algo_params.pop('output_range', None)
+    if output_dtype not in SUPPORTED_OUTPUT_DTYPES:
+        raise ValueError(
+            f"Unsupported output_dtype={output_dtype!r}. "
+            f"Choose from {SUPPORTED_OUTPUT_DTYPES}."
+        )
+    cluster, client = make_cluster(memory_fraction)  # direct call into dask_cluster.py
     
     try:
-        # チャンクサイズの自動決定
+        # Automatic chunk-size determination
         if chunk is None:
             if is_zarr_path(src_cog):
                 dem_probe = load_input_dataarray(src_cog, 1024)
@@ -1030,10 +1103,10 @@ def run_pipeline(
 
             logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
         
-        # 6-1) DEM 遅延ロード (COG または Zarr)
+        # 6-1) Lazy-load the DEM (COG or Zarr)
         dem: xr.DataArray = load_input_dataarray(src_cog, chunk)
 
-        # 手動 NoData 指定: 一致セルを NaN に置換（遅延・チャンク維持）。
+        # Manual NoData override: replace matching cells with NaN (lazy, chunk-preserving).
         if nodata_override is not None and np.isfinite(nodata_override):
             dem = dem.where(dem != np.float32(nodata_override))
             logger.info("Applied --nodata override: %s -> NaN", float(nodata_override))
@@ -1041,10 +1114,10 @@ def run_pipeline(
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
 
-        # アルゴリズム固有のデフォルトパラメータを取得
+        # Get algorithm-specific default parameters
         default_params = algo.get_default_params()
 
-        # パラメータの準備
+        # Prepare parameters
         params = {
             **default_params,
             **algo_params,
@@ -1055,7 +1128,7 @@ def run_pipeline(
         # NoData void filling is owned by the preprocessing command
         # (`python -m FujiShaderGPU.prepare`); the pipeline no longer fills holes.
 
-        # 6-2) CuPy 配列へ変換（改善：メタデータ指定）
+        # 6-2) Convert to a CuPy array (improved: explicit metadata)
         gpu_arr: da.Array = dem.data.map_blocks(
             cp.asarray,
             dtype=cp.float32,
@@ -1084,19 +1157,19 @@ def run_pipeline(
         else:
             logger.info(f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m")
         
-        # 6-2.5) 自動決定（RVIアルゴリズムの場合）
+        # 6-2.5) Auto-determination (for the RVI algorithm)
         if algorithm == "rvi":
             pixel_size = float(params.get('pixel_size', 1.0))
             
-            # 新しい効率的なモードをデフォルトに
+            # Make the new efficient mode the default
             if radii is None and auto_radii:
                 logger.info("Analyzing terrain for automatic radii determination...")
                 
-                # 地形解析
+                # Terrain analysis
                 terrain_stats = analyze_terrain_characteristics(gpu_arr, sample_ratio=0.01)
                 terrain_stats['pixel_size'] = pixel_size
                 
-                # 最適な半径を決定
+                # Determine optimal radii
                 radii, weights = determine_optimal_radii(terrain_stats)
                 
                 logger.info("Terrain analysis results:")
@@ -1105,13 +1178,13 @@ def run_pipeline(
                 logger.info(f"  - Auto-determined radii: {radii} pixels")
                 logger.info(f"  - Weights: {[f'{w:.2f}' for w in weights]}")
                 
-                # パラメータに設定
+                # Store into parameters
                 params['mode'] = 'radius'
                 params['radii'] = radii
                 params['weights'] = weights
                 
             elif radii is not None:
-                # 手動指定の半径モード
+                # Manually specified radius mode
                 params['mode'] = 'radius'
                 params['radii'] = radii
                 params['weights'] = algo_params.get('weights', None)
@@ -1119,7 +1192,7 @@ def run_pipeline(
             else:
                 raise ValueError("Either provide radii or enable auto_radii")
 
-        # 多くのアルゴリズムでピクセルサイズが必要（RVI以外の場合）
+        # Many algorithms need the pixel size (for non-RVI cases)
         elif algorithm != "rvi" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
             # Already injected above; keep this branch as a no-op for compatibility.
             params['pixel_size'] = float(params.get('pixel_size', 1.0))
@@ -1191,12 +1264,12 @@ def run_pipeline(
                     exc,
                 )
 
-        # 6-3) アルゴリズム実行（run_pipeline内）
+        # 6-3) Run the algorithm (within run_pipeline)
         # Redact bulky internal arrays (e.g. the RVI coarse field) from logs/metadata.
         _log_params = {k: v for k, v in params.items() if not k.startswith("_rvi_coarse_field")}
         logger.info(f"Computing {algorithm} with parameters: {_log_params}")
 
-        # アルゴリズムを適用（遅延評価）
+        # Apply the algorithm (lazy evaluation)
         result_gpu: da.Array = algo.process(gpu_arr, **params)
 
         # Re-apply the input NoData footprint: keep NaN exactly where the source
@@ -1216,17 +1289,55 @@ def run_pipeline(
         ):
             params.pop(_k, None)
 
-        # 6-4) GPU→CPU 戻し（改善：明示的なdtype）
+        # 6-3.5) Quantize the output dtype (float32 passes through). NaN (NoData) -> 0,
+        # valid values are linearly stretched from the algorithm's native range to [1, levels].
+        out_np_dtype = "float32"
+        out_scale_offset = None
+        if output_dtype in ("int16", "uint8") and result_gpu.shape == gpu_arr.shape:
+            value_range = resolve_output_range(
+                algorithm, params=params, override=output_range,
+            )
+            if value_range is None:
+                logger.info(
+                    "No fixed output range for %s (unit=%s); estimating from data percentiles",
+                    algorithm, params.get("unit", ""),
+                )
+                value_range = _estimate_output_range(result_gpu)
+            lo, hi = float(value_range[0]), float(value_range[1])
+            qp = quantize_params(lo, hi, output_dtype)
+            cp_dtype = cp.int16 if output_dtype == "int16" else cp.uint8
+            out_np_dtype = output_dtype
+            out_scale_offset = (qp["scale"], qp["offset"])
+            logger.info(
+                "Output dtype=%s (%s): range [%.6g, %.6g] -> DN [%d, %d], NoData=0 "
+                "(scale=%.6g, offset=%.6g)",
+                output_dtype, "signed" if qp["signed"] else "unsigned",
+                lo, hi, qp["dn_min"], qp["dn_max"], qp["scale"], qp["offset"],
+            )
+            result_gpu = result_gpu.map_blocks(
+                _quantize_block_cp,
+                dtype=np.dtype(out_np_dtype),
+                meta=cp.empty((0, 0), dtype=cp_dtype),
+                a_coef=qp["a_coef"], b_coef=qp["b_coef"],
+                dn_min=qp["dn_min"], dn_max=qp["dn_max"], cp_dtype=cp_dtype,
+            )
+        elif output_dtype in ("int16", "uint8"):
+            logger.warning(
+                "Output dtype=%s requested but result shape changed (e.g. agg=stack); "
+                "writing float32 instead.", output_dtype,
+            )
+
+        # 6-4) GPU->CPU transfer back (improved: explicit dtype)
         result_cpu = result_gpu.map_blocks(
-            cp.asnumpy, 
-            dtype="float32",
-            meta=cp.empty((0, 0), dtype=cp.float32).get()
+            cp.asnumpy,
+            dtype=out_np_dtype,
+            meta=np.empty((0, 0), dtype=out_np_dtype),
         )
 
-        # 進捗表示付きで計算を実行
-        # ────────── GPU→CPU 変換後の計算トリガ ──────────
-        # 20 GB を超える場合は persist をスキップし、
-        # write_cog_da_chunked() によるストリーム計算に任せる。
+        # Run the computation with progress display
+        # ---------- Compute trigger after the GPU->CPU conversion ----------
+        # When it exceeds 20 GB, skip persist and let
+        # write_cog_da_chunked() stream-compute it.
         total_gb = result_cpu.nbytes / (1024**3)
         if total_gb <= 20:
             if show_progress:
@@ -1239,12 +1350,12 @@ def run_pipeline(
             logger.info(f"Large dataset ({total_gb:.1f} GB) - skip persist; "
                         "chunked writer will stream-compute each tile")
     
-        # 6-5) xarray ラップ（改善：座標構築の簡略化）
-        # 6-5) xarray ラップ（座標構築）
+        # 6-5) xarray wrap (improved: simplified coordinate construction)
+        # 6-5) xarray wrap (coordinate construction)
         dims = dem.dims
         coords = dem.coords
         
-        # アルゴリズムによって適切なデータ範囲を設定
+        # Set the appropriate value range per algorithm
         if algorithm in ['hillshade']:
             # Hillshade is now also float32 (0..1), aligned with tile backend.
             attrs = {
@@ -1256,7 +1367,7 @@ def run_pipeline(
                 "data_type": "float32"
             }
         elif algorithm in ['slope']:
-            # Slopeは単位による（度、パーセント、ラジアン）
+            # Slope depends on the unit (degree, percent, radian)
             unit = params.get('unit', 'degree')
             attrs = {
                 **dem.attrs,
@@ -1320,17 +1431,20 @@ def run_pipeline(
             name=algorithm.upper(),
         )
         
-        # CRS情報を元のDEMから引き継ぐ（COG入力時）
+        # Carry over CRS info from the source DEM (for COG input)
         if hasattr(dem, 'rio') and dem.rio.crs is not None:
             result_da.rio.write_crs(dem.rio.crs, inplace=True)
         
-        # 6-6) 出力 (COG または Zarr)
+        # 6-6) Output (COG or Zarr)
         dst_path = Path(dst_cog)
         if is_zarr_path(str(dst_path)):
             logger.info("Writing output as Zarr: %s", dst_path)
             write_zarr_output(result_da, dst_path, show_progress=show_progress)
         else:
             write_cog_da_chunked(result_da, dst_path, show_progress=show_progress)
+            # Record DN->physical recovery (integer outputs only); non-critical.
+            if out_scale_offset is not None:
+                _apply_scale_offset(dst_path, out_scale_offset[0], out_scale_offset[1])
         logger.info("Pipeline completed successfully!")
         gc.collect()
         
@@ -1338,15 +1452,15 @@ def run_pipeline(
         logger.error(f"Pipeline failed: {e}")
         raise
     finally:
-        # CuPyメモリプールの明示的なクリア
+        # Explicitly clear the CuPy memory pool
         mempool = cp.get_default_memory_pool()
         pinned_mempool = cp.get_default_pinned_memory_pool()
         mempool.free_all_blocks()
         pinned_mempool.free_all_blocks()
 
-        # より確実なクリーンアップ
+        # More thorough cleanup
         try:
-            # ワーカーのメモリを強制的にクリア
+            # Force-clear worker memory
             def clear_worker_memory():
                 import gc
                 import cupy as cp
@@ -1355,21 +1469,21 @@ def run_pipeline(
                 gc.collect()
                 return True   
             client.run(clear_worker_memory)
-            # clientを先に閉じて、完全に終了するまで待つ
+            # Close the client first and wait until it fully shuts down
             client.close(timeout=10)
-            client.shutdown()  # 全てのワーカーとスケジューラーを確実に終了
+            client.shutdown()  # ensure all workers and the scheduler terminate
         except Exception as e:
             logger.debug(f"Client shutdown warning (can be ignored): {e}")
         
         try:
-            # clusterの終了（既に終了している可能性があるので例外を無視）
+            # Close the cluster (ignore exceptions since it may already be closed)
             cluster.close(timeout=10)
         except Exception as e:
             logger.debug(f"Cluster close warning (can be ignored): {e}")
         
-        # Daskワーカープロセスの確実な終了を待つ
+        # Wait for the Dask worker processes to terminate for sure
         time.sleep(3)
         
-        # 最終的なGC
+        # Final GC
         gc.collect()
 

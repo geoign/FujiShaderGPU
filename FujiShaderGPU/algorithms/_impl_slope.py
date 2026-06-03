@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_slope.py
 
-Slope (傾斜) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 3)。
+Slope algorithm implementation.
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import cupy as cp
@@ -19,7 +19,7 @@ from ._nan_utils import (
 
 def compute_slope_block(block, *, unit='degree', pixel_size=1.0,
                        pixel_scale_x=None, pixel_scale_y=None):
-    """1ブロックに対する傾斜計算"""
+    """Slope computation for a single block."""
     nan_mask = cp.isnan(block)
     dy, dx, nan_mask = handle_nan_for_gradient(
         block, scale=1, pixel_size=pixel_size,

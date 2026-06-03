@@ -5,11 +5,11 @@ import contextlib
 import threading
 import cupy as cp
 
-# スレッドローカルなGPUコンテキスト管理（改良版）
+# Thread-local GPU context management (improved)
 _thread_local = threading.local()
 
 def get_gpu_context():
-    """スレッドローカルなGPUメモリプールを取得（改良版）"""
+    """Get a thread-local GPU memory pool (improved)."""
     if not hasattr(_thread_local, 'mempool'):
         try:
             import rmm
@@ -29,12 +29,12 @@ def get_gpu_context():
 
 @contextlib.contextmanager
 def gpu_memory_pool():
-    """GPUメモリプールを管理するコンテキストマネージャー（改良版）"""
+    """Context manager for the GPU memory pool (improved)."""
     mempool, pinned_mempool = get_gpu_context()
     try:
         yield
     finally:
-        # より効率的なメモリクリーンアップ
-        cp.cuda.Stream.null.synchronize()  # GPU処理完了を確実に待機
+        # More efficient memory cleanup
+        cp.cuda.Stream.null.synchronize()  # ensure GPU work has finished
         mempool.free_all_blocks()
         pinned_mempool.free_all_blocks()

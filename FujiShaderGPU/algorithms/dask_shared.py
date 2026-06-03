@@ -1,14 +1,14 @@
 """
 FujiShaderGPU/algorithms/dask_shared.py
 
-後方互換性のための再エクスポートハブ。
-全アルゴリズム実装は個別の _impl_*.py モジュールに分離済み。
+Re-export hub for backward compatibility.
+All algorithm implementations are split into separate _impl_*.py modules.
 
-Phase 1: 共通基盤 (_base, _nan_utils, _global_stats, _normalization)
-Phase 2: 大型アルゴリズム6種 (_impl_rvi, _impl_npr_edges,
+Phase 1: shared foundation (_base, _nan_utils, _global_stats, _normalization)
+Phase 2: six large algorithms (_impl_rvi, _impl_npr_edges,
          _impl_ambient_occlusion, _impl_openness, _impl_specular,
          _impl_fractal_anomaly)
-Phase 3: 残留アルゴリズム8種 (_impl_hillshade, _impl_slope,
+Phase 3: remaining eight algorithms (_impl_hillshade, _impl_slope,
          _impl_visual_saliency, _impl_lrm, _impl_atmospheric_scattering,
          _impl_multiscale_terrain,
          _impl_curvature, _impl_experimental)
@@ -21,7 +21,7 @@ import numpy as np  # noqa: F401
 import dask.array as da  # noqa: F401
 
 # ---------------------------------------------------------------------------
-# Phase 1: 共通基盤の再エクスポート
+# Phase 1: re-export the shared foundation
 # ---------------------------------------------------------------------------
 
 # --- _base.py ---
@@ -64,7 +64,7 @@ from ._normalization import (
 )
 
 # ---------------------------------------------------------------------------
-# Phase 2: 大型アルゴリズムの再エクスポート
+# Phase 2: re-export the large algorithms
 # ---------------------------------------------------------------------------
 
 # --- _impl_rvi.py ---
@@ -100,7 +100,7 @@ from ._impl_fractal_anomaly import (
 )
 
 # ---------------------------------------------------------------------------
-# Phase 3: 残留アルゴリズムの再エクスポート
+# Phase 3: re-export the remaining algorithms
 # ---------------------------------------------------------------------------
 
 # --- _impl_hillshade.py ---
@@ -147,7 +147,7 @@ from ._impl_experimental import (
 )
 
 # ---------------------------------------------------------------------------
-# アルゴリズムレジストリ
+# Algorithm registry
 # ---------------------------------------------------------------------------
 
 ALGORITHMS = {

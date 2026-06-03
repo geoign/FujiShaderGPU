@@ -1,21 +1,21 @@
 """
 FujiShaderGPU/core/__init__.py
-コア処理モジュールの初期化
+Core processing package initialization.
 """
 
-# プラットフォーム別のインポート
+# Platform-specific imports
 import platform
 
 __all__ = []
 
-# 共通モジュール
+# Shared modules
 try:
     from .gpu_memory import gpu_memory_pool  # noqa: F401
     __all__.append("gpu_memory_pool")
 except ImportError:
     pass
 
-# Windows/macOS向けモジュール
+# Windows/macOS modules
 if platform.system().lower() != "linux":
     try:
         from .tile_processor import process_dem_tiles, resume_cog_generation  # noqa: F401
@@ -23,7 +23,7 @@ if platform.system().lower() != "linux":
     except ImportError:
         pass
 
-# Linux向けモジュール
+# Linux modules
 else:
     try:
         from .dask_processor import run_pipeline, make_cluster  # noqa: F401

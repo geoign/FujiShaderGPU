@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_visual_saliency.py
 
-Visual Saliency (視覚的顕著性) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 3)。
+Visual Saliency algorithm implementation.
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 from typing import List, Tuple

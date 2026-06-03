@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_specular.py
 
-Specular (鏡面反射効果) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 2)。
+Specular algorithm implementation.
+Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import cupy as cp
@@ -23,7 +23,7 @@ def compute_specular_block(block, *, roughness_scale=50.0, shininess=20.0,
                           roughness_norm_scale=None, geographic_mode=False,
                           light_azimuth=Constants.DEFAULT_AZIMUTH,
                           light_altitude=Constants.DEFAULT_ALTITUDE):
-    """鏡面反射効果の計算（Cook-Torranceモデルの簡易版）"""
+    """Specular reflection computation (simplified Cook-Torrance model)."""
     nan_mask = cp.isnan(block)
     dy, dx, nan_mask = handle_nan_for_gradient(
         block, scale=1, pixel_size=pixel_size,
@@ -118,7 +118,7 @@ def compute_specular_spatial_block(
 
 
 class SpecularAlgorithm(DaskAlgorithm):
-    """鏡面反射効果アルゴリズム"""
+    """Specular reflection algorithm."""
     def process(self, gpu_arr, **params):
         rs = params.get('roughness_scale', 50.0)
         sh = params.get('shininess', 20.0)

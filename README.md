@@ -28,7 +28,7 @@ Windows/macOS tile runtime:
 pip install -e ".[windows]"
 ```
 
-`windows` extra now includes `dask[array]` because some tile-path algorithms are executed through the shared Dask bridge.
+The `windows` extra includes `dask[array]` because some tile-path algorithms are executed through the shared Dask bridge.
 
 Development tools:
 
@@ -77,6 +77,26 @@ cost is nearly independent of the full raster size and streams within bounded
 memory. When the pipeline is given an input without overviews it still runs but
 warns and points to this command (decimated reads fall back to slow full-res reads).
 
+NoData detection / override (all converted to float NaN **before** filling):
+
+- The raster's **declared** NoData is always honored (masked I/O).
+- `--nodata VALUE` — treat an explicit sentinel as NoData even when the raster
+  declares none (or declares a different value). Accepts `-9999`, `0`, `nan`, …
+- **Undeclared NoData auto-detection is ON by default**: a dominant constant
+  border (a NoData frame whose tag was lost in conversion) is detected and
+  converted to NaN, preventing it from being treated as real terrain (which would
+  otherwise produce a halo around the data edge). Disable with `--no-detect-nodata`;
+  tune sensitivity with `--nodata-border-fraction` (default `0.5` = the value must
+  occupy ≥ 50% of the raster's outer ring).
+
+```bash
+# Explicitly declare a lost -9999 sentinel while building the COG
+python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --nodata -9999 --force
+```
+
+The **main pipeline** also accepts `--nodata VALUE` (both backends): the value is
+replaced with NaN at load time, before any algorithm runs.
+
 ```bash
 python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --fill-mode enclosed --force
 fujishadergpu kyoto_cog.tif kyoto_rvi.tif --algorithm rvi --radii 4,32,256,2048
@@ -90,6 +110,33 @@ fujishadergpu kyoto_cog.tif kyoto_rvi.tif --algorithm rvi --radii 4,32,256,2048
 - Output:
   - COG by default
   - Zarr when output path ends with `.zarr` (Dask path)
+
+## Output data type (compact integer COGs)
+
+By default every algorithm is computed and written as **float32** (NoData = NaN).
+For delivery you can quantize the result to a compact integer COG — useful for
+faster COG builds (less disk I/O), smaller object-storage transfers, and lighter
+QGIS reads:
+
+```bash
+# 1/4-size uint8 COG for visualization
+fujishadergpu in.tif out_rvi.tif --algorithm rvi --output-dtype uint8
+
+# 1/2-size int16 (more tonal levels), explicit range
+fujishadergpu in.tif out_slope.tif --algorithm slope --output-dtype int16 --output-range 0,90
+```
+
+- `--output-dtype {float32,int16,uint8}` (default `float32`, unchanged behavior).
+- **NoData = 0** for both integer types; valid data is stretched to fill the
+  remaining codes for maximum tonal resolution. Each algorithm has a known native
+  range (e.g. slope `0..90`, RVI `-1.5..1.5`); override with `--output-range lo,hi`.
+- Signed outputs (RVI / LRM / fractal_anomaly): `int16` uses the full symmetric
+  `[-32767, +32767]` (DN 0 = value ~0 = flat ground, doubling as NoData — visually
+  negligible); `uint8` centers value 0 at `128`.
+- GDAL `scale`/`offset` are recorded so the physical value is recoverable
+  (`value = scale·DN + offset`); QGIS shows scaled values and treats `0` as nodata.
+- Compute stays float32 on the GPU — only the final encoding changes — so the math
+  and its accuracy are identical to the float32 output. Available on both backends.
 
 ## Algorithms (Dask Registry)
 
@@ -175,6 +222,24 @@ Dask/Tile path RVI with explicit radii:
 fujishadergpu input.tif output.tif --algorithm rvi --radii 4,16,64 --weights 0.5,0.3,0.2
 ```
 
+Compact integer output (uint8, ~1/4 size) for visualization:
+
+```bash
+fujishadergpu input.tif output.tif --algorithm rvi --output-dtype uint8
+```
+
+int16 output with an explicit quantization range:
+
+```bash
+fujishadergpu input.tif output.tif --algorithm slope --output-dtype int16 --output-range 0,90
+```
+
+Declare a lost NoData sentinel at load time (both backends):
+
+```bash
+fujishadergpu input.tif output.tif --algorithm rvi --nodata -9999
+```
+
 RVI radii behavior:
 
 - `--radii` is interpreted in pixels.
@@ -225,7 +290,8 @@ python -m pip check
   - `tile_io.py`
   - `tile_compute.py`
 - `FujiShaderGPU/io/`
-  - `dem_preprocess.py` (preprocessing core: COG-ification + overview-based NoData fill)
+  - `dem_preprocess.py` (preprocessing core: COG-ification + overview-based NoData fill + undeclared-NoData detection)
+  - `output_encoding.py` (output dtype quantization: float32/int16/uint8 ranges, scale/offset, NoData policy)
   - `cog_builder.py`, `cog_validator.py`, `raster_info.py`
 
 ## Notes

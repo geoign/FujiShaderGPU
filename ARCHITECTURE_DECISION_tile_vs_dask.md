@@ -1,190 +1,225 @@
-# アーキテクチャ決定記録: tile 方式への統合検討（tile vs dask-cuda）
+# Architecture Decision Record: Consolidating onto the tile backend (tile vs dask-cuda)
 
-- **ステータス**: 検討中（未決定）
-- **作成日**: 2026-06-01
-- **対象**: FujiShaderGPU の 2 バックエンド（Linux: dask-cuda / Windows・macOS: tile）を、
-  将来的に tile 方式へ統合すべきかどうか
-- **きっかけ**: マルチGPU（例: RTX 3090 × 8）での高速化検討と、dask-cuda 実装の
-  書き込みボトルネック・依存スタックの重さに関する議論
-
----
-
-## 1. 背景と問い
-
-FujiShaderGPU は現在 2 つの処理バックエンドを持つ。
-
-- **dask-cuda 経路（Linux）**: `LocalCUDACluster`（GPU 1枚＝1ワーカー）＋遅延グラフ
-  （`map_overlap` でハロー付き計算）→ COG/Zarr 書き出し。
-- **tile 経路（Windows/macOS）**: `ThreadPoolExecutor` で、各タイルが自分の窓
-  （コア＋パディング）を COG から読み・GPU計算・タイルGeoTIFF書き出し → VRT+COG 統合。
-
-議論の問い:
-
-1. マルチGPUに対して、tile 方式の方がアーキテクチャ的に適性が強いのか？
-2. そうであれば、tile 方式へ一本化（統合）すべきか？
-3. dask-cuda が tile 方式に対して大きな優位を持つ状況はあるか？
+- **Status**: Under discussion (undecided)
+- **Created**: 2026-06-01
+- **Scope**: Whether FujiShaderGPU's two backends (Linux: dask-cuda / Windows/macOS:
+  tile) should eventually be consolidated onto the tile approach.
+- **Trigger**: Discussion around multi-GPU acceleration (e.g. RTX 3090 × 8) and the
+  write-side bottleneck / heavy dependency stack of the dask-cuda implementation.
 
 ---
 
-## 2. マルチGPU適性: tile 方式が本質的に有利
+## 1. Background and questions
 
-tile 方式は大規模ラスタ処理の定石である「独立タイル並列」パターンであり、次を満たす。
+FujiShaderGPU currently has two processing backends.
 
-1. **タイルが完全独立**: 各タイルが自分の窓（コア＋ハロー）を COG から直接読むため、
-   **GPU間のハロー交換が不要**。
-   - 対して dask-cuda は `map_overlap` がチャンク境界依存を作り、ハローが GPU 間を
-     ホスト経由で転送される（`dask_cluster.py` は非HMM対策で P2P rechunk を無効化済み
-     ＝転送オーバーヘッド）。
-2. **書き込みが分散**: 各ワーカーが自分のタイル GeoTIFF を個別に書き、最後に VRT+COG で
-   統合するだけ。
-   - 対して dask-cuda の大規模出力経路は計算結果をクライアントへ集約して逐次書き込み
-     （`_write_cog_da_chunked_impl`）。これが**マルチGPUの実効スケーリング上限**になる。
-3. **仕事の割り当てが自明**: タイルを GPU にラウンドロビンするだけ。スケジューラ・
-   スピル・RMMプールの調整が不要。
-4. **マルチノードにも自然に拡張可能**: 各ノードが共有/クラウド COG からタイルを読み、
-   タイルを共有ストレージへ書き、最後に統合。dask-cuda のマルチノードより単純。
+- **dask-cuda path (Linux)**: `LocalCUDACluster` (1 GPU = 1 worker) + lazy graph
+  (`map_overlap` for halo-padded compute) → COG/Zarr output.
+- **tile path (Windows/macOS)**: a `ThreadPoolExecutor` where each tile reads its own
+  window (core + padding) from the COG, computes on the GPU, and writes a tile
+  GeoTIFF → VRT+COG consolidation.
 
-要点: tile 方式は「**通信する代わりにハローをディスクから重複読みする**」トレードオフを
-取っており、これがスケーラビリティの源泉。今回入れた overview 最適化でハローが小さく
-なったため、重複読みのコストも小さい。
+Questions for discussion:
+
+1. Is the tile approach architecturally better suited to multi-GPU?
+2. If so, should we consolidate onto the tile approach?
+3. Are there situations where dask-cuda has a large advantage over the tile approach?
 
 ---
 
-## 3. 現状の正確な認識（重要な注意点）
+## 2. Multi-GPU suitability: the tile approach is inherently favorable
 
-統合を「単純な勝ち」と誤認しないための事実。
+The tile approach is the canonical "independent-tile parallelism" pattern for
+large-raster processing, and it satisfies the following.
 
-1. **現状の tile 経路も dask に依存している**。`DaskSharedTileAdapter` が1タイルを
-   単一チャンクの dask 配列にして `map_overlap` を回している。完全に dask を外すには、
-   ブリッジを「cupy ブロック関数（`compute_*_block`）の直接呼び出し＋窓パディングの
-   手動処理」に置き換える必要がある（中核計算は既に cupy 関数なので技術的には素直）。
-2. **現状の tile 経路は単一GPU**。`ThreadPoolExecutor` の全スレッドが既定デバイスを
-   共有する。マルチGPU化には **GPU 1枚＝1プロセス**（各プロセスを `CUDA_VISIBLE_DEVICES`
-   で固定し、タイル集合を分担）が最もクリーン（cupy の「1プロセス＝1既定デバイス」と
-   GIL 制約を回避できる）。
-3. dask 経路にあって tile 経路に無い機能: **Zarr I/O** と「VRAM超のストリーミング」。
+1. **Tiles are fully independent**: each tile reads its own window (core + halo)
+   directly from the COG, so **no inter-GPU halo exchange is needed**.
+   - By contrast, dask-cuda's `map_overlap` creates chunk-boundary dependencies, and
+     halos are transferred between GPUs via the host (`dask_cluster.py` already
+     disables P2P rechunk as a non-HMM workaround = transfer overhead).
+2. **Distributed writes**: each worker writes its own tile GeoTIFF independently, and
+   only the final VRT+COG step consolidates them.
+   - By contrast, dask-cuda's large-output path gathers compute results to the client
+     and writes them sequentially (`_write_cog_da_chunked_impl`). This becomes the
+     **effective ceiling on multi-GPU scaling**.
+3. **Trivial work assignment**: just round-robin tiles across GPUs. No scheduler,
+   spill, or RMM-pool tuning required.
+4. **Naturally extends to multi-node**: each node reads tiles from a shared/cloud COG,
+   writes tiles to shared storage, and consolidates at the end — simpler than
+   dask-cuda multi-node.
 
----
-
-## 4. dask-cuda が本質的に優位な状況
-
-tile 方式の強み（タイルの独立性）は、裏返すと「**タイル境界を越える結合**を扱えない」
-弱点でもある。そこが dask-cuda（分散配列モデル）の優位領域。
-
-### 4.1 大域結合アルゴリズム（最重要・地形ツール特有）
-
-タイル独立では**ラスタ全体に伝播する処理を正しく計算できない**（境界で必ず不連続/誤り）。
-
-- **水文系**: flow direction / **flow accumulation（流量集積）** / watershed（流域分割）/
-  **depression filling（窪地埋め, priority-flood）** / 河道網抽出。
-  流量は DEM 全体の上流域に依存し、上流域は数十km にわたってタイルをまたぐ → 不可能。
-- **可視性**: 長距離 viewshed / 累積可視領域。
-- **コスト距離・最小コスト経路**、全域 **連結成分ラベリング**、真の大域統計/伝播。
-
-これらは局所ハローで閉じず、全域のデータ移動・反復伝播を要するため、dask（または専用の
-大域アルゴリズム）が必要。**FujiShaderGPU の現行アルゴリズムはすべて局所**
-（hillshade/RVI/openness 等＝有限ハロー）なので現状は該当しないが、**将来 水文・可視性を
-入れるなら決定的な分岐点**になる。
-
-### 4.2 アウトオブコア（spill）の安全網
-
-1ユニット（チャンク＋ハロー、または巨大中間結果）が VRAM/RAM を超える病的ケースで、
-dask-cuda は device→host→disk へ自動スピルし、落ちずに完走できる。tile はタイルを
-VRAM に収める設計なので通常は不要だが、想定外の大ハロー/大中間結果に対する堅牢性は dask。
-
-### 4.3 動的負荷分散・耐障害性（大規模時）
-
-- タイルコストが不均一（NoData 多数でスキップ vs 重い領域）な場合、distributed の
-  work-stealing が自動均衡（tile の静的割り当ては偏りやすい。共有キューで緩和は可能）。
-- ワーカー死亡時のタスク再試行・nanny 再起動。多ノード・長時間ジョブでの耐障害性。
-
-### 4.4 遅延グラフ最適化・再チャンク・エコシステム
-
-- 多段パイプラインの fusion／中間結果の非実体化、全域の rechunk/transpose。
-- **xarray / Zarr** との成熟した連携（N次元・時系列・遅延評価）。
-
-> 補足: 大域処理でも汎用 dask が常に最速とは限らない（priority-flood 等は専用の
-> ストリーミング/外部メモリ実装が強い）。dask の真価は「**汎用の大域配列演算を
-> 比較的容易に書ける**」点にある。
+Key point: the tile approach takes the trade-off of "**re-reading halos redundantly
+from disk instead of communicating**", which is the source of its scalability. The
+overview optimizations added recently make halos small, so the cost of redundant
+reads is also small.
 
 ---
 
-## 5. 現行ワークロードへの当てはめ
+## 3. Accurate picture of the current state (important caveats)
 
-| 観点 | 現行（全アルゴリズムが局所＋COG中心） | dask優位が効くか |
+Facts to avoid mistaking consolidation for a "simple win".
+
+1. **The current tile path also depends on dask.** `DaskSharedTileAdapter` turns a
+   single tile into a single-chunk dask array and runs `map_overlap` on it. Fully
+   removing dask requires replacing the bridge with "direct calls to the cupy block
+   functions (`compute_*_block`) + manual window-padding handling" (technically
+   straightforward, since the core compute is already cupy functions).
+2. **The current tile path is single-GPU.** All threads of the `ThreadPoolExecutor`
+   share the default device. The cleanest path to multi-GPU is **1 GPU = 1 process**
+   (pin each process with `CUDA_VISIBLE_DEVICES` and split the tile set), which avoids
+   cupy's "1 process = 1 default device" and the GIL constraint.
+3. Features present in the dask path but not in the tile path: **Zarr I/O** and
+   "streaming beyond VRAM".
+
+---
+
+## 4. Situations where dask-cuda is inherently superior
+
+The tile approach's strength (tile independence) is, flipped around, the weakness of
+"**cannot handle coupling that crosses tile boundaries**". That is dask-cuda's
+(distributed-array model) domain of advantage.
+
+### 4.1 Globally-coupled algorithms (most important; specific to terrain tools)
+
+Independent tiles **cannot correctly compute processes that propagate across the whole
+raster** (always discontinuous/wrong at boundaries).
+
+- **Hydrology**: flow direction / **flow accumulation** / watershed /
+  **depression filling** (priority-flood) / channel-network extraction.
+  Flow depends on the entire upstream area of the DEM, and the upstream area spans
+  tiles over tens of km → impossible.
+- **Visibility**: long-range viewshed / cumulative viewshed.
+- **Cost distance / least-cost path**, full-extent **connected-component labeling**,
+  true global statistics/propagation.
+
+These do not close under a local halo and require whole-extent data movement /
+iterative propagation, so dask (or a dedicated global algorithm) is needed.
+**All of FujiShaderGPU's current algorithms are local** (hillshade/RVI/openness etc. =
+finite halo), so this does not apply today, but it becomes **a decisive branch point
+if hydrology/visibility is added in the future**.
+
+### 4.2 Out-of-core (spill) safety net
+
+In pathological cases where one unit (chunk + halo, or a huge intermediate) exceeds
+VRAM/RAM, dask-cuda automatically spills device→host→disk and can finish without
+crashing. The tile approach is designed to fit a tile in VRAM so this is usually
+unnecessary, but dask is more robust against unexpectedly large halos/intermediates.
+
+### 4.3 Dynamic load balancing / fault tolerance (at scale)
+
+- When tile cost is non-uniform (skip on heavy NoData vs heavy regions), distributed's
+  work-stealing rebalances automatically (the tile path's static assignment skews
+  easily; a shared queue can mitigate it).
+- Task retries on worker death, nanny restarts. Fault tolerance for multi-node,
+  long-running jobs.
+
+### 4.4 Lazy-graph optimization / rechunk / ecosystem
+
+- Multi-stage pipeline fusion / non-materialization of intermediates, whole-extent
+  rechunk/transpose.
+- Mature integration with **xarray / Zarr** (N-dimensional, time series, lazy eval).
+
+> Note: even for global processing, generic dask is not always fastest (priority-flood
+> etc. favor dedicated streaming/external-memory implementations). dask's real value is
+> that it makes "**generic global array operations relatively easy to write**".
+
+---
+
+## 5. Mapping to the current workload
+
+| Aspect | Current (all algorithms local + COG-centric) | Does dask's advantage apply? |
 |---|---|---|
-| hillshade / RVI / openness / AO / curvature 等 | 局所ハローで完結 | ✗（tile で十分・むしろ優位） |
-| 水文・可視性・コスト距離 | **未実装** | ◎（将来入れるなら dask か専用大域実装が必須） |
-| VRAM 超の病的ケース | タイルサイズで回避 | △（dask は安全網） |
-| Zarr / 多バンド / 時系列 | COG 主軸 | ○（必要なら dask） |
-| 多ノード・耐障害 | 単一ノード運用 | ○（大規模化時） |
-| マルチGPU スケーリング | — | ✗（**tile が有利**: 独立・分散書き込み・通信レス） |
+| hillshade / RVI / openness / AO / curvature etc. | Closes under a local halo | ✗ (tile is sufficient — if anything, superior) |
+| Hydrology / visibility / cost distance | **Not implemented** | ◎ (if added later, dask or a dedicated global impl is required) |
+| Pathological beyond-VRAM cases | Avoided via tile size | △ (dask is a safety net) |
+| Zarr / multi-band / time series | COG-centric | ○ (dask if needed) |
+| Multi-node / fault tolerance | Single-node operation | ○ (when scaling up) |
+| Multi-GPU scaling | — | ✗ (**tile is favorable**: independent, distributed writes, communication-free) |
 
 ---
 
-## 6. 統合のメリット / デメリット
+## 6. Pros / cons of consolidation
 
-### メリット（tile へ一本化）
+### Pros (consolidating onto tile)
 
-- **依存スタックの大幅簡素化**: dask-cuda / cudf-cu12 / rmm-cu12 / distributed を撤去できる
-  可能性。これは Runpod セットアップで最も重く・脆い部分（NVIDIA index からの cudf/rmm 導入）
-  で、運用上の大きな改善。
-- **構造的に**書き込み逐次・GPU間転送・スピル複雑性を持たない。
-- **コードの一本化**: 現状「dask実装＋tileブリッジ」の二重構造を解消。
-- マルチGPU/マルチノードへの自然な拡張。
+- **Major dependency-stack simplification**: potentially remove dask-cuda / cudf-cu12 /
+  rmm-cu12 / distributed. This is the heaviest and most fragile part of the Runpod
+  setup (installing cudf/rmm from the NVIDIA index), so a big operational improvement.
+- **Structurally** free of sequential writes, inter-GPU transfer, and spill complexity.
+- **Single code path**: resolves the current "dask implementation + tile bridge" dual
+  structure.
+- Natural extension to multi-GPU / multi-node.
 
-### デメリット / リスク
+### Cons / risks
 
-- 大域結合アルゴリズム（水文・可視性など）を将来やる場合、tile 単独では実装不可。
-- 現 tile も dask 依存・単一GPUのため、統合には相応の実装と回帰リスク。
-- Zarr I/O・VRAM超ストリーミングを tile 側に再実装する必要（必要なら）。
-- 両経路とも現状は動作しており、急ぐ理由は薄い。
-
----
-
-## 7. 判断軸: アルゴリズムのロードマップ次第
-
-- **当面 局所アルゴリズム中心** → tile へ統合してよい（簡素・高スケール）。
-  dask 撤去のデメリットは小さい。
-- **将来 水文・可視性などの大域処理を入れる計画がある** → その部分は tile では実装不可
-  なので、**dask を残す**か、**その大域処理だけを専用実装**（並列 priority-flood、
-  ストリーミング flow-accumulation 等）し、局所処理は tile という**ハイブリッド**が合理的。
+- If globally-coupled algorithms (hydrology, visibility, etc.) are pursued later, they
+  cannot be implemented in the tile approach alone.
+- The current tile path also depends on dask and is single-GPU, so consolidation
+  carries non-trivial implementation and regression risk.
+- Zarr I/O / beyond-VRAM streaming would need to be reimplemented on the tile side
+  (if needed).
+- Both paths currently work, so there is little reason to rush.
 
 ---
 
-## 8. 推奨: 段階的アプローチ
+## 7. Decision axis: depends on the algorithm roadmap
 
-一気の全置換はリスクが高いので段階導入を推奨。
-
-- **ステップ0（まず計測）**: 直近の最適化（前処理COG化／穴埋め分離／overview大半径化／
-  ハロー削減／並列書き込み）の効果で、**単一GPUでも十分速い可能性**がある。
-  まず単一GPU（A100 80GB か RTX 4090）で実測し、本当にマルチGPUが要るか見極める。
-- **ステップ1（高ROI・低リスク）**: tile 方式に「**GPU 1枚＝1プロセス**」のマルチGPU実行を
-  追加。タイルを GPU へ分担、各プロセスが自タイルを読み・計算・書き出し、最後に統合。
-  dask 経路は当面温存。これだけで独立タイル＋分散書き込みのマルチGPUスケーリングが得られる。
-- **ステップ2（簡素化・中リスク）**: ブリッジを cupy 直接呼び出しに置換して dask-cuda 依存を
-  撤去、tile を正式な唯一バックエンドに。Linux でも tile を使う。依存スタックが激減。
-- **（条件付き）大域アルゴリズム対応**: 水文・可視性を導入する場合のみ、その機能に対して
-  dask または専用大域実装を別途用意（ハイブリッド）。
+- **Mostly local algorithms for the foreseeable future** → consolidating onto tile is
+  fine (simple, high-scale). The downside of removing dask is small.
+- **Plans to add global processing (hydrology, visibility, etc.) in the future** →
+  those parts cannot be implemented in tile, so it is reasonable to **keep dask**, or
+  to provide **a dedicated implementation just for that global processing** (parallel
+  priority-flood, streaming flow-accumulation, etc.) while keeping local processing on
+  tile — a **hybrid**.
 
 ---
 
-## 9. 結論（現時点）
+## 8. Recommendation: a phased approach
 
-- **マルチGPU/マルチノード適性は tile 方式が明確に上**（独立性・分散書き込み・通信レス）。
-- **現行の局所アルゴリズム＋COG＋単一/少数GPU**用途では dask-cuda に大きな優位はなく、
-  tile への統合は戦略的に妥当（簡素化・堅牢化・スケーリングの両取り）。
-- ただし **dask-cuda が本質的に優位なのは大域結合アルゴリズム（特に水文・可視性）**であり、
-  これを将来やるかどうかが統合可否の最大の判断軸。
-- 進めるなら**段階導入**（①tile にプロセス毎GPUのマルチGPU追加 → ②dask 撤去・一本化、
-  必要時のみ大域処理のためにハイブリッド維持）が安全。
-- **まず単一GPUで実測**し、最適化後でもマルチGPUが必要か確認するのが先決。
+A single big-bang replacement is high-risk, so a phased rollout is recommended.
+
+- **Step 0 (measure first)**: with the recent optimizations (preprocessing COG-ization
+  / decoupled hole filling / large-radius-from-overview / halo reduction / parallel
+  writes), **a single GPU may already be fast enough**. Measure first on a single GPU
+  (A100 80GB or RTX 4090) to determine whether multi-GPU is really needed.
+- **Step 1 (high ROI, low risk)**: add "**1 GPU = 1 process**" multi-GPU execution to
+  the tile approach. Split tiles across GPUs; each process reads / computes / writes its
+  own tiles, then consolidate at the end. Keep the dask path for now. This alone yields
+  independent-tile + distributed-write multi-GPU scaling.
+- **Step 2 (simplification, medium risk)**: replace the bridge with direct cupy calls,
+  remove the dask-cuda dependency, and make tile the single official backend. Use tile
+  on Linux too. The dependency stack shrinks dramatically.
+- **(Conditional) global-algorithm support**: only if hydrology/visibility is
+  introduced, provide dask or a dedicated global implementation for that feature
+  separately (hybrid).
 
 ---
 
-## 10. 未解決事項 / 次アクション
+## 9. Conclusion (as of now)
 
-- [ ] 単一GPU（A100 80GB / RTX 4090）での実測（所要時間とボトルネック＝計算 or 書き込み/I-O の判定）
-- [ ] アルゴリズムロードマップの確認（水文・可視性など大域処理を入れるか）
-- [ ] （進める場合）ステップ1「tile のプロセス毎GPUマルチGPU実行」の設計・実装
-- [ ] （進める場合）ステップ2「ブリッジの cupy 直接化・dask-cuda 撤去」の移行計画書
+- **Multi-GPU/multi-node suitability is clearly higher for the tile approach**
+  (independence, distributed writes, communication-free).
+- For the **current local-algorithm + COG + single/few-GPU** use case, dask-cuda has no
+  large advantage, and consolidating onto tile is strategically reasonable (gains both
+  simplification/robustness and scaling).
+- However, **dask-cuda is inherently superior for globally-coupled algorithms
+  (especially hydrology/visibility)**, and whether those are pursued in the future is
+  the biggest decision axis for consolidation.
+- If we proceed, **a phased rollout** is safest (① add per-process-GPU multi-GPU to
+  tile → ② remove dask and consolidate, keeping a hybrid for global processing only
+  when needed).
+- **Measure on a single GPU first** to confirm whether multi-GPU is still needed after
+  the optimizations.
+
+---
+
+## 10. Open items / next actions
+
+- [ ] Single-GPU measurement (A100 80GB / RTX 4090): wall-clock time and bottleneck
+  (compute vs write/I-O).
+- [ ] Confirm the algorithm roadmap (whether to add global processing such as
+  hydrology/visibility).
+- [ ] (If proceeding) design/implement Step 1 "per-process-GPU multi-GPU execution on
+  tile".
+- [ ] (If proceeding) a migration plan for Step 2 "direct cupy bridge / dask-cuda
+  removal".

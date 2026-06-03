@@ -38,7 +38,7 @@ requires-python = ">=3.8"
 dependencies = [
     "numpy>=1.21.0",
     "PyYAML>=6.0.0",
-    "cupy-cuda12x>=13.4.0",  # 縺ｾ縺溘・ cupy-cuda12x for CUDA 12
+    "cupy-cuda12x>=13.4.0",  # or cupy-cuda12x for CUDA 12
     "rasterio>=1.3.0",
     "psutil>=5.8.0",
     "tqdm",
@@ -49,7 +49,7 @@ dependencies = [
 # Install the binding that exactly matches native libgdal, e.g.
 #   GDAL_VERSION=$(gdal-config --version)
 #   python -m pip install --no-build-isolation "GDAL==$GDAL_VERSION"
-# Linux/Dask-CUDA 螳溯｡檎腸蠅・
+# Linux/Dask-CUDA runtime environment
 linux = [
     "dask-cuda>=24.6",
     "dask[array]>=2024.4",
@@ -62,17 +62,17 @@ linux = [
     "rmm-cu12>=25.6",
     "cudf-cu12>=25.6",
 ]
-# Windows/macOS 繧ｿ繧､繝ｫ蜃ｦ逅・ｮ溯｡檎腸蠅・
+# Windows/macOS tile-processing runtime environment
 windows = [
     "dask[array]>=2024.4",
     "scipy>=1.7.0",
 ]
-# 鬮伜ｺｦ縺ｪ蝨ｰ蠖｢蛻・梵讖溯・逕ｨ
+# For advanced terrain-analysis features
 full = [
     "dask[array]>=2024.4",
     "scipy>=1.7.0",
 ]
-# 髢狗匱逕ｨ
+# For development
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -82,13 +82,13 @@ dev = [
     "isort>=5.12.0",
     "pre-commit>=3.0.0",
 ]
-# 繝峨く繝･繝｡繝ｳ繝育函謌千畑
+# For documentation generation
 docs = [
     "sphinx>=6.0.0",
     "sphinx-rtd-theme>=1.3.0",
     "sphinx-autodoc-typehints>=1.23.0",
 ]
-# 繝吶Φ繝√・繝ｼ繧ｯ逕ｨ
+# For benchmarking
 benchmark = [
     "pytest-benchmark>=4.0.0",
     "memory-profiler>=0.60.0",
@@ -113,7 +113,7 @@ target-version = ['py38', 'py39', 'py310', 'py311']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
-  # 繝・ヵ繧ｩ繝ｫ繝医・髯､螟冶ｨｭ螳・
+  # Default exclusion settings
   \.eggs
   | \.git
   | \.hg
@@ -171,7 +171,7 @@ exclude_lines = [
     "if TYPE_CHECKING:",
 ]
 
-# 繝代ャ繧ｱ繝ｼ繧ｸ險ｭ螳壹・隧ｳ邏ｰ
+# Package configuration details
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["FujiShaderGPU*"]

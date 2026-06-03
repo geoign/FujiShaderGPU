@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_multiscale_terrain.py
 
-Multiscale Terrain (マルチスケール地形) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 3)。
+Multiscale Terrain algorithm implementation.
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import logging
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class MultiscaleDaskAlgorithm(DaskAlgorithm):
-    """マルチスケール地形アルゴリズム"""
+    """Multiscale terrain algorithm."""
     def process(self, gpu_arr, **params):
         scales = params.get('scales', [1, 10, 50, 100])
         weights = params.get('weights', None)
@@ -86,7 +86,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             results.append(detail)
 
         def weighted_combine_and_normalize(*blocks):
-            """グローバル統計値を使用して正規化"""
+            """Normalize using global statistics."""
             nan_mask = cp.isnan(blocks[0])
             result = cp.zeros_like(blocks[0])
             for i, block in enumerate(blocks):

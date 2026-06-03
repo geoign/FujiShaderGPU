@@ -35,7 +35,7 @@ def get_gpu_config(
         gpu_name = sys_config.get("gpu_name", "").upper()
         vram_gb = float(sys_config.get("vram_gb", 0.0))
         gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
-        logger.info("GPU自動検出: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
+        logger.info("GPU auto-detected: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
 
     preset = _gpu_config_manager.get_preset(gpu_type)
 
@@ -65,7 +65,7 @@ def get_gpu_config(
         "vram_monitor": vram_gb < 40,
         "batch_size": tuned["batch_size"],
         "prefetch_tiles": tuned["prefetch_tiles"],
-        "description": f"{gpu_type.upper()} 動的最適化 (VRAM {vram_gb:.0f}GB)",
+        "description": f"{gpu_type.upper()} dynamic optimization (VRAM {vram_gb:.0f}GB)",
         "system_info": sys_config,
     }
 
@@ -112,32 +112,32 @@ def detect_optimal_system_config() -> dict:
     else:
         config["optimization_level"] = "standard"
 
-    logger.info("システム検出結果:")
-    logger.info("  CPU: %sコア, RAM: %sGB", config['cpu_count'], config['memory_gb'])
+    logger.info("System detection results:")
+    logger.info("  CPU: %s cores, RAM: %sGB", config['cpu_count'], config['memory_gb'])
     if config["gpu_detected"]:
         logger.info("  GPU: %s, VRAM: %.1fGB", config['gpu_name'], config['vram_gb'])
     else:
-        logger.info("  GPU: 未検出 (CPU情報のみで継続)")
-    logger.info("  最適化レベル: %s", config['optimization_level'])
+        logger.info("  GPU: not detected (continuing with CPU info only)")
+    logger.info("  Optimization level: %s", config['optimization_level'])
     return config
 
 
 def check_gdal_environment():
     """
-    GDAL環境チェック (QGIS最適化対応)
+    GDAL environment check (QGIS-optimization aware)
     """
-    logger.info("=== GDAL環境チェック ===")
+    logger.info("=== GDAL environment check ===")
 
     gdal_version = gdal.VersionInfo()
-    logger.info("GDALバージョン: %s", gdal_version)
+    logger.info("GDAL version: %s", gdal_version)
 
     cog_driver = gdal.GetDriverByName("COG")
-    logger.info("COGドライバー: %s", '利用可能' if cog_driver else '利用不可')
+    logger.info("COG driver: %s", 'available' if cog_driver else 'unavailable')
 
     gtiff_driver = gdal.GetDriverByName("GTiff")
-    logger.info("GTiffドライバー: %s", '利用可能' if gtiff_driver else '利用不可')
+    logger.info("GTiff driver: %s", 'available' if gtiff_driver else 'unavailable')
 
-    logger.info("QGIS最適化: 512x512ブロック / 多段階オーバービュー / AVERAGEリサンプリング / ZSTD圧縮")
+    logger.info("QGIS optimization: 512x512 blocks / multi-level overviews / AVERAGE resampling / ZSTD compression")
 
     sys_config = detect_optimal_system_config()
     logger.info(

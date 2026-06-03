@@ -1,11 +1,11 @@
 ﻿"""
 FujiShaderGPU/algorithms/tile_shared.py
-Windows/macOS向けタイルベース処理用の共通基盤
+Shared foundation for tile-based processing (Windows/macOS).
 
-NOTE: 大部分のアルゴリズムは dask_shared.py のクラスを
-tile/dask_bridge.py 経由で tile パスから利用しています。
-このファイルには tile 専用の TileAlgorithm 基底クラスと、
-共有カーネルに直接委譲する軽量アルゴリズムのみ残しています。
+NOTE: most algorithms use the dask_shared.py classes from the tile
+path via tile/dask_bridge.py.
+This file keeps only the tile-specific TileAlgorithm base class and the
+lightweight algorithms that delegate directly to shared kernels.
 """
 import cupy as cp
 from abc import ABC, abstractmethod
@@ -17,35 +17,35 @@ from .common.kernels import (
 
 
 class TileAlgorithm(ABC):
-    """地形解析アルゴリズムの基底クラス"""
+    """Base class for terrain analysis algorithms."""
 
     @abstractmethod
     def get_default_params(self) -> Dict[str, Any]:
-        """デフォルトパラメータを返す"""
+        """Return the default parameters."""
         pass
 
     @abstractmethod
     def process(self, dem_gpu: cp.ndarray, **params) -> cp.ndarray:
         """
-        GPU上でアルゴリズムを実行
+        Run the algorithm on the GPU.
 
         Parameters
         ----------
         dem_gpu : cp.ndarray
-            GPU上のDEMデータ
+            DEM data on the GPU
         **params : dict
-            アルゴリズム固有のパラメータ
+            Algorithm-specific parameters
 
         Returns
         -------
         cp.ndarray
-            処理結果（GPU上）
+            Processing result (on GPU)
         """
         pass
 
 
 class ScaleSpaceSurpriseAlgorithm(TileAlgorithm):
-    """スケール間での局所特徴変化を可視化"""
+    """Visualize local feature change across scales."""
 
     def get_default_params(self):
         return {
@@ -66,7 +66,7 @@ class ScaleSpaceSurpriseAlgorithm(TileAlgorithm):
 
 
 class MultiLightUncertaintyAlgorithm(TileAlgorithm):
-    """複数方位ライトでの不確実性を重ねた陰影"""
+    """Shading that overlays uncertainty from multiple light azimuths."""
 
     def get_default_params(self):
         return {

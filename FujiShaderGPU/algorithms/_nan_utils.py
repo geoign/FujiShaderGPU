@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_nan_utils.py
 
-NaN処理・空間スムージング・ダウンサンプリング・リストア関数群。
-dask_shared.py からの分離モジュール (Phase 1)。
+NaN handling, spatial smoothing, down/up-sampling, and restore helpers.
+Module split out from dask_shared.py (Phase 1).
 """
 from __future__ import annotations
 from typing import List, Optional, Tuple
@@ -15,7 +15,7 @@ from .common.spatial_mode import determine_spatial_radii, determine_spatial_prof
 
 
 def handle_nan_with_gaussian(block: cp.ndarray, sigma: float, mode: str = 'nearest') -> Tuple[cp.ndarray, cp.ndarray]:
-    """NaNを考慮したガウシアンフィルタ処理"""
+    """NaN-aware Gaussian filtering."""
     nan_mask = cp.isnan(block)
     if not nan_mask.any():
         return gaussian_filter(block, sigma=sigma, mode=mode), nan_mask
@@ -31,7 +31,7 @@ def handle_nan_with_gaussian(block: cp.ndarray, sigma: float, mode: str = 'neare
 
 
 def handle_nan_with_uniform(block: cp.ndarray, size: int, mode: str = 'nearest') -> Tuple[cp.ndarray, cp.ndarray]:
-    """NaNを考慮したuniform_filter処理"""
+    """NaN-aware uniform_filter processing."""
     nan_mask = cp.isnan(block)
     if not nan_mask.any():
         return uniform_filter(block, size=size, mode=mode), nan_mask
@@ -50,7 +50,7 @@ def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0,
                           pixel_size: float = 1.0,
                           pixel_scale_x: float = None,
                           pixel_scale_y: float = None) -> Tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
-    """NaNを考慮した勾配計算"""
+    """NaN-aware gradient computation."""
     nan_mask = cp.isnan(block)
     if nan_mask.any():
         filled = cp.where(nan_mask, cp.nanmean(block), block)
@@ -464,7 +464,7 @@ def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int]) -> cp.n
 
 
 def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
-    """NaN位置を復元"""
+    """Restore NaN positions."""
     if nan_mask.any():
         result[nan_mask] = cp.nan
     return result

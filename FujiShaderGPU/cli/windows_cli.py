@@ -1,6 +1,6 @@
 ﻿"""
 FujiShaderGPU/cli/windows_cli.py
-Windows環境用CLI - タイルベース処理の実装
+CLI for Windows - tile-based processing implementation.
 """
 import os
 from typing import List
@@ -10,125 +10,139 @@ from ..core.tile_processor import DEFAULT_ALGORITHMS
 
 
 class WindowsCLI(BaseCLI):
-    """Windows環境向けCLI実装（タイルベース処理）"""
+    """CLI implementation for Windows (tile-based processing)."""
     
     def get_description(self) -> str:
-        return "富士シェーダーGPU - 高速地形解析ツール (Windows/タイルベース処理)"
+        return "FujiShaderGPU - fast terrain analysis tool (Windows/tile-based processing)"
     
     def get_epilog(self) -> str:
         return """
-使用例:
-  # RVI（Ridge-Valley Index）計算
+Examples:
+  # RVI (Ridge-Valley Index)
   fujishadergpu input.tif output.tif
   
-  # Hillshade計算
+  # Hillshade
   fujishadergpu input.tif output.tif --algorithm hillshade
   
-  # Spatial RVI（半径を手動指定）
+  # Spatial RVI (manual radii)
   fujishadergpu input.tif output.tif --algorithm rvi --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
   
-  # GPUタイプを指定
+  # Specify the GPU type
   fujishadergpu input.tif output.tif --gpu-type rtx4070
   
-  # COG生成のみ（既存タイルから）
+  # COG generation only (from existing tiles)
   fujishadergpu dummy.tif output.tif --cog-only --tmp-dir existing_tiles
 
-注意: 現在は Windows/Linux とも同一のアルゴリズム名を利用できます。
-      主な違いはバックエンド実装（Windows: タイル処理 / Linux: Dask-CUDA）です。
+Note: Windows and Linux now share the same algorithm names.
+      The main difference is the backend implementation (Windows: tile processing / Linux: Dask-CUDA).
 """
     
     def get_supported_algorithms(self) -> List[str]:
-        """Windows環境でサポートされているアルゴリズム"""
+        """Algorithms supported on Windows."""
         return list(DEFAULT_ALGORITHMS.keys())
     
     def _add_platform_specific_args(self, parser: argparse.ArgumentParser):
-        """Windows固有の引数を追加"""
-        # タイル処理関連
+        """Add Windows-specific arguments."""
+        # Tile-processing options
         parser.add_argument(
             "--tile-size",
             type=int,
-            help="タイルサイズ（未指定時は自動検出）"
+            help="Tile size (auto-detected when omitted)"
         )
         
         parser.add_argument(
             "--padding",
             type=int,
-            help="タイル境界のパディング（未指定時は自動計算）"
+            help="Tile-boundary padding (auto-computed when omitted)"
         )
         
         parser.add_argument(
             "--max-workers",
             type=int,
-            help="並列処理数（未指定時は自動検出）"
+            help="Number of parallel workers (auto-detected when omitted)"
         )
         
         parser.add_argument(
             "--nodata-threshold",
             type=float,
             default=1.0,
-            help="NoDataスキップ閾値 (default: 1.0)"
+            help="NoData skip threshold (default: 1.0)"
         )
 
         parser.add_argument(
             "--nodata",
             type=str,
             default=None,
-            help="NoData値を明示指定 (例: 0, -9999, nan)"
+            help="Explicit NoData value (e.g. 0, -9999, nan)"
+        )
+
+        parser.add_argument(
+            "--output-dtype",
+            choices=["float32", "int16", "uint8"],
+            default="float32",
+            help="Output data type. int16/uint8 quantize for visualization (NoData=0) and shrink the COG (default: float32)"
+        )
+
+        parser.add_argument(
+            "--output-range",
+            type=str,
+            default=None,
+            help="Explicit quantization range 'lo,hi' (e.g. 0,90); defaults to the algorithm's native range"
         )
         
-        # GPU関連
+        # GPU options
         parser.add_argument(
             "--gpu-type",
             choices=["rtx4070", "t4", "l4", "a100", "auto"],
             default="auto",
-            help="GPU種別指定 (default: auto)"
+            help="GPU type (default: auto)"
         )
         
-        # モード関連
+        # Mode options
         parser.add_argument(
             "--single-scale",
             action="store_true",
-            help="シングルスケールモードを強制"
+            help="Force single-scale mode"
         )
         
         parser.add_argument(
             "--no-auto-scale",
             action="store_true",
-            help="自動スケール分析を無効化"
+            help="Disable automatic scale analysis"
         )
 
         parser.add_argument(
             "--mode",
             choices=["local", "spatial"],
             default="local",
-            help="計算モード: local(近傍) / spatial(半径積算). spatialで半径未指定時はYAMLプリセットを使用"
+            help="Compute mode: local (neighborhood) / spatial (radius integration). With spatial and no radii, YAML presets are used"
         )
 
         parser.add_argument(
             "--radii",
             type=str,
-            help="Spatial半径(px)を明示指定 (例: 4,16,64)。未指定時はpixel sizeに応じてYAML自動選択"
+            help="Explicit spatial radii (px), e.g. 4,16,64; when omitted, YAML is auto-selected by pixel size"
         )
 
         parser.add_argument(
             "--weights",
             type=str,
-            help="Spatial重み (例: 0.5,0.3,0.2)。未指定時はYAML重み/等重みを自動適用"
+            help="Spatial weights (e.g. 0.5,0.3,0.2); when omitted, YAML/equal weights are applied"
         )
 
-        # アルゴリズム固有パラメータの追加
+        # Add algorithm-specific parameters
         parser.add_argument(
             "--azimuth",
             type=float,
             default=315.0,
-            help="太陽の方位角 (度, default: 315, Hillshadeで使用)"
+            help="Sun azimuth (degrees, default: 315, used by Hillshade)"
         )
         
         parser.add_argument(
             "--altitude",
             type=float,
             default=45.0,
-            help="太陽の高度角 (度, default: 45, Hillshadeで使用)"
+            help="Sun altitude (degrees, default: 45, used by Hillshade)"
         )
 
         parser.add_argument(
@@ -142,78 +156,78 @@ class WindowsCLI(BaseCLI):
             "--color-mode",
             choices=["warm", "cool", "grayscale"],
             default="warm",
-            help="カラーモード (default: warm, Hillshadeで使用)"
+            help="Color mode (default: warm, used by Hillshade)"
         )
         
         parser.add_argument(
             "--cog-only",
             action="store_true",
-            help="既存タイルからCOG生成のみ実行"
+            help="Only generate a COG from existing tiles"
         )
         parser.add_argument(
             "--cog-backend",
             choices=["internal", "external", "auto"],
             default="internal",
-            help="COG生成バックエンド (default: internal)"
+            help="COG generation backend (default: internal)"
         )
         parser.add_argument(
             "--gdal-bin-dir",
             type=str,
             default=None,
-            help="外部GDALのbinディレクトリ (例: C:\\Program Files\\GDAL)"
+            help="External GDAL bin directory (e.g. C:\\Program Files\\GDAL)"
         )
 
         # Experimental algorithms
         parser.add_argument(
             "--surprise-scales",
             type=str,
-            help="Scale-Space Surprise のスケール。カンマ区切り (例: 1,2,4,8,16)"
+            help="Scale-Space Surprise scales, comma-separated (e.g. 1,2,4,8,16)"
         )
         parser.add_argument(
             "--surprise-enhancement",
             type=float,
             default=2.0,
-            help="Scale-Space Surprise の強調係数 (default: 2.0)"
+            help="Scale-Space Surprise enhancement factor (default: 2.0)"
         )
         parser.add_argument(
             "--ml-azimuths",
             type=str,
-            help="Multi-lightの方位角。カンマ区切り (例: 315,45,135,225)"
+            help="Multi-light azimuths, comma-separated (e.g. 315,45,135,225)"
         )
         parser.add_argument(
             "--uncertainty-weight",
             type=float,
             default=0.7,
-            help="Multi-light uncertainty の重み (default: 0.7)"
+            help="Multi-light uncertainty weight (default: 0.7)"
         )
     
     def _validate_platform_args(self, args: argparse.Namespace):
-        """Windows固有の引数検証"""
-        # COG生成のみモードの場合の特別処理
+        """Validate Windows-specific arguments."""
+        # Special handling for COG-only mode
         if hasattr(args, 'cog_only') and args.cog_only:
             if not os.path.exists(args.tmp_dir):
-                self.parser.error(f"--cog-only モードではタイルディレクトリが必要です: {args.tmp_dir}")
-            # 入力ファイルチェックをスキップするためのフラグ
+                self.parser.error(f"--cog-only mode requires a tile directory: {args.tmp_dir}")
+            # Flag to skip the input-file check
             args._skip_input_check = True
         
-        # アルゴリズム固有の検証
+        # Algorithm-specific validation
         if args.algorithm == "rvi" and not hasattr(args, 'no_auto_scale'):
-            self.logger.info("radii未指定時は地形解析による自動スケール決定を行います")
+            self.logger.info("When radii are omitted, scales are auto-determined via terrain analysis")
         if args.cog_backend == "external" and not args.gdal_bin_dir:
             self.logger.warning(
-                "--cog-backend external では --gdal-bin-dir の明示指定を推奨します"
+                "With --cog-backend external, explicitly specifying --gdal-bin-dir is recommended"
             )
     
     def execute(self, args: argparse.Namespace):
-        """タイルベース処理を実行"""
-        # 設定の確認
+        """Run tile-based processing."""
+        # Check configuration
         from ..config.system_config import check_gdal_environment
         check_gdal_environment()
         
-        # パラメータの準備
+        # Prepare parameters
         params = self.get_common_params(args)
         
-        # Windows固有パラメータの追加
+        # Add Windows-specific parameters
         params.update({
             'tile_size': args.tile_size,
             'padding': args.padding,
@@ -227,23 +241,23 @@ class WindowsCLI(BaseCLI):
             'gdal_bin_dir': args.gdal_bin_dir,
         })
         
-        # ログ出力
+        # Log output
         if args.cog_only:
-            self.logger.info("=== COG生成のみモード ===")
-            self.logger.info(f"タイルディレクトリ: {args.tmp_dir}")
-            self.logger.info(f"出力: {args.output}")
+            self.logger.info("=== COG-only mode ===")
+            self.logger.info(f"Tile directory: {args.tmp_dir}")
+            self.logger.info(f"Output: {args.output}")
         else:
-            self.logger.info(f"入力: {args.input}")
-            self.logger.info(f"出力: {args.output}")
-            self.logger.info(f"アルゴリズム: {args.algorithm}")
-            self.logger.info(f"モード: {'マルチスケール' if params['multiscale_mode'] else 'シングルスケール'}")
-            self.logger.info(f"空間モード: {args.mode}")
+            self.logger.info(f"Input: {args.input}")
+            self.logger.info(f"Output: {args.output}")
+            self.logger.info(f"Algorithm: {args.algorithm}")
+            self.logger.info(f"Mode: {'multiscale' if params['multiscale_mode'] else 'single-scale'}")
+            self.logger.info(f"Spatial mode: {args.mode}")
         
-        # 処理の実行
+        # Run processing
         try:
             from ..core.tile_processor import process_dem_tiles
             
-            # COG生成のみモードの場合、入力パスを調整
+            # In COG-only mode, adjust the input path
             if args.cog_only:
                 params['input_path'] = params['input_path'] if os.path.exists(params['input_path']) else "dummy_input.tif"
 
@@ -260,7 +274,7 @@ class WindowsCLI(BaseCLI):
                 except ValueError:
                     self.parser.error("Invalid --weights format. Use comma-separated numbers: 0.5,0.3,0.2")
             
-            # アルゴリズム固有パラメータの準備
+            # Prepare algorithm-specific parameters
             algo_params = {}
             if args.algorithm == "hillshade":
                 algo_params.update({
@@ -289,13 +303,15 @@ class WindowsCLI(BaseCLI):
                 input_cog_path=params['input_path'],
                 output_cog_path=params['output_path'],
                 tmp_tile_dir=params['tmp_dir'],
-                algorithm=params['algorithm'],  # アルゴリズムを追加
+                algorithm=params['algorithm'],  # add the algorithm
                 tile_size=params['tile_size'],
                 padding=params['padding'],
                 sigma=10.0,
                 max_workers=params['max_workers'],
                 nodata_threshold=params['nodata_threshold'],
                 nodata_override=self._parse_nodata_override(args.nodata),
+                output_dtype=getattr(args, 'output_dtype', 'float32'),
+                output_range=self._parse_output_range(getattr(args, 'output_range', None)),
                 gpu_type=params['gpu_type'],
                 multiscale_mode=params['multiscale_mode'],
                 pixel_size=params['pixel_size'],
@@ -303,13 +319,13 @@ class WindowsCLI(BaseCLI):
                 cog_only=params['cog_only'],
                 cog_backend=params['cog_backend'],
                 gdal_bin_dir=params['gdal_bin_dir'],
-                **algo_params  # アルゴリズム固有パラメータを展開
+                **algo_params  # expand algorithm-specific parameters
             )
             
-            self.logger.info("✓ 処理完了")
+            self.logger.info("Done")
             
         except Exception as e:
-            self.logger.error(f"✗ エラー: {e}")
+            self.logger.error(f"Error: {e}")
             raise
 
     @staticmethod
@@ -323,3 +339,19 @@ class WindowsCLI(BaseCLI):
             return float(raw_value)
         except ValueError as exc:
             raise ValueError(f"Invalid --nodata value: {raw_value}") from exc
+
+    @staticmethod
+    def _parse_output_range(raw_value):
+        """Parse --output-range 'lo,hi' into a (lo, hi) tuple (or None)."""
+        if raw_value is None:
+            return None
+        try:
+            lo_s, hi_s = str(raw_value).split(",")
+            lo, hi = float(lo_s), float(hi_s)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Invalid --output-range {raw_value!r}; expected 'lo,hi' (e.g. 0,90)."
+            ) from exc
+        if not (hi > lo):
+            raise ValueError(f"--output-range requires hi > lo, got {raw_value!r}.")
+        return (lo, hi)

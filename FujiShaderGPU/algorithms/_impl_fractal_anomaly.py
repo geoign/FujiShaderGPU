@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_fractal_anomaly.py
 
-Fractal Anomaly (フラクタル異常検出) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 2)。
+Fractal Anomaly algorithm implementation.
+Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 from typing import List, Tuple
@@ -140,7 +140,7 @@ def fractal_stat_func(data):
 
 
 class FractalAnomalyAlgorithm(DaskAlgorithm):
-    """フラクタル異常検出アルゴリズム"""
+    """Fractal anomaly detection algorithm."""
     def process(self, gpu_arr, **params):
         radii = params.get('radii', None)
         ps = params.get('pixel_size', 1.0)
@@ -190,7 +190,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am, detail_boost=db)
 
     def _determine_optimal_radii(self, pixel_size):
-        """解像度に基づいて最適な半径を決定"""
+        """Determine optimal radii based on resolution."""
         rc = classify_resolution(pixel_size)
         if rc == 'ultra_high':
             base = [4, 8, 16, 32, 64, 96]

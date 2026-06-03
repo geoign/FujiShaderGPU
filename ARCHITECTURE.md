@@ -1,6 +1,7 @@
 # FujiShaderGPU Architecture
 
 ## 1. Purpose
+
 FujiShaderGPU is a Python/CUDA terrain-visualization pipeline for very large DEM rasters.
 
 - Linux path: Dask-CUDA distributed processing for large-scale workloads.
@@ -8,12 +9,15 @@ FujiShaderGPU is a Python/CUDA terrain-visualization pipeline for very large DEM
 - Output targets: Cloud Optimized GeoTIFF (COG) and Zarr.
 
 ## 2. End-to-End Flow
+
 ```text
-(optional) Any raster --prepare--> overview-bearing COG (+ NoData fill)
+(optional) Any raster --prepare--> overview-bearing COG (+ NoData fill / detection)
 Input DEM (COG with overviews, or Zarr)
   -> CLI (platform-specific)
   -> Core orchestration (Dask or Tile)
-  -> Algorithm layer (modular per-algorithm files)
+  -> NoData -> NaN (declared + optional --nodata override)
+  -> Algorithm layer (modular per-algorithm files; float32, NaN-aware)
+  -> Output encoding (float32 | int16 | uint8 quantization)
   -> Output writer (COG or Zarr)
   -> Validation / logs
 ```
@@ -27,24 +31,22 @@ slow full-resolution reads).
 ## 3. Code Topology
 
 ### 3.1 Algorithm Layer
+
 `FujiShaderGPU/algorithms/`
 
 - `dask_registry.py`
   - Canonical Dask algorithm registry (`ALGORITHMS`).
   - Used by `core/dask_processor.py`.
-
 - `dask_shared.py`
-  - **再エクスポートハブ** (177行)。後方互換性のため全公開シンボルを再エクスポートする。
-  - 実装は以下のモジュールに分離済み (Phase 1–3 リファクタリング完了)。
+  - **Re-export hub**. Re-exports all public symbols for backward compatibility.
+  - Implementations are split into the modules below (Phase 1–3 refactor complete).
   - Used by both Dask (`dask/*.py`) and Tile (`tile/*.py` via bridge) backends.
-
-- **Phase 1 共通基盤モジュール**:
+- **Phase 1 shared-foundation modules**:
   - `_base.py` — `Constants`, `DaskAlgorithm` ABC, `classify_resolution`, `get_gradient_scale_factor`
-  - `_nan_utils.py` — NaN処理、空間スムージング、ダウンサンプリング/アップサンプリング、`restore_nan`
+  - `_nan_utils.py` — NaN handling, spatial smoothing, down/up-sampling, `restore_nan`
   - `_global_stats.py` — `determine_optimal_downsample_factor`, `compute_global_stats`, `apply_global_normalization`
-  - `_normalization.py` — アルゴリズム別統計/正規化関数 (`rvi_stat_func`, `npr_stat_func` 等)
-
-- **Phase 2–3 アルゴリズム実装モジュール** (`_impl_*.py`):
+  - `_normalization.py` — per-algorithm stats/normalization functions (`rvi_stat_func`, `npr_stat_func`, etc.)
+- **Phase 2–3 algorithm implementation modules** (`_impl_*.py`):
   - `_impl_rvi.py` — RVI (Ridge-Valley Index)
   - `_impl_hillshade.py` — Hillshade
   - `_impl_slope.py` — Slope
@@ -59,24 +61,19 @@ slow full-resolution reads).
   - `_impl_openness.py` — Openness
   - `_impl_fractal_anomaly.py` — Fractal Anomaly
   - `_impl_experimental.py` — Scale-Space Surprise + Multi-Light Uncertainty
-
 - `tile_shared.py`
   - Tile-side base class (`TileAlgorithm`) and lightweight algorithms that delegate directly to shared kernels.
   - Contains only: `TileAlgorithm`, `ScaleSpaceSurpriseAlgorithm`, `MultiLightUncertaintyAlgorithm`.
   - Most tile algorithms import their implementation from `dask_shared.py` via `tile/dask_bridge.py`.
-
 - `common/kernels.py`
   - Shared CuPy kernels used by both Dask and Tile.
-
 - `common/auto_params.py`
   - Shared auto-parameter helpers (e.g., radii derivation).
-
 - `common/spatial_mode.py`
   - Shared local/spatial execution helpers:
     - spatial radii/weights auto-derivation from YAML presets
     - NaN-aware radius smoothing
     - multi-radius weighted aggregation
-
 - `config/spatial_presets.yaml`
   - Spatial auto presets keyed by pixel-size bins (meters).
   - Current bins:
@@ -88,58 +85,55 @@ slow full-resolution reads).
     - `1250~5000`
     - `>5000`
   - Each bin defines default `radii` and `weights` used when user does not pass `--radii/--weights`.
-
 - `dask/*.py`
   - One file per Dask algorithm module.
-
 - `tile/*.py`
   - One file per Tile algorithm module.
   - Includes `tile/dask_bridge.py` adapters so canonical Dask algorithm names are callable on tile backend too.
 
 ### 3.2 Core Layer
+
 `FujiShaderGPU/core/`
 
 - `dask_processor.py`
   - Dask orchestration layer.
   - Coordinates algorithm execution, parameter flow, and output mode.
-
 - `dask_cluster.py`
   - Dask-CUDA cluster lifecycle and chunk-size strategy.
-
 - `dask_io.py`
   - Dask-side COG/Zarr load and Zarr write helpers.
-
 - `tile_processor.py`
   - Tile orchestration layer.
   - Schedules per-tile work and final build flow.
-
 - `tile_io.py`
   - Tile raster read/write primitives.
-
 - `tile_compute.py`
   - Per-tile algorithm invocation and shared compute helpers.
-
 - `gpu_memory.py`
   - GPU memory pool/context lifecycle helper.
 
 ### 3.3 CLI Layer
+
 `FujiShaderGPU/cli/`
 
 - `base.py`
   - Shared CLI scaffold.
-
 - `linux_cli.py`
   - Linux-specific CLI.
   - Supported algorithms are sourced from `algorithms/dask_registry.py`.
-
 - `windows_cli.py`
   - Windows/macOS-specific CLI.
   - Supported algorithms are sourced from `core/tile_processor.py::DEFAULT_ALGORITHMS`.
 
 ### 3.4 IO / Config / Utils
+
 - `io/cog_builder.py`, `io/cog_validator.py`, `io/raster_info.py`
 - `io/dem_preprocess.py` — preprocessing core: any GDAL raster -> overview-bearing
-  COG (float32, ZSTD) with optional overview-based NoData fill (see §13)
+  COG (float32, ZSTD) with optional overview-based NoData fill + undeclared-NoData
+  detection / override (see §13)
+- `io/output_encoding.py` — output dtype encoding: per-algorithm value ranges,
+  float32→int16/uint8 quantization (signed/unsigned), NoData policy, GDAL
+  scale/offset (see §14). Shared by both backends.
 - `prepare.py` — preprocessing CLI (`python -m FujiShaderGPU.prepare`)
 - `config/auto_tune.py` — VRAM-based dynamic performance parameter computation (single source of truth)
 - `config/gpu_config_manager.py`, `config/system_config.py`, `config/gdal_config.py`
@@ -147,6 +141,7 @@ slow full-resolution reads).
 - `utils/scale_analysis.py`, `utils/nodata_handler.py`, `utils/types.py`
 
 ## 4. Dask Algorithm Catalog
+
 Registered in `algorithms/dask_registry.py` (and `dask_shared.py` ALGORITHMS):
 
 - `rvi`
@@ -170,13 +165,16 @@ These names are also the canonical CLI names for the tile backend.
 ## 5. Zarr Support
 
 ### 5.1 Input
+
 In Dask path, `.zarr` input is detected and loaded through `xarray.open_zarr(...)`.
 
 ### 5.2 Output
+
 If output path ends with `.zarr`, result is written with `xarray.Dataset.to_zarr(...)`.
 Otherwise output is written through COG flow.
 
 ### 5.3 Runtime Dependency Boundary
+
 `pyproject.toml` is split by runtime mode:
 
 - base dependencies: common minimum
@@ -186,11 +184,13 @@ Otherwise output is written through COG flow.
 ## 6. Platform Behavior
 
 ### Linux
+
 - Uses `core/dask_processor.py` + `dask_cluster.py` + `dask_io.py`.
 - Uses `algorithms/dask_registry.py`.
 - Optimized for very large distributed workloads.
 
 ### Windows/macOS
+
 - Uses `core/tile_processor.py` + `tile_io.py` + `tile_compute.py`.
 - Uses `algorithms/tile/*.py`.
 - Canonical algorithm names are synchronized with Dask registry names.
@@ -198,6 +198,7 @@ Otherwise output is written through COG flow.
 - Optimized for local tile-based processing.
 
 ## 7. Design Principles
+
 - No monolithic public entrypoint for algorithms (registry + per-module imports).
 - Per-algorithm modular files.
 - Shared kernels for duplicate math removal.
@@ -225,39 +226,36 @@ Otherwise output is written through COG flow.
   - See §12 for details
 
 ## 8. Tests
+
 `tests/` includes baseline regression coverage for the refactored architecture:
 
 - `test_registry_cli_sync.py`
   - Registry and CLI supported-algorithm synchronization.
-
 - `test_algorithm_smoke.py`
   - Dask/Tile smoke execution on small arrays.
-
 - `test_zarr_io.py`
   - Zarr detection and minimal roundtrip behavior.
-
 - `test_fractal_anomaly_normalization.py`
   - Fractal anomaly output range and normalization.
-
 - `test_local_spatial_modes.py`
   - Local/spatial mode switching and radii derivation.
-
 - `test_nodata_handler.py`
   - NoData virtual-fill preprocessing.
-
 - `test_output_nodata_policy.py`
   - Output nodata masking behavior.
-
+- `test_dem_preprocess.py`
+  - `prepare` preprocessing: NoData fill modes and undeclared-NoData detection/override.
+- `test_cog_overviews.py`
+  - COG overview pyramid presence/structure.
 - `test_rvi_normalization.py`
   - RVI output normalization stability.
-
 - `test_visual_saliency_normalization.py`
   - Visual saliency normalization.
-
 - `test_visual_saliency_tile_stability.py`
   - Visual saliency tile boundary consistency.
 
 ## 9. Operational Checks
+
 Recommended checks:
 
 ```bash
@@ -269,6 +267,7 @@ pytest -q -o addopts='' tests
 ```
 
 ## 10. Developer Navigation Order
+
 1. `FujiShaderGPU/__main__.py`
 2. `FujiShaderGPU/cli/base.py`
 3. `FujiShaderGPU/cli/linux_cli.py` or `FujiShaderGPU/cli/windows_cli.py`
@@ -279,18 +278,21 @@ pytest -q -o addopts='' tests
 8. `FujiShaderGPU/algorithms/common/kernels.py` and `FujiShaderGPU/algorithms/common/auto_params.py`
 
 ## 11. Notes
+
 - Current structure treats modular algorithm files as canonical.
-- Algorithm implementations live in individual `_impl_*.py` modules; `dask_shared.py` is a 177-line re-export hub for backward compatibility.
+- Algorithm implementations live in individual `_impl_*.py` modules; `dask_shared.py` is a thin re-export hub for backward compatibility.
 - `hillshade`, `slope`, `specular`, `atmospheric_scattering`, `curvature`, `ambient_occlusion`, `openness`, `multi_light_uncertainty` support unified local/spatial mode on both Dask and tile paths.
 
 ## 12. Dynamic GPU Optimization
 
 ### 12.1 Overview
+
 `config/auto_tune.py` dynamically computes all GPU performance parameters from the detected VRAM size.
 This replaces the previous approach of static per-GPU presets with a continuous function that works
 for any GPU, including hardware not in the preset list.
 
 ### 12.2 Anchor-Point Interpolation
+
 Calibration anchors (derived from validated presets for known GPUs) are defined as paired arrays:
 
 | VRAM (GB) | chunk_size | rmm_pool_gb | rmm_fraction |
@@ -307,6 +309,7 @@ Calibration anchors (derived from validated presets for known GPUs) are defined 
 - Values outside anchor range are linearly extrapolated from the nearest segment.
 
 ### 12.3 Algorithm Complexity Scaling
+
 `ALGORITHM_COMPLEXITY` in `auto_tune.py` is the single source of truth for per-algorithm cost factors:
 
 ```python
@@ -339,6 +342,7 @@ ALGORITHM_COMPLEXITY = {
 | `prefetch_tiles` | 4 / 3 / 2 by VRAM tier | tile_processor |
 
 ### 12.5 Worker Throttling
+
 Worker count is bounded by three independent constraints:
 
 1. **CPU count**: `min(6, cpu_count)` upper bound.
@@ -361,7 +365,9 @@ auto_tune()
 ```
 
 ### 12.7 Environment Variable Overrides
+
 Users can still override computed values via environment variables:
+
 - `FUJISHADER_CHUNK_SIZE` — override chunk_size
 - `FUJISHADER_RMM_POOL_GB` — override RMM pool size
 
@@ -391,7 +397,28 @@ python -m FujiShaderGPU.prepare input.tif out.tif --fill-mode all --force
 - NoData policy: `none`/`enclosed` emit NaN-nodata; `all` emits a dense raster
   with no NoData.
 
-### 13.3 NoData Fill Modes (`--fill-mode`)
+### 13.3 NoData detection / override (`--nodata`, `--no-detect-nodata`)
+
+Before filling, every NoData cell is normalized to float **NaN** so finite
+sentinels are handled identically to declared NoData. Sources of NoData:
+
+1. **Declared** NoData (`src.nodata`) — always honored via masked I/O.
+2. **Explicit override** `--nodata VALUE` (`-9999`, `0`, `nan`, …) — treated as
+   NoData even when the raster declares none or a different value.
+3. **Auto-detected undeclared NoData (default ON)** — `io/dem_preprocess.py::
+   _detect_border_nodata` scans a NEAREST-resampled coarse grid: when a single
+   finite value dominates the outer ring (≥ `--nodata-border-fraction`, default
+   `0.5`) and covers a non-trivial share of the grid, it is treated as a lost
+   NoData frame (sea / dataset exterior whose tag was dropped in conversion).
+   Disable with `--no-detect-nodata`. Already-declared values are not re-reported.
+
+Rationale: an undeclared constant frame, if left as data, is read as a flat
+plateau adjacent to real terrain; large-radius / multiscale operators then render
+a halo along the data edge. Converting it to NaN lets the NaN-aware kernels exclude
+it. The main pipeline mirrors source (2) via its own `--nodata` (both backends),
+applied at load time before any algorithm runs.
+
+### 13.4 NoData Fill Modes (`--fill-mode`)
 
 - `none` — no filling; NoData preserved.
 - `enclosed` *(default)* — fill only interior voids (NoData **not** connected to
@@ -400,7 +427,7 @@ python -m FujiShaderGPU.prepare input.tif out.tif --fill-mode all --force
   Useful when NaN/NoData is not allowed (e.g. 3D model generation); large
   exterior fills are a coarse extrapolation.
 
-### 13.4 Method (overview-based, low-frequency fill)
+### 13.5 Method (overview-based, low-frequency fill)
 
 Hole filling is inherently low-frequency, so the expensive work runs on a small
 coarse grid and is upsampled — cost is nearly independent of full raster size:
@@ -415,7 +442,7 @@ coarse grid and is upsampled — cost is nearly independent of full raster size:
 Implementation streams windowed reads/writes (bounded memory) so very large
 rasters (hundreds of GB) are handled without loading the full array.
 
-### 13.5 Large-radius-from-overview (RVI)
+### 13.6 Large-radius-from-overview (RVI)
 
 Because the input is an overview-bearing COG, large-radius low-frequency terms
 can be taken from the stored overview instead of reading a huge per-chunk/per-tile
@@ -449,7 +476,7 @@ at `Constants.MAX_DEPTH` (150 px), and `fractal_anomaly` / `scale_space_surprise
 / `visual_saliency` / `npr_edges` use small scales (no large halo) and combine
 scales non-linearly (not linearly decomposable).
 
-### 13.6 Pipeline Input Assumption
+### 13.7 Pipeline Input Assumption
 
 The main pipeline assumes an overview-bearing COG.  Both backends warn (not fail)
 when overviews are missing and point to this command.  NoData fill management is
@@ -458,3 +485,57 @@ hole-fill has been removed from both the Dask and tile pipelines (along with the
 `--no-fill-dem-holes` / `--hole-fill-max-components` CLI options).  The pipelines
 still *mask* NoData and use NaN-aware filters, but they no longer interpolate
 voids — run `prepare` (mode `enclosed` or `all`) first if voids must be filled.
+
+### 13.8 NaN-aware coarse resampling (boundary halo prevention)
+
+The large-radius coarse paths (`_nan_utils._downsample_nan_aware` /
+`_upsample_to_shape`) are **NaN-aware at the data boundary**: the broad exterior
+NoData is preserved as NaN (only thin, well-enclosed interior voids are smoothed),
+and upsampling interpolates valid contributors only.  This prevents the exterior
+from being filled with a finite plateau (≈ global mean elevation) that would leak
+into interior valid pixels and render a halo just inside the data edge — the same
+class of artifact that §13.3's NoData detection prevents at the source.
+
+## 14. Output Data Type Encoding (`io/output_encoding.py`)
+
+### 14.1 Purpose
+
+Algorithms always compute in **float32** (NaN = NoData) on the GPU.  As a final,
+optional step the result can be quantized to a compact integer COG for delivery:
+smaller files → faster COG builds (less disk I/O), cheaper object-storage transfer,
+lighter QGIS reads.  `--output-dtype {float32,int16,uint8}` (default `float32`)
+selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
+
+### 14.2 Encoding rules
+
+- **NoData = 0** for both integer types (NaN → 0).
+- Each algorithm has a known native value range (`OUTPUT_VALUE_RANGES`), e.g.
+  slope `0..90`, AO/hillshade `0..1`, RVI/LRM/fractal `-1.5..1.5`,
+  visual_saliency/multiscale_terrain/scale_space_surprise `0..1.5`, npr_edges
+  `0.2..1.0`.  `--output-range lo,hi` overrides; unbounded cases (e.g. slope in
+  `percent`) fall back to a robust `[p1, p99]` estimate from a strided sample.
+- **Unsigned** range → data fills `[1, MAXPOS]` (255 / 32767).
+- **Signed** range (lo < 0 < hi) is encoded symmetrically about 0:
+  - `int16`: full `[-MAXPOS, +MAXPOS]`; `DN = 0` (value ≈ 0, i.e. flat ground)
+    doubles as NoData — visually negligible.
+  - `uint8`: value 0 centered at `128`, data in `[1, 255]`.
+- GDAL `scale`/`offset` are recorded (`value = scale·DN + offset`) for physical
+  recovery; `DN = 0` is NoData (undefined value).
+
+### 14.3 Backend integration
+
+Mapping parameters come from `output_encoding.quantize_params`; both backends use
+the same registry so int outputs are consistent.
+
+- **Dask** (`dask_processor.run_pipeline`): a CuPy `map_blocks` quantize step is
+  inserted between the result and the host transfer (`_quantize_block_cp`); the
+  writers set NoData by dtype (`output_nodata_for_dtype`: NaN for float, 0 for int).
+- **Tile** (`tile_processor`): `quantize_array` (NumPy) runs per tile after
+  `_format_algorithm_output`; tile profiles and the VRT/COG assembler inherit the
+  integer dtype + NoData=0 from the tiles (data-driven, no extra plumbing).
+- After the COG is built, `apply_scale_offset` records the band scale/offset
+  (best-effort; non-critical).  Float-only display hints (e.g. RVI ±1) are skipped
+  for integer outputs.
+
+Quantization is skipped (writes float32) when the algorithm changes the result
+shape (e.g. `agg=stack`) or when no range can be resolved.

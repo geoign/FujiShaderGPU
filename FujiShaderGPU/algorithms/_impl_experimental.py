@@ -1,10 +1,10 @@
 """
 FujiShaderGPU/algorithms/_impl_experimental.py
 
-実験的アルゴリズム実装：
+Experimental algorithm implementations:
   - Scale-Space Surprise
   - Multi-Light Uncertainty
-dask_shared.py からの分離モジュール (Phase 3)。
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 from typing import List
@@ -30,7 +30,7 @@ from .common.kernels import (
 
 def compute_scale_space_surprise_block(block, *, scales, enhancement=2.0,
                                       normalize=True, norm_min=None, norm_scale=None):
-    """Scale-Space Surprise Map: スケール間での特徴変化量を強調"""
+    """Scale-Space Surprise Map: emphasize the amount of feature change across scales."""
     nan_mask = cp.isnan(block)
     surprise = kernel_scale_space_surprise(
         block, scales=scales, enhancement=enhancement,

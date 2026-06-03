@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_openness.py
 
-Openness (開度) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 2)。
+Openness algorithm implementation.
+Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import cupy as cp
@@ -25,7 +25,7 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                               pixel_size: float = 1.0,
                               pixel_scale_x: float = None,
                               pixel_scale_y: float = None) -> cp.ndarray:
-    """開度の計算（最適化版）"""
+    """Openness computation (optimized)."""
     h, w = block.shape
     nan_mask = cp.isnan(block)
 
@@ -126,7 +126,7 @@ def compute_openness_spatial_block(
 
 
 class OpennessAlgorithm(DaskAlgorithm):
-    """開度アルゴリズム（簡易ベクトル化版）"""
+    """Openness algorithm (simplified vectorized version)."""
 
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         max_distance = params.get('max_distance', 50)

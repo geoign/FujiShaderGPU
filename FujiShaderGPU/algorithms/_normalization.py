@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_normalization.py
 
-各アルゴリズム用の統計・正規化関数群。
-dask_shared.py からの分離モジュール (Phase 1)。
+Per-algorithm statistics and normalization functions.
+Module split out from dask_shared.py (Phase 1).
 """
 from __future__ import annotations
 from typing import Tuple
@@ -12,7 +12,7 @@ NORMAL_PERCENTILE = 80.0
 OVERFLOW_LIMIT = 1.5
 
 
-# --- RVI用 ---
+# --- RVI ---
 
 def rvi_stat_func(data: cp.ndarray) -> Tuple[float]:
     """RVI normalization scale from robust absolute percentile."""
@@ -28,7 +28,7 @@ def rvi_stat_func(data: cp.ndarray) -> Tuple[float]:
 
 
 def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
-    """RVI用の正規化"""
+    """Normalization for RVI."""
     scale_global = stats[0]
     if scale_global > 0:
         normalized = block / scale_global
@@ -36,11 +36,11 @@ def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     return cp.zeros_like(block)
 
 
-# --- NPREdges用 ---
+# --- NPR Edges ---
 
 def npr_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """NPRエッジ用の統計量計算（勾配のパーセンタイル）"""
-    # 簡易的に勾配を計算
+    """Statistics for NPR edges (gradient percentile)."""
+    # Compute the gradient simply
     dy, dx = cp.gradient(data)
     gradient_mag = cp.sqrt(dx**2 + dy**2)
     valid_grad = gradient_mag[~cp.isnan(gradient_mag)]
@@ -51,7 +51,7 @@ def npr_stat_func(data: cp.ndarray) -> Tuple[float, float]:
     return (0.1, 0.3)
 
 
-# --- LRM用 ---
+# --- LRM ---
 
 def lrm_stat_func(data: cp.ndarray) -> Tuple[float]:
     """Return robust signed scale: p80(abs(value)) maps to +/-1."""
@@ -65,10 +65,10 @@ def lrm_stat_func(data: cp.ndarray) -> Tuple[float]:
     return (1.0,)
 
 
-# --- TPI/LRM共通 ---
+# --- TPI/LRM shared ---
 
 def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
-    """TPI/LRM用の正規化"""
+    """Normalization for TPI/LRM."""
     max_abs = stats[0]
     if max_abs > 0:
         return cp.clip(block / max_abs, -OVERFLOW_LIMIT, OVERFLOW_LIMIT)

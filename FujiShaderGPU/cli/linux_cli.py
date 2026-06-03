@@ -1,6 +1,6 @@
 ﻿"""
 FujiShaderGPU/cli/linux_cli.py
-Linux環境用CLI - Dask-CUDA処理の実装
+CLI for Linux - Dask-CUDA processing implementation.
 """
 from typing import List, Optional
 import argparse
@@ -13,405 +13,419 @@ from .base import BaseCLI
 from ..algorithms.dask_registry import ALGORITHMS as DASK_ALGORITHMS
 
 class LinuxCLI(BaseCLI):
-    """Linux環境向けCLI実装（Dask-CUDA処理）"""
+    """CLI implementation for Linux (Dask-CUDA processing)."""
     
     def get_description(self) -> str:
-        return """富士シェーダーGPU - 超高速地形解析ツール (Linux/Dask-CUDA処理)
+        return """FujiShaderGPU - ultra-fast terrain analysis tool (Linux/Dask-CUDA)
         
-巨大DEM (200,000×200,000px COG) から各種地形解析を実行し、
-Cloud-Optimized GeoTIFF として書き出します。"""
+Runs various terrain analyses on huge DEMs (200,000x200,000px COG) and
+writes them out as Cloud-Optimized GeoTIFF."""
     
     def get_epilog(self) -> str:
         algos = ", ".join(self.get_supported_algorithms())
         return f"""
-    使用例:
-    # RVI: 地形を解析して半径を自動決定（推奨・高速）
+    Examples:
+    # RVI: analyze terrain and auto-determine radii (recommended, fast)
     fujishadergpu input.tif output.tif
     
-    # RVI: 手動で半径を指定（新方式・高速）
+    # RVI: specify radii manually (new method, fast)
     fujishadergpu input.tif output.tif --radii 4,16,64,256
     
-    # その他のアルゴリズム
+    # Other algorithms
     fujishadergpu input.tif output.tif --algo hillshade
     
-    # 大きなチャンクサイズを指定
+    # Specify a large chunk size
     fujishadergpu input.tif output.tif --algo rvi --chunk 4096
 
-    利用可能な全アルゴリズム:
+    All available algorithms:
     {algos}
     """
     
     def get_supported_algorithms(self) -> List[str]:
-        """Linux環境でサポートされているアルゴリズム（全て）"""
+        """Algorithms supported on Linux (all of them)."""
         return list(DASK_ALGORITHMS.keys())
     
     def _add_platform_specific_args(self, parser: argparse.ArgumentParser):
-        """Linux固有の引数を追加"""
-        # Dask処理関連
+        """Add Linux-specific arguments."""
+        # Dask processing options
         parser.add_argument(
             "--chunk",
             type=int,
-            help="チャンク幅 (px)。未指定時は自動決定"
+            help="Chunk width (px); auto-determined when omitted"
         )
         
         parser.add_argument(
             "--memory-fraction",
             type=float,
-            default=0.4,  # より保守的なデフォルト値に変更
-            help="GPU メモリ使用率 (default: 0.4)"  # ヘルプテキストも更新
+            default=0.4,  # changed to a more conservative default
+            help="GPU memory fraction (default: 0.4)"  # help text also updated
         )
 
         parser.add_argument(
             "--nodata",
             type=str,
             default=None,
-            help="NoData値を明示指定 (例: -9999, 0, nan)。指定値は処理前にfloat NaNへ置換"
+            help="Explicit NoData value (e.g. -9999, 0, nan); replaced with float NaN before processing"
+        )
+
+        parser.add_argument(
+            "--output-dtype",
+            choices=["float32", "int16", "uint8"],
+            default="float32",
+            help="Output data type. int16/uint8 quantize for visualization (NoData=0) and shrink the COG (default: float32)"
+        )
+
+        parser.add_argument(
+            "--output-range",
+            type=str,
+            default=None,
+            help="Explicit quantization range 'lo,hi' (e.g. 0,90); defaults to the algorithm's native range"
         )
 
         parser.add_argument(
             "--verbose",
             action="store_true",
-            help="詳細なログ出力を有効化"
+            help="Enable verbose logging"
         )
         
-        # マルチスケール処理
+        # Multiscale processing
         parser.add_argument(
             "--agg",
             choices=["mean", "min", "max", "sum", "stack"],
             default="mean",
-            help="複数スケールの集約方法 (default: mean)"
+            help="Aggregation method across scales (default: mean)"
         )
 
         parser.add_argument(
             "--mode",
             choices=["local", "spatial"],
             default="local",
-            help="計算モード: local(近傍) / spatial(半径積算). spatialで半径未指定時はYAMLプリセットを使用"
+            help="Compute mode: local (neighborhood) / spatial (radius integration). With spatial and no radii, YAML presets are used"
         )
         
         parser.add_argument(
             "--radii",
             type=str,
-            help="Spatial半径(px)を明示指定 (例: 4,16,64)。未指定時はpixel sizeに応じてYAML自動選択"
+            help="Explicit spatial radii (px), e.g. 4,16,64; when omitted, YAML is auto-selected by pixel size"
         )
         
         parser.add_argument(
             "--weights",
             type=str,
-            help="Spatial重み (例: 0.5,0.3,0.2)。未指定時はYAML重み/等重みを自動適用"
+            help="Spatial weights (e.g. 0.5,0.3,0.2); when omitted, YAML/equal weights are applied"
         )
 
         parser.add_argument(
             "--auto-radii",
             action="store_true",
             default=True,
-            help="半径を地形解析により自動決定 (RVIのみ, default: True)"
+            help="Auto-determine radii via terrain analysis (RVI only, default: True)"
         )
         
         parser.add_argument(
             "--no-auto-radii",
             action="store_true",
-            help="半径自動決定を無効化 (RVIのみ)"
+            help="Disable automatic radii determination (RVI only)"
         )
         
-        # Hillshade固有
+        # Hillshade-specific
         parser.add_argument(
             "--azimuth",
             type=float,
             default=315,
-            help="太陽の方位角 (度, default: 315)"
+            help="Sun azimuth (degrees, default: 315)"
         )
         
         parser.add_argument(
             "--altitude",
             type=float,
             default=45,
-            help="太陽の高度角 (度, default: 45)"
+            help="Sun altitude (degrees, default: 45)"
         )
         
         parser.add_argument(
             "--z-factor",
             type=float,
             default=1.0,
-            help="垂直誇張率 (default: 1.0)"
+            help="Vertical exaggeration (default: 1.0)"
         )
         
         parser.add_argument(
             "--multiscale",
             action="store_true",
-            help="マルチスケールHillshadeを実行"
+            help="Run multiscale Hillshade"
         )
 
-        # Slope固有
+        # Slope-specific
         parser.add_argument(
             "--unit",
             choices=["degree", "percent", "radians"],
             default="degree",
-            help="勾配の単位 (default: degree)"
+            help="Slope unit (default: degree)"
         )
         
-        # Curvature固有
+        # Curvature-specific
         parser.add_argument(
             "--curvature-type",
             choices=["mean", "gaussian", "planform", "profile"],
             default="mean",
-            help="曲率の種類 (default: mean)"
+            help="Curvature type (default: mean)"
         )
         
-        # Openness/Ambient Occlusion共通
+        # Common to Openness/Ambient Occlusion
         parser.add_argument(
             "--radius",
             type=int,
             default=10,
-            help="解析半径 (ピクセル, default: 10)"
+            help="Analysis radius (pixels, default: 10)"
         )
         
-        # LRM固有
+        # LRM-specific
         parser.add_argument(
             "--kernel-size",
             type=int,
             default=25,
-            help="トレンド除去のカーネルサイズ (default: 25)"
+            help="Kernel size for trend removal (default: 25)"
         )
         
-        # Openness固有
+        # Openness-specific
         parser.add_argument(
             "--openness-type",
             choices=["positive", "negative"],
             default="positive",
-            help="開度のタイプ (default: positive)"
+            help="Openness type (default: positive)"
         )
         
         parser.add_argument(
             "--num-directions",
             type=int,
             default=16,
-            help="探索方向数 (default: 16)"
+            help="Number of search directions (default: 16)"
         )
         
         parser.add_argument(
             "--max-distance",
             type=int,
             default=50,
-            help="最大探索距離 (ピクセル, default: 50)"
+            help="Maximum search distance (pixels, default: 50)"
         )
 
-        # Specular固有
+        # Specular-specific
         parser.add_argument(
             "--roughness-scale",
             type=float,
             default=20.0,
-            help="ラフネス計算のスケール (default: 20.0)"
+            help="Scale for roughness computation (default: 20.0)"
         )
 
         parser.add_argument(
             "--shininess",
             type=float,
             default=10.0,
-            help="光沢の強さ (default: 10.0)"
+            help="Gloss strength (default: 10.0)"
         )
 
         parser.add_argument(
             "--light-azimuth",
             type=float,
             default=315,
-            help="光源の方位角 (度, default: 315)"
+            help="Light azimuth (degrees, default: 315)"
         )
 
         parser.add_argument(
             "--light-altitude",
             type=float,
             default=45,
-            help="光源の高度角 (度, default: 45)"
+            help="Light altitude (degrees, default: 45)"
         )
 
-        # Atmospheric Scattering固有
+        # Atmospheric Scattering-specific
         parser.add_argument(
             "--scattering-strength",
             type=float,
             default=0.5,
-            help="大気散乱の強度 (default: 0.5)"
+            help="Atmospheric scattering strength (default: 0.5)"
         )
 
-        # Multiscale Terrain固有
+        # Multiscale Terrain-specific
         parser.add_argument(
             "--scales",
             type=str,
-            help="マルチスケール地形のスケール。カンマ区切り (例: 1,10,50,100)"
+            help="Multiscale terrain scales, comma-separated (e.g. 1,10,50,100)"
         )
 
         parser.add_argument(
-            "--mst-weights",  # weightsと衝突を避けるため
+            "--mst-weights",  # avoid colliding with weights
             type=str,
-            help="マルチスケール地形の重み。カンマ区切り (例: 0.4,0.3,0.2,0.1)"
+            help="Multiscale terrain weights, comma-separated (e.g. 0.4,0.3,0.2,0.1)"
         )
 
-        # Visual Saliency固有
+        # Visual Saliency-specific
         parser.add_argument(
-            "--vs-scales",  # scalesと衝突を避けるため
+            "--vs-scales",  # avoid colliding with scales
             type=str,
-            help="視覚的顕著性のスケール。カンマ区切り (例: 2,4,8,16)"
+            help="Visual saliency scales, comma-separated (e.g. 2,4,8,16)"
         )
 
         parser.add_argument(
             "--use-global-stats",
             action="store_true",
             default=True,
-            help="グローバル統計を使用 (default: True)"
+            help="Use global statistics (default: True)"
         )
 
         parser.add_argument(
             "--no-global-stats",
             action="store_true",
-            help="グローバル統計を無効化"
+            help="Disable global statistics"
         )
 
         parser.add_argument(
             "--downsample-factor",
             type=int,
             default=20,
-            help="ダウンサンプル係数 (default: 20)"
+            help="Downsample factor (default: 20)"
         )
 
-        # NPR Edges固有
+        # NPR Edges-specific
         parser.add_argument(
             "--edge-sigma",
             type=float,
             default=1.0,
-            help="エッジ検出のぼかし強度 (default: 1.0)"
+            help="Edge-detection blur strength (default: 1.0)"
         )
 
         parser.add_argument(
             "--threshold-low",
             type=float,
             default=0.2,
-            help="エッジ検出の下限閾値 (default: 0.2)"
+            help="Edge-detection lower threshold (default: 0.2)"
         )
 
         parser.add_argument(
             "--threshold-high",
             type=float,
             default=0.5,
-            help="エッジ検出の上限閾値 (default: 0.5)"
+            help="Edge-detection upper threshold (default: 0.5)"
         )
 
-        # Ambient Occlusion固有（num-samplesのみ追加）
+        # Ambient Occlusion-specific (only num-samples added)
         parser.add_argument(
             "--num-samples",
             type=int,
             default=16,
-            help="AO計算のサンプル数 (default: 16)"
+            help="Number of samples for AO (default: 16)"
         )
 
-        # Fractal Anomaly固有（新規追加）
+        # Fractal Anomaly-specific (newly added)
         parser.add_argument(
             "--fractal-radii",
             type=str,
-            help="フラクタル異常検出の計算半径。カンマ区切り (例: 2,4,8,16,32)"
+            help="Fractal anomaly radii, comma-separated (e.g. 2,4,8,16,32)"
         )
 
         parser.add_argument(
             "--auto-fractal-radii",
             action="store_true",
             default=True,
-            help="フラクタル半径を解像度から自動決定 (default: True)"
+            help="Auto-determine fractal radii from resolution (default: True)"
         )
 
         parser.add_argument(
             "--no-auto-fractal-radii",
             action="store_true",
-            help="フラクタル半径の自動決定を無効化"
+            help="Disable automatic fractal radii determination"
         )
         
-        # 汎用強度パラメータ
+        # Generic intensity parameter
         parser.add_argument(
             "--intensity",
             type=float,
             default=1.0,
-            help="効果の強度 (default: 1.0, 複数のアルゴリズムで使用)"
+            help="Effect intensity (default: 1.0, used by several algorithms)"
         )
 
         # Scale-Space Surprise
         parser.add_argument(
             "--surprise-scales",
             type=str,
-            help="Scale-Space Surprise のスケール。カンマ区切り (例: 1,2,4,8,16)"
+            help="Scale-Space Surprise scales, comma-separated (e.g. 1,2,4,8,16)"
         )
         parser.add_argument(
             "--surprise-enhancement",
             type=float,
             default=2.0,
-            help="Scale-Space Surprise の強調係数 (default: 2.0)"
+            help="Scale-Space Surprise enhancement factor (default: 2.0)"
         )
 
         # Multi-light Uncertainty
         parser.add_argument(
             "--ml-azimuths",
             type=str,
-            help="Multi-light の方位角。カンマ区切り (例: 315,45,135,225)"
+            help="Multi-light azimuths, comma-separated (e.g. 315,45,135,225)"
         )
         parser.add_argument(
             "--uncertainty-weight",
             type=float,
             default=0.7,
-            help="Multi-light uncertainty の重み (default: 0.7)"
+            help="Multi-light uncertainty weight (default: 0.7)"
         )
 
     def parse_args(self, args: Optional[List[str]] = None) -> argparse.Namespace:
-        """引数をパース（基底クラスをオーバーライド）"""
+        """Parse arguments (overrides the base class)."""
         parsed_args = super().parse_args(args)
         
-        # radiiのパース（属性の存在チェックを追加）
+        # Parse radii (with attribute-existence check)
         if hasattr(parsed_args, 'radii') and parsed_args.radii:
             try:
                 parsed_args.radii_list = [int(r.strip()) for r in parsed_args.radii.split(",")]
             except ValueError:
-                self.parser.error("無効なradii形式です。カンマ区切りの整数を指定してください: 4,16,64,256")
+                self.parser.error("Invalid radii format. Provide comma-separated integers, e.g. 4,16,64,256")
         else:
             parsed_args.radii_list = None
         
-        # weightsのパース（属性の存在チェックを追加）
+        # Parse weights (with attribute-existence check)
         if hasattr(parsed_args, 'weights') and parsed_args.weights:
             try:
                 parsed_args.weights_list = [float(w.strip()) for w in parsed_args.weights.split(",")]
             except ValueError:
-                self.parser.error("無効なweights形式です。カンマ区切りの数値を指定してください: 0.4,0.3,0.2,0.1")
+                self.parser.error("Invalid weights format. Provide comma-separated numbers, e.g. 0.4,0.3,0.2,0.1")
         else:
             parsed_args.weights_list = None
         
-        # scalesのパース（multiscale_terrain用）
+        # Parse scales (for multiscale_terrain)
         if hasattr(parsed_args, 'scales') and parsed_args.scales:
             try:
                 parsed_args.scales_list = [float(s.strip()) for s in parsed_args.scales.split(",")]
             except ValueError:
-                self.parser.error("無効なscales形式です。カンマ区切りの数値を指定してください: 1,10,50,100")
+                self.parser.error("Invalid scales format. Provide comma-separated numbers, e.g. 1,10,50,100")
         else:
             parsed_args.scales_list = None
 
-        # mst_weightsのパース（multiscale_terrain用）
+        # Parse mst_weights (for multiscale_terrain)
         if hasattr(parsed_args, 'mst_weights') and parsed_args.mst_weights:
             try:
                 parsed_args.mst_weights_list = [float(w.strip()) for w in parsed_args.mst_weights.split(",")]
             except ValueError:
-                self.parser.error("無効なmst-weights形式です。カンマ区切りの数値を指定してください: 0.4,0.3,0.2,0.1")
+                self.parser.error("Invalid mst-weights format. Provide comma-separated numbers, e.g. 0.4,0.3,0.2,0.1")
         else:
             parsed_args.mst_weights_list = None
 
-        # vs_scalesのパース（visual_saliency用）
+        # Parse vs_scales (for visual_saliency)
         if hasattr(parsed_args, 'vs_scales') and parsed_args.vs_scales:
             try:
                 parsed_args.vs_scales_list = [float(s.strip()) for s in parsed_args.vs_scales.split(",")]
             except ValueError:
-                self.parser.error("無効なvs-scales形式です。カンマ区切りの数値を指定してください: 2,4,8,16")
+                self.parser.error("Invalid vs-scales format. Provide comma-separated numbers, e.g. 2,4,8,16")
         else:
             parsed_args.vs_scales_list = None
 
-        # fractal_radiiのパース（fractal_anomaly用）
+        # Parse fractal_radii (for fractal_anomaly)
         if hasattr(parsed_args, 'fractal_radii') and parsed_args.fractal_radii:
             try:
                 parsed_args.fractal_radii_list = [int(r.strip()) for r in parsed_args.fractal_radii.split(",")]
             except ValueError:
-                self.parser.error("無効なfractal-radii形式です。カンマ区切りの整数を指定してください: 2,4,8,16,32")
+                self.parser.error("Invalid fractal-radii format. Provide comma-separated integers, e.g. 2,4,8,16,32")
         else:
             parsed_args.fractal_radii_list = None
 
@@ -419,7 +433,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             try:
                 parsed_args.surprise_scales_list = [float(s.strip()) for s in parsed_args.surprise_scales.split(",")]
             except ValueError:
-                self.parser.error("無効なsurprise-scales形式です。カンマ区切りの数値を指定してください: 1,2,4,8,16")
+                self.parser.error("Invalid surprise-scales format. Provide comma-separated numbers, e.g. 1,2,4,8,16")
         else:
             parsed_args.surprise_scales_list = None
 
@@ -427,29 +441,29 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             try:
                 parsed_args.ml_azimuths_list = [float(a.strip()) for a in parsed_args.ml_azimuths.split(",")]
             except ValueError:
-                self.parser.error("無効なml-azimuths形式です。カンマ区切りの数値を指定してください: 315,45,135,225")
+                self.parser.error("Invalid ml-azimuths format. Provide comma-separated numbers, e.g. 315,45,135,225")
         else:
             parsed_args.ml_azimuths_list = None
 
         return parsed_args
     
     def _validate_platform_args(self, args: argparse.Namespace):
-        # auto-radiiフラグの処理
+        # Handle the auto-radii flag
         if hasattr(args, 'auto_radii') and hasattr(args, 'no_auto_radii'):
             args.auto_radii = args.auto_radii and not args.no_auto_radii
         
-        # use_global_statsフラグの処理
+        # Handle the use_global_stats flag
         if hasattr(args, 'use_global_stats') and hasattr(args, 'no_global_stats'):
             args.use_global_stats = args.use_global_stats and not args.no_global_stats
 
-        # auto_fractal_radiiフラグの処理
+        # Handle the auto_fractal_radii flag
         if hasattr(args, 'auto_fractal_radii') and hasattr(args, 'no_auto_fractal_radii'):
             args.auto_fractal_radii = args.auto_fractal_radii and not args.no_auto_fractal_radii
         
-        # RVIでradiiが未指定かつ自動決定も無効の場合エラー
+        # Error when RVI has no radii and auto-determination is also disabled
         if args.algorithm == "rvi":
             if not getattr(args, 'radii', None) and not getattr(args, 'auto_radii', True):
-                self.parser.error("radiiを指定するか、--auto-radiiを有効にしてください")
+                self.parser.error("Specify radii or enable --auto-radii")
 
     @staticmethod
     def _parse_nodata_override(raw_value):
@@ -464,8 +478,24 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         except ValueError as exc:
             raise ValueError(f"Invalid --nodata value: {raw_value}") from exc
 
+    @staticmethod
+    def _parse_output_range(raw_value):
+        """Parse --output-range 'lo,hi' into a (lo, hi) tuple (or None)."""
+        if raw_value is None:
+            return None
+        try:
+            lo_s, hi_s = str(raw_value).split(",")
+            lo, hi = float(lo_s), float(hi_s)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Invalid --output-range {raw_value!r}; expected 'lo,hi' (e.g. 0,90)."
+            ) from exc
+        if not (hi > lo):
+            raise ValueError(f"--output-range requires hi > lo, got {raw_value!r}.")
+        return (lo, hi)
+
     def execute(self, args: argparse.Namespace):
-        """Dask-CUDA処理を実行"""
+        """Run Dask-CUDA processing."""
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"]="0.70"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"]="0.75"
         os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"]="0.85"
@@ -480,71 +510,71 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         if gpus:
             gpu_memory_gb = gpus[0].memoryTotal / 1024
         else:
-            gpu_memory_gb = 16  # 控えめなデフォルト
+            gpu_memory_gb = 16  # conservative default
         _rmm_gb = compute_rmm_pool_gb(gpu_memory_gb)
         os.environ["RMM_ALLOCATOR"] = "pool"
         os.environ["RMM_POOL_SIZE"] = f"{_rmm_gb}GB"
         os.environ["RMM_MAXIMUM_POOL_SIZE"] = f"{int(_rmm_gb * 1.1)}GB"
 
-        # パラメータの準備
+        # Prepare parameters
         params = self.get_common_params(args)
 
-        # pixel_sizeの自動取得（指定されていない場合）
+        # Auto-detect pixel_size (when not specified)
         if not hasattr(args, 'pixel_size') or args.pixel_size is None:
             with rasterio.open(params['input_path']) as src:
-                # CRSをチェック
+                # Check the CRS
                 if src.crs and src.crs.is_geographic:
-                    # 地理座標系（緯度経度）の場合
-                    # データの中心緯度を取得
+                    # Geographic CRS (lat/lon) case
+                    # Get the data's center latitude
                     bounds = src.bounds
                     center_lat = (bounds.bottom + bounds.top) / 2
                     
-                    # 緯度1度あたりの距離（メートル）
-                    # 地球の半径を使用した近似計算
+                    # Distance per degree of latitude (meters)
+                    # Approximation using Earth's radius
                     lat_rad = np.radians(center_lat)
                     meters_per_degree_lat = 111132.92 - 559.82 * np.cos(2 * lat_rad) + \
                                         1.175 * np.cos(4 * lat_rad) - 0.0023 * np.cos(6 * lat_rad)
                     meters_per_degree_lon = 111412.84 * np.cos(lat_rad) - \
                                         93.5 * np.cos(3 * lat_rad) + 0.118 * np.cos(5 * lat_rad)
                     
-                    # ピクセルサイズを度からメートルに変換
+                    # Convert pixel size from degrees to meters
                     pixel_size_x_deg = abs(src.transform[0])
                     pixel_size_y_deg = abs(src.transform[4])
                     
                     pixel_size_x_m = pixel_size_x_deg * meters_per_degree_lon
                     pixel_size_y_m = pixel_size_y_deg * meters_per_degree_lat
                     
-                    # 平均値を使用（通常はほぼ同じ値）
+                    # Use the mean (usually nearly identical)
                     args.pixel_size = (pixel_size_x_m + pixel_size_y_m) / 2
                     
-                    self.logger.info(f"地理座標系を検出: 中心緯度 {center_lat:.2f}°")
-                    self.logger.info(f"ピクセルサイズ: {pixel_size_x_deg:.6f}° x {pixel_size_y_deg:.6f}°")
-                    self.logger.info(f"メートル換算: {args.pixel_size:.2f}m")
+                    self.logger.info(f"Geographic CRS detected: center latitude {center_lat:.2f}°")
+                    self.logger.info(f"Pixel size: {pixel_size_x_deg:.6f}° x {pixel_size_y_deg:.6f}°")
+                    self.logger.info(f"In meters: {args.pixel_size:.2f}m")
                     
                 else:
-                    # 投影座標系の場合（すでにメートル単位など）
+                    # Projected CRS case (already in meters, etc.)
                     pixel_size_x = abs(src.transform[0])
                     pixel_size_y = abs(src.transform[4])
                     
-                    # 単位を確認（CRSがある場合）
+                    # Check the unit (when a CRS is present)
                     if src.crs:
                         units = src.crs.linear_units
                         if units and units.lower() != 'metre' and units.lower() != 'meter':
-                            self.logger.warning(f"座標系の単位が'{units}'です。メートル単位として扱います。")
+                            self.logger.warning(f"CRS unit is '{units}'; treating it as meters.")
                     
                     args.pixel_size = (pixel_size_x + pixel_size_y) / 2
-                    self.logger.info(f"投影座標系: ピクセルサイズ {args.pixel_size:.2f}m")
+                    self.logger.info(f"Projected CRS: pixel size {args.pixel_size:.2f}m")
         else:
-            # ユーザーが明示的に指定した場合
-            self.logger.info(f"ユーザー指定のピクセルサイズ: {args.pixel_size}m")
+            # When the user specified it explicitly
+            self.logger.info(f"User-specified pixel size: {args.pixel_size}m")
 
-        # ログ出力
-        self.logger.info("=== Dask-CUDA地形解析 ===")
-        self.logger.info(f"入力: {args.input}")
-        self.logger.info(f"出力: {args.output}")
-        self.logger.info(f"アルゴリズム: {args.algorithm}")
+        # Log output
+        self.logger.info("=== Dask-CUDA terrain analysis ===")
+        self.logger.info(f"Input: {args.input}")
+        self.logger.info(f"Output: {args.output}")
+        self.logger.info(f"Algorithm: {args.algorithm}")
         
-        # デフォルト値の設定
+        # Set default values
         if not hasattr(args, 'auto_radii'):
             args.auto_radii = True
         if not hasattr(args, 'radii'):
@@ -556,11 +586,11 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         if not hasattr(args, 'weights_list'):
             args.weights_list = getattr(args, 'weights_list', None)
 
-        # アルゴリズム固有パラメータの準備
+        # Prepare algorithm-specific parameters
         algo_params = {}
         
-        # ... 既存のアルゴリズム固有パラメータ処理 ...
-        # 共通パラメータ
+        # ... existing algorithm-specific parameter handling ...
+        # Common parameters
         if hasattr(args, 'intensity'):
             algo_params['intensity'] = args.intensity
         if hasattr(args, 'pixel_size'):
@@ -568,7 +598,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
         if hasattr(args, 'verbose'):
             algo_params['verbose'] = args.verbose
 
-        # Hillshade固有
+        # Hillshade-specific
         if args.algorithm == 'hillshade':
             if hasattr(args, 'azimuth'):
                 algo_params['azimuth'] = args.azimuth
@@ -583,22 +613,22 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'weights_list') and args.weights_list:
                 algo_params['weights'] = args.weights_list
 
-        # Slope固有
+        # Slope-specific
         elif args.algorithm == 'slope':
             if hasattr(args, 'unit'):
                 algo_params['unit'] = args.unit
 
-        # Curvature固有
+        # Curvature-specific
         elif args.algorithm == 'curvature':
             if hasattr(args, 'curvature_type'):
                 algo_params['curvature_type'] = args.curvature_type
 
-        # LRM固有
+        # LRM-specific
         elif args.algorithm == 'lrm':
             if hasattr(args, 'kernel_size'):
                 algo_params['kernel_size'] = args.kernel_size
 
-        # Openness固有
+        # Openness-specific
         elif args.algorithm == 'openness':
             if hasattr(args, 'radius'):
                 algo_params['radius'] = args.radius
@@ -609,14 +639,14 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'max_distance'):
                 algo_params['max_distance'] = args.max_distance
 
-        # Ambient Occlusion固有
+        # Ambient Occlusion-specific
         elif args.algorithm == 'ambient_occlusion':
             if hasattr(args, 'num_samples'):
                 algo_params['num_samples'] = args.num_samples
             if hasattr(args, 'radius'):
                 algo_params['radius'] = args.radius
         
-        # Specular固有
+        # Specular-specific
         elif args.algorithm == 'specular':
             if hasattr(args, 'roughness_scale'):
                 algo_params['roughness_scale'] = args.roughness_scale
@@ -627,30 +657,30 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'light_altitude'):
                 algo_params['light_altitude'] = args.light_altitude
 
-        # Atmospheric Scattering固有
+        # Atmospheric Scattering-specific
         elif args.algorithm == 'atmospheric_scattering':
             if hasattr(args, 'scattering_strength'):
                 algo_params['scattering_strength'] = args.scattering_strength
 
-        # Multiscale Terrain固有
+        # Multiscale Terrain-specific
         elif args.algorithm == 'multiscale_terrain':
             if hasattr(args, 'scales_list') and args.scales_list:
                 algo_params['scales'] = args.scales_list
             if hasattr(args, 'mst_weights_list') and args.mst_weights_list:
                 algo_params['weights'] = args.mst_weights_list
 
-        # Visual Saliency固有
+        # Visual Saliency-specific
         elif args.algorithm == 'visual_saliency':
             if hasattr(args, 'vs_scales_list') and args.vs_scales_list:
                 algo_params['scales'] = args.vs_scales_list
             if hasattr(args, 'use_global_stats'):
-                # no_global_statsとの処理
+                # Handle no_global_stats
                 use_global = args.use_global_stats and not getattr(args, 'no_global_stats', False)
                 algo_params['use_global_stats'] = use_global
             if hasattr(args, 'downsample_factor'):
                 algo_params['downsample_factor'] = args.downsample_factor
 
-        # NPR Edges固有
+        # NPR Edges-specific
         elif args.algorithm == 'npr_edges':
             if hasattr(args, 'edge_sigma'):
                 algo_params['edge_sigma'] = args.edge_sigma
@@ -659,7 +689,7 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if hasattr(args, 'threshold_high'):
                 algo_params['threshold_high'] = args.threshold_high
 
-        # Fractal Anomaly固有
+        # Fractal Anomaly-specific
         elif args.algorithm == 'fractal_anomaly':
             if hasattr(args, 'fractal_radii_list') and args.fractal_radii_list:
                 algo_params['radii'] = args.fractal_radii_list
@@ -696,19 +726,19 @@ Cloud-Optimized GeoTIFF として書き出します。"""
             if args.algorithm != "rvi" and getattr(args, 'weights_list', None):
                 algo_params['weights'] = args.weights_list
 
-        # 処理の実行
+        # Run processing
         try:
             from ..core.dask_processor import run_pipeline
             
-            # RVIパラメータの安全な処理
+            # Safe handling of RVI parameters
             if args.algorithm == "rvi":
                 rvi_params = {
-                    'radii': args.radii_list,  # 手動指定がある場合のみ
+                    'radii': args.radii_list,  # only when manually specified
                     'weights': args.weights_list,
-                    'auto_radii': args.radii_list is None,  # radiiが指定されていない場合は自動決定
+                    'auto_radii': args.radii_list is None,  # auto-determine when radii are not specified
                 }
             else:
-                # RVI以外のアルゴリズム
+                # Non-RVI algorithms
                 rvi_params = {}
 
             run_pipeline(
@@ -720,12 +750,14 @@ Cloud-Optimized GeoTIFF として書き出します。"""
                 show_progress=params['show_progress'],
                 memory_fraction=getattr(args, 'memory_fraction', None),
                 nodata_override=self._parse_nodata_override(getattr(args, 'nodata', None)),
+                output_dtype=getattr(args, 'output_dtype', 'float32'),
+                output_range=self._parse_output_range(getattr(args, 'output_range', None)),
                 **rvi_params,
                 **algo_params
             )
             
         except Exception as e:
-            self.logger.error(f"処理中にエラーが発生しました: {e}")
+            self.logger.error(f"An error occurred during processing: {e}")
             import traceback
             traceback.print_exc()
             raise

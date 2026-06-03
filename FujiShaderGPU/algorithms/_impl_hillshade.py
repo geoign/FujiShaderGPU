@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_hillshade.py
 
-Hillshade アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 3)。
+Hillshade algorithm implementation.
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import cupy as cp
@@ -21,7 +21,7 @@ def compute_hillshade_block(block, *, azimuth=Constants.DEFAULT_AZIMUTH,
                            altitude=Constants.DEFAULT_ALTITUDE, z_factor=1.0,
                            pixel_size=1.0, pixel_scale_x=None,
                            pixel_scale_y=None, geographic_mode=False):
-    """1ブロックに対するHillshade計算"""
+    """Hillshade computation for a single block."""
     nan_mask = cp.isnan(block)
     azimuth_rad = cp.radians(azimuth)
     altitude_rad = cp.radians(altitude)
@@ -64,7 +64,7 @@ def compute_hillshade_spatial_block(block, *, azimuth=Constants.DEFAULT_AZIMUTH,
 
 
 class HillshadeAlgorithm(DaskAlgorithm):
-    """Hillshadeアルゴリズム"""
+    """Hillshade algorithm."""
     def process(self, gpu_arr, **params):
         azimuth = params.get('azimuth', Constants.DEFAULT_AZIMUTH)
         altitude = params.get('altitude', Constants.DEFAULT_ALTITUDE)

@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_ambient_occlusion.py
 
-Ambient Occlusion (環境遮蔽) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 2)。
+Ambient Occlusion algorithm implementation.
+Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import cupy as cp
@@ -26,7 +26,7 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
                                     pixel_size: float = 1.0,
                                     pixel_scale_x: float = None,
                                     pixel_scale_y: float = None) -> cp.ndarray:
-    """スクリーン空間環境遮蔽（SAO）の地形版（法線ベクトル化版）"""
+    """Terrain version of screen-space ambient occlusion (SAO), vectorized with normals."""
     h, w = block.shape
     nan_mask = cp.isnan(block)
 
@@ -140,7 +140,7 @@ def compute_ambient_occlusion_spatial_block(
 
 
 class AmbientOcclusionAlgorithm(DaskAlgorithm):
-    """環境遮蔽アルゴリズム"""
+    """Ambient occlusion algorithm."""
 
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         num_samples = params.get('num_samples', 16)

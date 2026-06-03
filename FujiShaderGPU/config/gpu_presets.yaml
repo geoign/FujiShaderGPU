@@ -1,22 +1,22 @@
 system_presets:
-  # CPU/システムメモリベースの設定
+  # CPU/system-memory-based settings
   gdal:
-    high_memory:  # 64GB以上
+    high_memory:  # 64GB or more
       cache_mb: 16384
       dataset_pool: 3000
     medium_memory:  # 32-64GB
       cache_mb: 8192
       dataset_pool: 2000
-    low_memory:  # 32GB未満
+    low_memory:  # under 32GB
       cache_mb: 4096
       dataset_pool: 1000
 
-# GPU プリセット定義
+# GPU preset definitions
 gpu_presets:
-  # エントリーレベル
+  # Entry level
   rtx4070_laptop:
     vram_gb: 12
-    vram_gb_range: [10, 14]  # 判定用の範囲を追加
+    vram_gb_range: [10, 14]  # range added for detection
     chunk_size: 768
     rmm_pool_size_gb: 8
     rmm_pool_fraction: 0.55
@@ -28,7 +28,7 @@ gpu_presets:
     rmm_pool_size_gb: 12
     rmm_pool_fraction: 0.6
    
-  # ミドルレンジ
+  # Mid range
   l4:
     vram_gb: 24
     vram_gb_range: [20, 35]
@@ -36,7 +36,7 @@ gpu_presets:
     rmm_pool_size_gb: 16
     rmm_pool_fraction: 0.65
    
-  # ハイエンド
+  # High end
   a100_40gb:
     vram_gb: 40
     vram_gb_range: [35, 70]
@@ -51,7 +51,7 @@ gpu_presets:
     rmm_pool_size_gb: 56
     rmm_pool_fraction: 0.7
   
-  # 最上位
+  # Top tier
   h100:
     vram_gb: 80
     vram_gb_range: [85, 100]
@@ -59,7 +59,7 @@ gpu_presets:
     rmm_pool_size_gb: 60
     rmm_pool_fraction: 0.75
 
-# アルゴリズム複雑度
+# Algorithm complexity
 algorithm_complexity:
   rvi: 1.2
   hillshade: 0.8

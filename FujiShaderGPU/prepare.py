@@ -28,87 +28,87 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m FujiShaderGPU.prepare",
         description=(
-            "任意のGDALラスタを FujiShaderGPU 互換COG(overview+ZStd, float32)へ変換し、"
-            "必要に応じてNoDataの穴埋めを行う前処理コマンド。"
+            "Convert any GDAL raster into a FujiShaderGPU-compatible COG (overview+ZSTD, float32), "
+            "optionally filling NoData voids -- a preprocessing command."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-NoData 穴埋めモード (--fill-mode):
-  none      穴埋めしない（NoData を保持）
-  enclosed  外縁(ラスタ境界に連結する NoData = 海/データ外)以外の内陸の穴のみ埋める【既定】
-  all       外縁を含め全 NoData を埋め、NoData を完全に除去（密ラスタ。3Dモデル等向け）
+NoData fill modes (--fill-mode):
+  none      do not fill (keep NoData)
+  enclosed  fill only interior voids, not the border-connected exterior (NoData touching the raster edge = sea/outside) [default]
+  all       fill every NoData incl. the exterior and remove NoData entirely (dense raster; for 3D models, etc.)
 
-例:
+Examples:
   python -m FujiShaderGPU.prepare input.tif output_cog.tif
   python -m FujiShaderGPU.prepare input.img output_cog.tif --fill-mode all --force
 """,
     )
-    parser.add_argument("input", help="入力ラスタ (GDAL が読める任意の形式)")
-    parser.add_argument("output", help="出力COG (.tif)")
+    parser.add_argument("input", help="Input raster (any format GDAL can read)")
+    parser.add_argument("output", help="Output COG (.tif)")
     parser.add_argument(
         "--fill-mode",
         choices=FILL_MODES,
         default="enclosed",
-        help="NoData 穴埋めモード (default: enclosed)",
+        help="NoData fill mode (default: enclosed)",
     )
     parser.add_argument(
         "--coarse-max",
         type=int,
         default=2048,
-        help="穴埋め用の粗グリッド最長辺(px)。大きいほど精細だが遅い (default: 2048)",
+        help="Longest side of the coarse fill grid (px); larger is finer but slower (default: 2048)",
     )
     parser.add_argument(
         "--block-size",
         type=int,
         default=512,
-        help="COG タイル/ブロックサイズ (default: 512)",
+        help="COG tile/block size (default: 512)",
     )
     parser.add_argument(
         "--overview-count",
         type=int,
         default=8,
-        help="生成する overview レベル数 (default: 8)",
+        help="Number of overview levels to generate (default: 8)",
     )
     parser.add_argument(
         "--zstd-level",
         type=int,
         default=1,
-        help="ZSTD 圧縮レベル (default: 1)",
+        help="ZSTD compression level (default: 1)",
     )
     parser.add_argument(
         "--num-threads",
         default="ALL_CPUS",
-        help="GDAL の並列スレッド数 (default: ALL_CPUS)",
+        help="Number of GDAL parallel threads (default: ALL_CPUS)",
     )
     parser.add_argument(
         "--nodata",
         type=str,
         default=None,
-        help="NoData値を明示指定 (例: -9999, 0, nan)。指定値はNaNに置換してから穴埋め",
+        help="Explicit NoData value (e.g. -9999, 0, nan); replaced with NaN before filling",
     )
     parser.add_argument(
         "--no-detect-nodata",
         dest="detect_nodata",
         action="store_false",
-        help="外周の固定値からの未指定NoData自動検出を無効化 (default: 有効)",
+        help="Disable auto-detection of undeclared NoData from a constant border (default: enabled)",
     )
     parser.set_defaults(detect_nodata=True)
     parser.add_argument(
         "--nodata-border-fraction",
         type=float,
         default=0.5,
-        help="自動検出: 値が外周リングを占める最小割合 (default: 0.5)",
+        help="Auto-detection: minimum fraction of the outer ring the value must occupy (default: 0.5)",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="出力が存在する場合も上書き",
+        help="Overwrite the output even if it exists",
     )
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
-        help="ログレベル (default: INFO)",
+        help="Log level (default: INFO)",
     )
     return parser
 
@@ -134,7 +134,7 @@ def main(argv=None) -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logger = logging.getLogger(__name__)
-    logger.info("=== DEM 前処理 (COG化 + 穴埋め: %s) ===", args.fill_mode)
+    logger.info("=== DEM preprocessing (COG-ification + fill: %s) ===", args.fill_mode)
     try:
         preprocess_dem_to_cog(
             args.input,
@@ -151,7 +151,7 @@ def main(argv=None) -> None:
             nodata_border_fraction=args.nodata_border_fraction,
         )
     except Exception as exc:
-        logger.error("前処理に失敗しました: %s", exc)
+        logger.error("Preprocessing failed: %s", exc)
         sys.exit(1)
 
 

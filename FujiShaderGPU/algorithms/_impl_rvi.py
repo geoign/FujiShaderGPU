@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_rvi.py
 
-RVI (Ridge-Valley Index) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 2)。
+RVI (Ridge-Valley Index) algorithm implementation.
+Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import logging
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
-    """CuPy でガウシアンぼかし後に差分を取るhigh pass フィルタ（NaN対応）"""
+    """High-pass filter via CuPy Gaussian blur then difference (NaN-aware)."""
     nan_mask = cp.isnan(block)
     if nan_mask.any():
         filled = cp.where(nan_mask, 0, block)
@@ -53,7 +53,7 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
                                radii: List[int] = [4, 16, 64],
                                weights: Optional[List[float]] = None,
                                pixel_size: float = 1.0) -> cp.ndarray:
-    """効率的なRVI計算（メモリ最適化版）"""
+    """Efficient RVI computation (memory-optimized)."""
     nan_mask = cp.isnan(block)
 
     if weights is None:
@@ -187,7 +187,7 @@ def multiscale_rvi(gpu_arr: da.Array, *,
                    radii: List[int],
                    weights: Optional[List[float]] = None,
                    pixel_size: float = 1.0) -> da.Array:
-    """効率的なマルチスケールRVI（Dask版）"""
+    """Efficient multiscale RVI (Dask version)."""
     if not radii:
         raise ValueError("At least one radius value is required")
 
@@ -296,7 +296,7 @@ def compute_rvi_input_sample_stats(
 
 
 class RVIAlgorithm(DaskAlgorithm):
-    """Ridge-Valley Indexアルゴリズム（効率的実装）"""
+    """Ridge-Valley Index algorithm (efficient implementation)."""
 
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         pixel_size = params.get('pixel_size', 1.0)
@@ -362,7 +362,7 @@ class RVIAlgorithm(DaskAlgorithm):
         )
 
     def _determine_optimal_radii(self, pixel_size: float) -> List[int]:
-        """ピクセルサイズに基づいて最適な半径を決定"""
+        """Determine optimal radii based on pixel size."""
         target_distances = [5, 20, 80, 320]
         radii = []
 

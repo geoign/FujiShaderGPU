@@ -1,8 +1,8 @@
 """
 FujiShaderGPU/algorithms/_impl_curvature.py
 
-Curvature (曲率) アルゴリズム実装。
-dask_shared.py からの分離モジュール (Phase 3)。
+Curvature algorithm implementation.
+Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import cupy as cp
@@ -19,7 +19,7 @@ from ._nan_utils import (
 
 def compute_curvature_block(block, *, curvature_type='mean', pixel_size=1.0,
                           pixel_scale_x=None, pixel_scale_y=None):
-    """曲率計算（平均曲率、ガウス曲率、平面・縦面曲率）"""
+    """Curvature computation (mean, Gaussian, plan, and profile curvature)."""
     nan_mask = cp.isnan(block)
     if nan_mask.any():
         filled = cp.where(nan_mask, cp.nanmean(block), block)
@@ -57,7 +57,7 @@ def compute_curvature_block(block, *, curvature_type='mean', pixel_size=1.0,
 
 
 class CurvatureAlgorithm(DaskAlgorithm):
-    """曲率アルゴリズム"""
+    """Curvature algorithm."""
     def process(self, gpu_arr, **params):
         ct = params.get('curvature_type', 'mean')
         ps = params.get('pixel_size', 1.0)
