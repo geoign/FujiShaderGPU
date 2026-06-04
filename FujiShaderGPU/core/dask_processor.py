@@ -1515,10 +1515,18 @@ def run_pipeline(
             def clear_worker_memory():
                 import gc
                 import cupy as cp
+                # Raise worker/nanny log levels before teardown so the benign
+                # shutdown-race "Failed to communicate with scheduler during
+                # heartbeat -> CommClosedError: Stream is closed" traceback is
+                # not emitted at ERROR after the pipeline already succeeded.
+                import logging as _logging
+                for _name in ("distributed.worker", "distributed.nanny",
+                              "distributed.core", "distributed.comm"):
+                    _logging.getLogger(_name).setLevel(_logging.CRITICAL)
                 cp.get_default_memory_pool().free_all_blocks()
                 cp.get_default_pinned_memory_pool().free_all_blocks()
                 gc.collect()
-                return True   
+                return True
             client.run(clear_worker_memory)
             # Close the client first and wait until it fully shuts down
             client.close(timeout=10)
