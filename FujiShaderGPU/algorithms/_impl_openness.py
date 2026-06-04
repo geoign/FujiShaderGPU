@@ -16,6 +16,8 @@ from ._nan_utils import (
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
     large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
 )
+from ._global_stats import apply_display_stretch_dask
+from ._normalization import robust_unsigned_stretch_stat_func
 
 
 def compute_openness_vectorized(block: cp.ndarray, *,
@@ -173,18 +175,21 @@ class OpennessAlgorithm(DaskAlgorithm):
                             pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
                         )
                     )
-            return _combine_multiscale_dask(responses, weights=weights, agg=agg)
-
-        return gpu_arr.map_overlap(
-            compute_openness_vectorized,
-            depth=max_distance+1,
-            boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            openness_type=openness_type, num_directions=num_directions,
-            max_distance=max_distance, pixel_size=pixel_size,
-            pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-        )
+            result = _combine_multiscale_dask(responses, weights=weights, agg=agg)
+        else:
+            result = gpu_arr.map_overlap(
+                compute_openness_vectorized,
+                depth=max_distance+1,
+                boundary='reflect',
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                openness_type=openness_type, num_directions=num_directions,
+                max_distance=max_distance, pixel_size=pixel_size,
+                pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+            )
+        # Data-driven [p1, p99] -> [0, 1] contrast stretch (openness concentrates
+        # in a narrow high band).  No-op unless 'global_stats' was injected.
+        return apply_display_stretch_dask(result, params.get("global_stats"))
 
     def get_default_params(self) -> dict:
         return {

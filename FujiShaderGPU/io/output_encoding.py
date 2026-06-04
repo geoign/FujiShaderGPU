@@ -44,9 +44,12 @@ OUTPUT_VALUE_RANGES: Dict[str, Tuple[float, float]] = {
     "specular": (0.0, 1.0),
     "atmospheric_scattering": (0.0, 1.0),
     "curvature": (0.0, 1.0),
+    "multi_light_uncertainty": (0.0, 1.0),
+    # Data-driven [p1, p99] -> [0,1] stretch (see _NORM_STAT_SPECS).  No headroom:
+    # these maps sit right against 1.0 (p99 ~= max), so the bright tail is
+    # negligible and the full [1, MAXPOS] code range is used instead.
     "ambient_occlusion": (0.0, 1.0),
     "openness": (0.0, 1.0),
-    "multi_light_uncertainty": (0.0, 1.0),
     # Unsigned, normalized to [0,1] with int headroom.
     "multiscale_terrain": (0.0, _NORM_HEADROOM),
     "visual_saliency": (0.0, _NORM_HEADROOM),

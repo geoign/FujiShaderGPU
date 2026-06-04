@@ -174,8 +174,34 @@ def apply_global_normalization(block: cp.ndarray,
     return normalized.astype(cp.float32)
 
 
+def apply_display_stretch_dask(result: da.Array, stats) -> da.Array:
+    """Stretch a bounded result by a robust ``(norm_min, norm_scale)`` range.
+
+    Maps ``[norm_min, norm_min+norm_scale]`` (typically the [p1, p99] band) to
+    ``[0, 1]`` at the Dask level, clamping the dark tail to 0 and letting the
+    bright tail run past 1 (encoded into the integer headroom).  NaN/NoData are
+    preserved.  Used by maps that are physically bounded but concentrated in a
+    narrow high band (ambient_occlusion, openness).  A no-op when ``stats`` is
+    missing/degenerate, so behaviour is unchanged without a global-stats pre-pass.
+    """
+    if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
+        return result
+    lo = float(stats[0])
+    scale = float(stats[1])
+    if not (scale > 1e-12):
+        return result
+
+    def _stretch(block: cp.ndarray) -> cp.ndarray:
+        return cp.maximum((block - lo) / scale, cp.float32(0.0)).astype(cp.float32)
+
+    return result.map_blocks(
+        _stretch, dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32)
+    )
+
+
 __all__ = [
     "determine_optimal_downsample_factor",
     "compute_global_stats",
     "apply_global_normalization",
+    "apply_display_stretch_dask",
 ]

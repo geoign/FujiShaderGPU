@@ -17,6 +17,8 @@ from ._nan_utils import (
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
     large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
 )
+from ._global_stats import apply_display_stretch_dask
+from ._normalization import robust_unsigned_stretch_stat_func
 
 
 def compute_ambient_occlusion_block(block: cp.ndarray, *,
@@ -186,17 +188,21 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
                             pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
                         )
                     )
-            return _combine_multiscale_dask(responses, weights=weights, agg=agg)
-
-        return gpu_arr.map_overlap(
-            compute_ambient_occlusion_block,
-            depth=int(radius + 1),
-            boundary='reflect',
-            dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            num_samples=num_samples, radius=radius, intensity=intensity,
-            pixel_size=pixel_size, pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-        )
+            result = _combine_multiscale_dask(responses, weights=weights, agg=agg)
+        else:
+            result = gpu_arr.map_overlap(
+                compute_ambient_occlusion_block,
+                depth=int(radius + 1),
+                boundary='reflect',
+                dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                num_samples=num_samples, radius=radius, intensity=intensity,
+                pixel_size=pixel_size, pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+            )
+        # Data-driven [p1, p99] -> [0, 1] contrast stretch (AO concentrates in a
+        # narrow high band; without this most code values are unused).  No-op
+        # unless the global-stats pre-pass injected 'global_stats'.
+        return apply_display_stretch_dask(result, params.get("global_stats"))
 
     def get_default_params(self) -> dict:
         return {

@@ -81,12 +81,29 @@ def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     return cp.zeros_like(block)
 
 
+def robust_unsigned_stretch_stat_func(data: cp.ndarray) -> Tuple[float, float]:
+    """Robust contrast-stretch stats for bounded maps concentrated in a narrow
+    high band (ambient_occlusion, openness): map [p1, p99] -> [0, 1].
+
+    Returns ``(norm_min=p1, norm_scale=p99-p1)`` so the darkest features anchor at
+    0 and the bright bulk fills the code range instead of piling up near the top.
+    """
+    valid = data[~cp.isnan(data)]
+    if valid.size == 0:
+        return (0.0, 1.0)
+    lo = float(cp.percentile(valid, 100.0 - NORMAL_PERCENTILE))  # p1
+    hi = float(cp.percentile(valid, NORMAL_PERCENTILE))          # p99
+    scale = hi - lo
+    return (lo, scale if scale > 1e-9 else 1.0)
+
+
 __all__ = [
     "rvi_stat_func",
     "rvi_norm_func",
     "npr_stat_func",
     "lrm_stat_func",
     "tpi_norm_func",
+    "robust_unsigned_stretch_stat_func",
     "NORMAL_PERCENTILE",
     "OVERFLOW_LIMIT",
 ]

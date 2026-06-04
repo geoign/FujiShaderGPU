@@ -1098,6 +1098,13 @@ _NORM_STAT_SPECS = {
                         "compute_visual_saliency_block", "visual_saliency_stat_func"),
     "multiscale_terrain": ("_impl_multiscale_terrain",
                           "compute_multiscale_combined_raw", "multiscale_stat_func"),
+    # Bounded [0,1] maps concentrated in a narrow high band: data-driven
+    # [p1, p99] -> [0, 1] contrast stretch so the integer codes are not wasted.
+    "ambient_occlusion": ("_impl_ambient_occlusion",
+                         "compute_ambient_occlusion_block",
+                         "robust_unsigned_stretch_stat_func"),
+    "openness": ("_impl_openness", "compute_openness_vectorized",
+                "robust_unsigned_stretch_stat_func"),
 }
 
 
