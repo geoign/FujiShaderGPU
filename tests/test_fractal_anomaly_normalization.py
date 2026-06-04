@@ -1,4 +1,5 @@
 import cupy as cp
+from FujiShaderGPU.algorithms._normalization import NORMAL_PERCENTILE
 
 
 def test_fractal_anomaly_normalization_is_signed_and_not_collapsed():
@@ -25,8 +26,11 @@ def test_fractal_anomaly_normalization_is_signed_and_not_collapsed():
     )
 
     p05, p95 = [float(v) for v in cp.percentile(out, cp.asarray([5, 95], dtype=cp.float32))]
-    assert -1.0 <= float(cp.nanmin(out)) <= 1.0
-    assert -1.0 <= float(cp.nanmax(out)) <= 1.0
+    # Signed, median-centered, normalized so the robust p99(|.|) maps to ~1.0
+    # (unclipped, so extremes may exceed +/-1).
+    valid = out[~cp.isnan(out)]
+    p99abs = float(cp.percentile(cp.abs(valid), NORMAL_PERCENTILE))
+    assert 0.7 <= p99abs <= 1.3
     assert p05 < 0.0 < p95
     assert (p95 - p05) > 0.2
 

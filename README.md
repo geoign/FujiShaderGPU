@@ -128,8 +128,13 @@ fujishadergpu in.tif out_slope.tif --algorithm slope --output-dtype int16 --outp
 
 - `--output-dtype {float32,int16,uint8}` (default `float32`, unchanged behavior).
 - **NoData = 0** for both integer types; valid data is stretched to fill the
-  remaining codes for maximum tonal resolution. Each algorithm has a known native
-  range (e.g. slope `0..90`, RVI `-1.5..1.5`); override with `--output-range lo,hi`.
+  remaining codes for maximum tonal resolution. Normalized algorithms (RVI, LRM,
+  fractal_anomaly, visual_saliency, scale_space_surprise, multiscale_terrain) map
+  their robust **p99** value to display magnitude `1` via an overview pre-pass, so
+  float32 lands in `-1..1` (signed) / `0..1` (unsigned); physical maps keep their
+  native range (slope `0..90`, hillshade/AO/openness `0..1`). int16/uint8 reserve
+  a little headroom (value `±1` → ~85% of the code range) so the unclipped tail is
+  preserved. Override with `--output-range lo,hi`.
 - Signed outputs (RVI / LRM / fractal_anomaly): `int16` uses the full symmetric
   `[-32767, +32767]` (DN 0 = value ~0 = flat ground, doubling as NoData — visually
   negligible); `uint8` centers value 0 at `128`.

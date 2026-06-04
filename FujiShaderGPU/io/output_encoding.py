@@ -8,7 +8,7 @@ the result can optionally be quantized to a compact integer COG:
 - Integer encodings reserve **0 for NoData**.  The data->DN mapping depends on
   whether the algorithm's range is signed (straddles 0) or unsigned:
     * unsigned (e.g. slope 0..90, AO 0..1): data occupies ``[1, MAX]``.
-    * signed (e.g. RVI/LRM -1.5..1.5):
+    * signed (e.g. RVI -3..3, LRM -1.5..1.5):
         - ``int16`` uses the full symmetric range ``[-MAX, +MAX]`` so both signs
           get maximum tonal resolution; ``DN = 0`` (== value ~0, i.e. flat ground)
           doubles as NoData -- visually negligible since it is the flat midtone.
@@ -28,12 +28,18 @@ import numpy as np
 
 # Native output value range per algorithm (the span that maximises tonal range).
 # Verified against each algorithm's final clip / normalization.
+# Normalized algorithms map their robust p99 value to display magnitude 1.0
+# (see ``algorithms/_normalization.NORMAL_PERCENTILE``); the float result is
+# unclipped, so the rare tail runs a little past +/-1.  The integer ranges below
+# are set to +/-_NORM_HEADROOM (1.176 = 1/0.85) so value +/-1 lands at ~0.85*MAXPOS
+# and the tail up to +/-1.176 is encoded before clipping, preserving dynamic range.
+_NORM_HEADROOM = 1.176
 OUTPUT_VALUE_RANGES: Dict[str, Tuple[float, float]] = {
-    # Signed, normalized to +/-OVERFLOW_LIMIT (1.5).
-    "rvi": (-1.5, 1.5),
-    "lrm": (-1.5, 1.5),
-    "fractal_anomaly": (-1.5, 1.5),
-    # Unsigned [0, 1].
+    # Signed, normalized to +/-1 with int headroom.
+    "rvi": (-_NORM_HEADROOM, _NORM_HEADROOM),
+    "lrm": (-_NORM_HEADROOM, _NORM_HEADROOM),
+    "fractal_anomaly": (-_NORM_HEADROOM, _NORM_HEADROOM),
+    # Unsigned [0, 1], physically bounded -- left at native range (no pre-stat).
     "hillshade": (0.0, 1.0),
     "specular": (0.0, 1.0),
     "atmospheric_scattering": (0.0, 1.0),
@@ -41,10 +47,10 @@ OUTPUT_VALUE_RANGES: Dict[str, Tuple[float, float]] = {
     "ambient_occlusion": (0.0, 1.0),
     "openness": (0.0, 1.0),
     "multi_light_uncertainty": (0.0, 1.0),
-    # Unsigned, normalized to [0, OVERFLOW_LIMIT].
-    "multiscale_terrain": (0.0, 1.5),
-    "visual_saliency": (0.0, 1.5),
-    "scale_space_surprise": (0.0, 1.5),
+    # Unsigned, normalized to [0,1] with int headroom.
+    "multiscale_terrain": (0.0, _NORM_HEADROOM),
+    "visual_saliency": (0.0, _NORM_HEADROOM),
+    "scale_space_surprise": (0.0, _NORM_HEADROOM),
     # Stylized edges clip to [0.2, 1.0].
     "npr_edges": (0.2, 1.0),
     # Physical: slope in degrees spans [0, 90] (default unit).

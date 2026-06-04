@@ -36,16 +36,18 @@ def test_rvi_stat_func_does_not_clip_broad_ridge_tail():
 
     scale = float(rvi_stat_func(data)[0])
 
-    assert scale == pytest.approx(0.108, rel=1e-2)
+    assert scale == pytest.approx(0.5, rel=1e-2)
 
 
-def test_rvi_norm_func_preserves_overflow_up_to_hard_cap():
+def test_rvi_norm_func_is_linear_without_clip():
     from FujiShaderGPU.algorithms.dask_shared import rvi_norm_func
 
-    data = cp.asarray([-2.0, -1.0, 0.0, 1.0, 2.0], dtype=cp.float32)
-    result = rvi_norm_func(data, (1.0,), cp.isnan(data))
+    # Normalization is a pure linear divide by the p99 scale (no overflow clip):
+    # the high-amplitude tail beyond +/-1 passes through unclipped.
+    data = cp.asarray([-4.0, -1.0, 0.0, 1.0, 4.0], dtype=cp.float32)
+    result = rvi_norm_func(data, (2.0,), cp.isnan(data))
 
-    assert cp.asnumpy(result).tolist() == pytest.approx([-1.5, -1.0, 0.0, 1.0, 1.5])
+    assert cp.asnumpy(result).tolist() == pytest.approx([-2.0, -0.5, 0.0, 0.5, 2.0])
 
 
 def test_rvi_result_stats_sample_existing_result_not_second_rvi():
@@ -62,4 +64,4 @@ def test_rvi_result_stats_sample_existing_result_not_second_rvi():
 
     scale = float(compute_rvi_result_stats(rvi)[0])
 
-    assert scale == pytest.approx(0.108, rel=1e-2)
+    assert scale == pytest.approx(0.5, rel=1e-2)

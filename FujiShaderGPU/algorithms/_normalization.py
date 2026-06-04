@@ -8,8 +8,14 @@ from __future__ import annotations
 from typing import Tuple
 import cupy as cp
 
-NORMAL_PERCENTILE = 80.0
-OVERFLOW_LIMIT = 1.5
+# Robust percentile that maps to display magnitude 1.0.  Set to 99 so that the
+# central ~99% of the (overview-derived) value distribution lands within
+# [-1,1] / [0,1] -- i.e. "most values fit the standard display range".  The
+# normalized float is NOT clipped, so the rare high-amplitude tail passes through
+# just past +/-1 and stays informative (see OUTPUT_VALUE_RANGES for how int16/
+# uint8 reserve a little headroom for it).
+NORMAL_PERCENTILE = 99.0
+OVERFLOW_LIMIT = 1.5  # retained for backward-compat imports; no longer clipped
 
 
 # --- RVI ---
@@ -31,8 +37,8 @@ def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     """Normalization for RVI."""
     scale_global = stats[0]
     if scale_global > 0:
-        normalized = block / scale_global
-        return cp.clip(normalized, -OVERFLOW_LIMIT, OVERFLOW_LIMIT)
+        # p99(|RVI|) -> magnitude 1.0; tail passes through unclipped.
+        return block / scale_global
     return cp.zeros_like(block)
 
 
@@ -71,7 +77,7 @@ def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     """Normalization for TPI/LRM."""
     max_abs = stats[0]
     if max_abs > 0:
-        return cp.clip(block / max_abs, -OVERFLOW_LIMIT, OVERFLOW_LIMIT)
+        return block / max_abs
     return cp.zeros_like(block)
 
 

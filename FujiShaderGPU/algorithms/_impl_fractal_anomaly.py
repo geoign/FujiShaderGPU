@@ -14,7 +14,7 @@ from cupyx.scipy.ndimage import gaussian_filter, median_filter
 from ._base import DaskAlgorithm, classify_resolution
 from ._nan_utils import handle_nan_with_gaussian, restore_nan
 from ._global_stats import compute_global_stats
-from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
+from ._normalization import NORMAL_PERCENTILE
 
 
 def compute_roughness_multiscale(block, radii, window_mult=3, detrend=True):
@@ -108,11 +108,8 @@ def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
     feature_out = alpha * raw_feature + (1.0 - alpha) * feat_smooth
     if normalize and mean_global is not None and std_global is not None:
         if std_global > 1e-6:
-            result = cp.clip(
-                (feature_out - mean_global) / std_global,
-                -OVERFLOW_LIMIT,
-                OVERFLOW_LIMIT,
-            )
+            # center via robust median, p99(|centered|) -> +/-1; unclipped tail.
+            result = (feature_out - mean_global) / std_global
         else:
             result = cp.zeros_like(feature_out)
     else:

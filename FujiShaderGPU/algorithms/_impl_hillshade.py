@@ -126,8 +126,14 @@ class HillshadeAlgorithm(DaskAlgorithm):
                     w = np.asarray(weights, dtype=np.float32)
                     if np.isfinite(w).all() and w.sum() > 0:
                         w = w / w.sum()
-                        w_da = da.from_array(w.astype(np.float32), chunks=(len(radii),))
-                        return da.sum(stacked * w_da[:, None, None], axis=0)
+                        # Scalar-weighted sum (backend-agnostic): a numpy-backed
+                        # weight dask array would multiply cupy blocks by numpy and
+                        # raise "Unsupported type numpy.ndarray".  Mirrors
+                        # _combine_multiscale_dask.
+                        out = results[0] * float(w[0])
+                        for i in range(1, len(results)):
+                            out = out + results[i] * float(w[i])
+                        return out
                 return da.mean(stacked, axis=0)
             elif agg == "min":
                 return da.min(stacked, axis=0)

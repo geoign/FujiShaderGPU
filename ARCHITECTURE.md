@@ -509,11 +509,21 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
 ### 14.2 Encoding rules
 
 - **NoData = 0** for both integer types (NaN → 0).
-- Each algorithm has a known native value range (`OUTPUT_VALUE_RANGES`), e.g.
-  slope `0..90`, AO/hillshade `0..1`, RVI/LRM/fractal `-1.5..1.5`,
-  visual_saliency/multiscale_terrain/scale_space_surprise `0..1.5`, npr_edges
-  `0.2..1.0`.  `--output-range lo,hi` overrides; unbounded cases (e.g. slope in
-  `percent`) fall back to a robust `[p1, p99]` estimate from a strided sample.
+- Normalized algorithms (RVI, LRM, fractal_anomaly, visual_saliency,
+  scale_space_surprise, multiscale_terrain) derive their display scale from a
+  **full-extent overview pre-pass**: the algorithm runs on a decimated, whole-raster
+  COG overview and its robust **p99** (`NORMAL_PERCENTILE`) sets the value mapped to
+  display magnitude `1`.  Sampling the whole extent (not a center crop) makes this
+  robust to off-center / sparse data footprints; see
+  `_compute_rvi_global_stats_from_overview` / `_compute_norm_stats_from_overview`
+  in `core/dask_processor.py`.  The normalized float is **unclipped**, so the tail
+  runs a little past `±1`.
+- Native value ranges (`OUTPUT_VALUE_RANGES`): slope `0..90`, AO/hillshade/openness
+  `0..1` (physically bounded, no pre-stat), npr_edges `0.2..1.0`; the normalized set
+  uses `±1.176` (signed) / `0..1.176` (unsigned), where `1.176 = 1/0.85` reserves
+  int16/uint8 headroom so value `±1` lands at ~85% of the code range and the tail up
+  to `±1.176` is encoded before clipping.  `--output-range lo,hi` overrides; unbounded
+  cases (e.g. slope in `percent`) fall back to a robust `[p1, p99]` estimate.
 - **Unsigned** range → data fills `[1, MAXPOS]` (255 / 32767).
 - **Signed** range (lo < 0 < hi) is encoded symmetrically about 0:
   - `int16`: full `[-MAXPOS, +MAXPOS]`; `DN = 0` (value ≈ 0, i.e. flat ground)

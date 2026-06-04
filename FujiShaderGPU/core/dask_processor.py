@@ -203,40 +203,83 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
 # 3. Automatic parameter determination via terrain analysis
 ###############################################################################
 
-def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01) -> dict:
-    """Analyze terrain characteristics holistically."""
-    # Sampling (shared part)
+def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01,
+                                    src_path: "str | None" = None) -> dict:
+    """Analyze terrain characteristics holistically.
+
+    Samples a coarse, FULL-EXTENT view of the DEM rather than a fixed center
+    crop, so datasets whose valid data is off-center or sparse (e.g. an
+    L-shaped footprint whose raster center is entirely NoData) are handled
+    correctly.  When the source COG path is provided the sample is read from a
+    low-resolution overview (cheap, full-extent); otherwise a strided
+    decimation of the in-memory array is used.  The decimation factor ``decim``
+    is divided back out of the gradient so ``mean_slope`` stays in
+    per-original-pixel units and remains comparable across resolutions.
+    """
     h, w = dem_arr.shape
-    sample_size = int(min(h, w) * sample_ratio)
-    sample_size = max(512, min(4096, sample_size))
-    
-    cy, cx = h // 2, w // 2
-    y1 = max(0, cy - sample_size // 2)
-    y2 = min(h, cy + sample_size // 2)
-    x1 = max(0, cx - sample_size // 2)
-    x2 = min(w, cx + sample_size // 2)
-    
-    sample = dem_arr[y1:y2, x1:x2].compute()
-    
+    sample = None
+    decim = 1
+
+    # Preferred: a low-resolution, full-extent overview from the source COG.
+    if src_path is not None and not is_zarr_path(src_path):
+        try:
+            from rasterio.enums import Resampling
+            target = 2048
+            with rasterio.open(src_path) as src:
+                ovr = src.overviews(1)
+                long_side = max(h, w)
+                # Align to a real overview factor when possible (no extra
+                # resampling / NoData blending); else use the plain ratio.
+                cand = [f for f in ovr if f >= 1] or [max(1, long_side // target)]
+                decim = min(cand, key=lambda f: abs((long_side // max(f, 1)) - target))
+                decim = max(1, int(decim))
+                out_h = max(1, h // decim)
+                out_w = max(1, w // decim)
+                ov = src.read(1, out_shape=(out_h, out_w),
+                              resampling=Resampling.nearest, masked=True)
+                src_nodata = src.nodata
+            data = np.ma.getdata(ov).astype(np.float32, copy=False)
+            mask = np.ma.getmaskarray(ov)
+            arr = cp.asarray(data)
+            arr = cp.where(cp.asarray(mask), cp.asarray(np.float32(np.nan)), arr)
+            if src_nodata is not None and np.isfinite(src_nodata):
+                arr = cp.where(arr == cp.float32(src_nodata),
+                               cp.asarray(np.float32(np.nan)), arr)
+            sample = arr
+        except Exception:
+            sample = None
+            decim = 1
+
+    # Fallback: strided full-extent decimation of the in-memory array.
+    if sample is None:
+        decim = max(1, min(h, w) // 2048)
+        sample = dem_arr[::decim, ::decim].compute()
+
     # Basic statistics (shared part)
     valid_mask = ~cp.isnan(sample)
     if not valid_mask.any():
         raise ValueError("No valid elevation data found")
-    
+
     elevations = sample[valid_mask]
     stats = {
         'elevation_range': float(cp.ptp(elevations)),
         'std_dev': float(cp.std(elevations)),
         'sample_size': sample.shape
     }
-    
-    # Gradient computation (shared part)
+
+    # Gradient computation (shared part). NoData boundaries produce NaN
+    # gradients, so aggregate over finite slope values only.  Divide by the
+    # decimation factor to recover per-original-pixel slope magnitude.
     dy, dx = cp.gradient(sample)
-    slope = cp.sqrt(dy**2 + dx**2)
+    slope = cp.sqrt(dy**2 + dx**2) / float(max(decim, 1))
     valid_slope = slope[valid_mask]
-    stats['mean_slope'] = float(cp.mean(valid_slope))
-    stats['max_slope'] = float(cp.percentile(valid_slope, 95))
-    
+    valid_slope = valid_slope[cp.isfinite(valid_slope)]
+    if valid_slope.size == 0:
+        stats['mean_slope'] = 0.0
+        stats['max_slope'] = 0.0
+    else:
+        stats['mean_slope'] = float(cp.mean(valid_slope))
+        stats['max_slope'] = float(cp.percentile(valid_slope, 95))
 
     # Common metrics for auto-parameter estimation
     stats["complexity_score"] = float(stats["mean_slope"] * stats["std_dev"])
@@ -1034,6 +1077,158 @@ def _compute_rvi_overview_coarse_field(
         return None
 
 
+# Normalized algorithms whose display range (-1..1 / 0..1) is derived from a
+# robust p99 of the algorithm's own output.  The stat is computed at FULL
+# RESOLUTION (so scale-sensitive algorithms keep correct magnitudes) on several
+# tiles stratified across the whole valid extent (so heterogeneous scenes -- e.g.
+# Mt Fuji's smooth flanks + singular summit -- are represented and singular
+# outliers fall into the unclipped >1 tail rather than dominating the scale).
+# Each entry: (module, raw_block_function, stat_function).  The raw block runs
+# with the SAME parameters as the main pass (resolved via the registry defaults +
+# the run's params, filtered to the block's signature).
+_NORM_STAT_SPECS = {
+    "rvi": ("_impl_rvi", "compute_rvi_efficient_block", "rvi_stat_func"),
+    "lrm": ("_impl_lrm", "compute_lrm_block", "lrm_stat_func"),
+    "fractal_anomaly": ("_impl_fractal_anomaly",
+                        "compute_fractal_dimension_block", "fractal_stat_func"),
+    "scale_space_surprise": ("_impl_experimental",
+                            "compute_scale_space_surprise_block",
+                            "scale_space_surprise_stat_func"),
+    "visual_saliency": ("_impl_visual_saliency",
+                        "compute_visual_saliency_block", "visual_saliency_stat_func"),
+    "multiscale_terrain": ("_impl_multiscale_terrain",
+                          "compute_multiscale_combined_raw", "multiscale_stat_func"),
+}
+
+
+def _norm_stat_max_scale(merged: dict) -> float:
+    """Largest pixel-scale among the algorithm's radii/scales/kernel parameters."""
+    vals = []
+    for key in ("radii", "scales"):
+        v = merged.get(key)
+        if isinstance(v, (list, tuple)) and v:
+            vals.append(max(float(x) for x in v))
+    ks = merged.get("kernel_size")
+    if ks:
+        vals.append(float(ks))
+    return max(vals) if vals else 16.0
+
+
+def _compute_norm_stats_tiled(
+    src_cog: str,
+    algorithm: str,
+    params: dict,
+    *,
+    grid: int = 3,
+    max_tile: int = 4096,
+    min_valid_frac: float = 0.02,
+) -> Optional[tuple]:
+    """Robust full-resolution, full-extent normalization stats via stratified tiles.
+
+    Reads several full-resolution windows tiled across the valid-data bounding box
+    (located from a coarse overview, so off-center footprints are handled), runs
+    the algorithm's raw block function on each with the main-pass parameters, pools
+    the interior valid pixels, and returns the algorithm's robust ``(offset,
+    p99-scale)`` statistics over the pool.  Full resolution keeps scale-sensitive
+    magnitudes correct; pooling the whole extent dilutes singular outliers into the
+    p99 tail.  Returns ``None`` on failure (caller falls back to window sampling).
+    """
+    spec = _NORM_STAT_SPECS.get(algorithm)
+    if spec is None:
+        return None
+    try:
+        import inspect
+        from rasterio.windows import Window
+        from rasterio.enums import Resampling
+        from ..algorithms.dask_registry import ALGORITHMS
+        mod = __import__(f"FujiShaderGPU.algorithms.{spec[0]}", fromlist=[spec[1]])
+        block_func = getattr(mod, spec[1])
+        stat_func = getattr(mod, spec[2])
+        try:
+            defaults = ALGORITHMS[algorithm].get_default_params() or {}
+        except Exception:
+            defaults = {}
+        merged = {**defaults, **(params or {})}
+    except Exception as exc:
+        logger.warning("Tiled norm-stats helpers unavailable for %s: %s", algorithm, exc)
+        return None
+
+    try:
+        accepted = set(inspect.signature(block_func).parameters)
+        # Drop None-valued params so the block function falls back to its own
+        # defaults (e.g. fractal_anomaly's radii default None -> would not iterate).
+        kw = {k: merged[k] for k in list(merged) if k in accepted and merged[k] is not None}
+        if "normalize" in accepted:
+            kw["normalize"] = False
+        max_scale = _norm_stat_max_scale(merged)
+        margin = int(min(max_scale, max_tile // 4))
+        tile = int(min(max_tile, max(2048, 4 * margin)))
+
+        pooled = []
+        with rasterio.open(src_cog) as src:
+            W, H = src.width, src.height
+            nodata = src.nodata
+
+            def _denodata(a):
+                a = a.astype(np.float32, copy=False)
+                if nodata is not None and not np.isnan(float(nodata)):
+                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
+                return a
+
+            # Coarse overview -> valid-data bounding box.
+            cov = max(1, max(W, H) // 512)
+            ov = _denodata(src.read(
+                1, out_shape=(max(1, H // cov), max(1, W // cov)),
+                resampling=Resampling.nearest, masked=True).filled(np.nan))
+            vmask = np.isfinite(ov)
+            if not vmask.any():
+                return None
+            ys, xs = np.where(vmask)
+            by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
+            bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
+
+            cell_h = max(1, (by1 - by0) // grid)
+            cell_w = max(1, (bx1 - bx0) // grid)
+            for gy in range(grid):
+                for gx in range(grid):
+                    ccy = by0 + gy * cell_h + cell_h // 2
+                    ccx = bx0 + gx * cell_w + cell_w // 2
+                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
+                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
+                    tw, th = min(tile, W - wx0), min(tile, H - wy0)
+                    a = _denodata(src.read(
+                        1, window=Window(wx0, wy0, tw, th),
+                        out_dtype=np.float32, masked=True).filled(np.nan))
+                    if float(np.isfinite(a).mean()) < min_valid_frac:
+                        continue
+                    g = cp.asarray(a)
+                    raw = block_func(g, **kw)
+                    m = int(min(margin, raw.shape[0] // 3, raw.shape[1] // 3))
+                    if m > 0:
+                        raw = raw[m:-m, m:-m]
+                    vals = raw[~cp.isnan(raw)]
+                    if vals.size:
+                        pooled.append(cp.asnumpy(vals))
+                    del g, raw, vals
+                    cp.get_default_memory_pool().free_all_blocks()
+
+        if not pooled:
+            return None
+        pooled_gpu = cp.asarray(np.concatenate(pooled))
+        stats = stat_func(pooled_gpu)
+        if not stats or not np.isfinite(float(stats[-1])) or float(stats[-1]) <= 1e-9:
+            return None
+        logger.info(
+            "%s global stats from %d full-res tiles (tile=%d, margin=%d, %d px): %s",
+            algorithm, len(pooled), tile, margin, int(pooled_gpu.size),
+            tuple(round(float(s), 6) for s in stats),
+        )
+        return stats
+    except Exception as exc:
+        logger.warning("Failed tiled norm stats for %s: %s", algorithm, exc)
+        return None
+
+
 def _quantize_block_cp(block, *, a_coef: float, b_coef: float,
                        dn_min: int, dn_max: int, cp_dtype):
     """Linearly encode a float32 CuPy block to integer codes (NaN/NoData -> 0).
@@ -1217,7 +1412,8 @@ def run_pipeline(
                 logger.info("Analyzing terrain for automatic radii determination...")
                 
                 # Terrain analysis
-                terrain_stats = analyze_terrain_characteristics(gpu_arr, sample_ratio=0.01)
+                terrain_stats = analyze_terrain_characteristics(
+                    gpu_arr, sample_ratio=0.01, src_path=src_cog)
                 terrain_stats['pixel_size'] = pixel_size
                 
                 # Determine optimal radii
@@ -1254,22 +1450,22 @@ def run_pipeline(
             params['radii'] = radii
             logger.info(f"Setting radii for {algorithm}: {radii}")
 
-        # RVI: derive the global normalization scale from a fast decimated
-        # overview read instead of striding the full-resolution array (which
-        # would read the entire dataset before any write progress is visible).
+        # Normalized algorithms (RVI/LRM/fractal_anomaly/scale_space_surprise/
+        # visual_saliency/multiscale_terrain): derive the display range
+        # (-1..1 / 0..1) from a robust p99 of the algorithm's own FULL-RESOLUTION
+        # output, pooled over tiles stratified across the whole valid extent.
+        # Full resolution keeps scale-sensitive magnitudes correct (radii/kernel
+        # are not decimated); pooling the whole extent is robust to off-center
+        # data and dilutes singular outliers (e.g. a volcano summit) into the
+        # unclipped >1 tail rather than letting them set the scale.
         if (
-            algorithm == "rvi"
+            algorithm in _NORM_STAT_SPECS
             and "global_stats" not in params
             and not is_zarr_path(src_cog)
         ):
-            rvi_global_stats = _compute_rvi_global_stats_from_overview(
-                src_cog,
-                radii=params.get("radii"),
-                weights=params.get("weights"),
-                pixel_size=float(params.get("pixel_size", 1.0)),
-            )
-            if rvi_global_stats is not None:
-                params["global_stats"] = rvi_global_stats
+            _norm_stats = _compute_norm_stats_tiled(src_cog, algorithm, params)
+            if _norm_stats is not None:
+                params["global_stats"] = _norm_stats
 
         # RVI large-radius-from-overview fast path: split radii at a chunk-aware
         # threshold; compute the large-radius contribution from the COG overview

@@ -11,9 +11,45 @@ import dask.array as da
 
 from ._base import Constants, DaskAlgorithm
 from ._nan_utils import handle_nan_with_gaussian, restore_nan
-from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
+from ._normalization import NORMAL_PERCENTILE
 
 logger = logging.getLogger(__name__)
+
+
+def compute_multiscale_combined_raw(block, *, scales=None, weights=None, **_ignored):
+    """Raw (un-normalized) weighted multiscale detail field.
+
+    Mirrors the scale/weight resolution in ``process()`` (inverse-scale weights
+    when none are supplied, then normalized) so the global-stats pre-pass computes
+    the normalization range with the same combination as the main pass.
+    """
+    if not scales:
+        scales = [1, 10, 50, 100]
+    if weights is None:
+        weights = [1.0 / float(s) for s in scales]
+    w = cp.asarray(weights, dtype=cp.float32)
+    w = w / w.sum()
+    n = min(len(scales), int(w.shape[0]))
+    nan_mask = cp.isnan(block)
+    combined = cp.zeros_like(block, dtype=cp.float32)
+    for i in range(n):
+        smoothed, _ = handle_nan_with_gaussian(
+            block, sigma=max(float(scales[i]), 0.5), mode='nearest')
+        detail = block - smoothed
+        valid = ~cp.isnan(detail)
+        combined[valid] += detail[valid] * float(w[i])
+    combined[nan_mask] = cp.nan
+    return combined.astype(cp.float32)
+
+
+def multiscale_stat_func(combined):
+    """Unsigned (p1-anchored, p99-scaled) stats: returns ``(norm_min, norm_scale)``."""
+    valid = combined[~cp.isnan(combined)]
+    if valid.size == 0:
+        return (0.0, 1.0)
+    norm_min = float(cp.percentile(valid, 1))
+    norm_scale = float(cp.percentile(cp.maximum(valid - norm_min, 0.0), NORMAL_PERCENTILE))
+    return (norm_min, norm_scale if norm_scale > 1e-9 else 1.0)
 
 
 class MultiscaleDaskAlgorithm(DaskAlgorithm):
@@ -93,7 +129,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                 valid = ~cp.isnan(block)
                 result[valid] += block[valid] * weights[i]
             result = (result - norm_min) / norm_scale
-            result = cp.clip(result, 0, OVERFLOW_LIMIT)
+            result = cp.maximum(result, 0.0)  # p99 -> 1.0; tail passes through
             result = cp.power(result, Constants.DEFAULT_GAMMA)
             result[nan_mask] = cp.nan
             return result.astype(cp.float32)

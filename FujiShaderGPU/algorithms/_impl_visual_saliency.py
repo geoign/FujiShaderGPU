@@ -14,7 +14,7 @@ from cupyx.scipy.ndimage import gaussian_filter
 from ._base import DaskAlgorithm
 from ._nan_utils import restore_nan
 from ._global_stats import compute_global_stats
-from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
+from ._normalization import NORMAL_PERCENTILE
 
 
 def _compress_saliency_feature(feature):
@@ -90,7 +90,7 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16],
             result = (sal - norm_min) / norm_scale
         else:
             result = cp.zeros_like(sal)
-        result = cp.clip(result, 0, OVERFLOW_LIMIT)
+        result = cp.maximum(result, 0.0)  # p99 -> 1.0; tail passes through unclipped
     else:
         result = sal
     result = restore_nan(result, nan_mask)

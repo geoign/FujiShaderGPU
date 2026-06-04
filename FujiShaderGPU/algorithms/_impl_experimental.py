@@ -18,7 +18,7 @@ from ._nan_utils import (
     _smooth_for_radius,
     large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
 )
-from ._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
+from ._normalization import NORMAL_PERCENTILE
 from .common.kernels import (
     scale_space_surprise as kernel_scale_space_surprise,
     multi_light_uncertainty as kernel_multi_light_uncertainty,
@@ -43,8 +43,11 @@ def compute_scale_space_surprise_block(block, *, scales, enhancement=2.0,
         scale = float(norm_scale)
         if scale > 1e-9:
             offset = 0.0 if norm_min is None else float(norm_min)
-            surprise = cp.clip((surprise - offset) / scale, 0, OVERFLOW_LIMIT)
-            surprise = cp.power(surprise, 1.0 / max(1e-3, enhancement))
+            # Normalize (p99 -> 1.0) then apply the gamma-style enhancement.  The
+            # non-negative base maps [0,1] -> [0,1] (p99 -> 1.0); the tail passes
+            # through just past 1.0 unclipped.
+            base = cp.clip((surprise - offset) / scale, 0.0, None)
+            surprise = cp.power(base, 1.0 / max(1e-3, enhancement))
         else:
             surprise = cp.zeros_like(surprise)
         surprise = cp.where(nan_mask, cp.nan, surprise)
