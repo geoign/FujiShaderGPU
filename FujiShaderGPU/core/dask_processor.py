@@ -1358,10 +1358,18 @@ def run_pipeline(
             qp = quantize_params(lo, hi, output_dtype)
             cp_dtype = cp.int16 if output_dtype == "int16" else cp.uint8
             out_np_dtype = output_dtype
-            out_scale_offset = (qp["scale"], qp["offset"])
+            # Visualization integer outputs are written as plain DN rasters
+            # (uint8: 0..255, int16: raw codes) with NoData=0 and NO GDAL
+            # scale/offset metadata.  Embedding scale/offset makes QGIS auto-
+            # unscale the band and present it as Float32 over the physical range
+            # (e.g. RVI -1.5..1.5), which looks "quantized float with NoData=0"
+            # and is confusing for a display product.  The DN<->value mapping is
+            # still logged and recorded in the COG 'parameters'/value_range attrs
+            # for anyone who needs to recover physical units.
+            out_scale_offset = None
             logger.info(
                 "Output dtype=%s (%s): range [%.6g, %.6g] -> DN [%d, %d], NoData=0 "
-                "(scale=%.6g, offset=%.6g)",
+                "(DN<->value mapping: value = %.6g*DN + %.6g; not embedded as scale/offset)",
                 output_dtype, "signed" if qp["signed"] else "unsigned",
                 lo, hi, qp["dn_min"], qp["dn_max"], qp["scale"], qp["offset"],
             )
@@ -1474,6 +1482,12 @@ def run_pipeline(
                 "data_type": "float32"
             }
             
+        # Reflect the actual on-disk dtype (the per-algorithm blocks above hard-code
+        # data_type=float32, which is misleading for quantized int16/uint8 output and
+        # shows up verbatim in QGIS metadata). value_range stays as the physical
+        # interpretation / DN<->value documentation.
+        attrs["data_type"] = out_np_dtype
+
         result_da = xr.DataArray(
             result_cpu,
             dims=dims,

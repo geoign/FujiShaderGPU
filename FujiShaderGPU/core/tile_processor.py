@@ -24,7 +24,6 @@ from ..io.output_encoding import (
     resolve_output_range,
     quantize_params,
     quantize_array,
-    apply_scale_offset,
 )
 from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 import os
@@ -2219,12 +2218,13 @@ def process_dem_tiles(
         
         # COG quality validation
         _validate_cog_for_qgis(output_cog_path)
-        # Quantized output is in DN space, so skip float-oriented display hints (e.g. RVI -1/1).
+        # Float output: apply float-oriented display hints (e.g. RVI -1/1).
+        # Quantized integer output is a plain DN raster (uint8 0..255 / int16
+        # raw codes) with NoData=0 and NO scale/offset metadata -- embedding
+        # scale/offset makes QGIS auto-unscale the band to a confusing float
+        # range, so we deliberately leave it off for the display product.
         if quantize_scale_offset is None:
             _apply_output_display_hints(output_cog_path, algorithm)
-        else:
-            # Record scale/offset for DN -> physical recovery (non-essential).
-            apply_scale_offset(output_cog_path, quantize_scale_offset[0], quantize_scale_offset[1])
 
     except Exception as e:
         if os.path.exists(tmp_tile_dir):
