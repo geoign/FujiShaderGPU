@@ -698,15 +698,56 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
 
             logger.info(f"Successfully created COG from {n_done} chunks")
 
+def _dask_worker_memory_limit_gb() -> Optional[float]:
+    """Return the smallest connected Dask worker memory limit in GB.
+
+    This reflects the real container/cgroup cap (RunPod/Colab/k8s) that bounds
+    any single-worker gather, unlike ``psutil`` which reports host RAM.  Falls
+    back to ``dask.system.MEMORY_LIMIT`` (also cgroup-aware) and finally None.
+    """
+    try:
+        client = get_client()
+        limits = [
+            w.get("memory_limit")
+            for w in client.scheduler_info()["workers"].values()
+        ]
+        limits = [float(x) for x in limits if x]
+        if limits:
+            return min(limits) / (1024**3)
+    except Exception:
+        pass
+    try:
+        from dask.system import MEMORY_LIMIT  # cgroup-aware byte count
+        if MEMORY_LIMIT:
+            return float(MEMORY_LIMIT) / (1024**3)
+    except Exception:
+        pass
+    return None
+
+
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """Write COG (auto-selected by available memory)."""
     total_gb = data.nbytes / (1024**3)
     
-    # Auto-determine the threshold from system memory
+    # Auto-determine the threshold from system memory.
+    #
+    # IMPORTANT: psutil reports the *host* RAM, not the container's cgroup limit.
+    # On RunPod / Colab / k8s the Dask worker is capped far below the host total
+    # (e.g. host 503GB but worker memory_limit 46.6GiB), and the direct-write
+    # path below gathers the ENTIRE result onto a *single* worker via one
+    # ``finalize`` task.  If we size the threshold from host RAM we wrongly pick
+    # direct writing and the worker OOM-kills (signal 9) in a recompute loop.
+    # So clamp the available figure to the real per-worker limit.
     mem_info = psutil.virtual_memory()
     total_ram_gb = mem_info.total / (1024**3)
-    available_ram_gb = mem_info.available / (1024**3)
-    
+    host_avail_gb = mem_info.available / (1024**3)
+
+    worker_limit_gb = _dask_worker_memory_limit_gb()
+    if worker_limit_gb is not None:
+        available_ram_gb = min(host_avail_gb, worker_limit_gb)
+    else:
+        available_ram_gb = host_avail_gb
+
     # Detect the Google Colab environment
     is_colab = 'google.colab' in sys.modules
     
@@ -730,8 +771,18 @@ def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = Tr
     # Clamp to range
     chunk_threshold = max(min_threshold, min(chunk_threshold, max_threshold))
     
+    # The direct-write path peaks at roughly 2-3x the output size on ONE worker
+    # (persisted intermediate + per-chunk asnumpy host copies + the contiguous
+    # finalize concat), so never let the threshold exceed what a single worker
+    # can actually hold for that peak.
+    if worker_limit_gb is not None:
+        single_worker_direct_cap = worker_limit_gb * 0.85 / 3.0
+        chunk_threshold = min(chunk_threshold, single_worker_direct_cap)
+
     # Log output
-    logger.info(f"System RAM: {total_ram_gb:.1f}GB total, {available_ram_gb:.1f}GB available")
+    logger.info(f"System RAM: {total_ram_gb:.1f}GB total, {host_avail_gb:.1f}GB available")
+    if worker_limit_gb is not None:
+        logger.info(f"Dask worker memory limit: {worker_limit_gb:.1f}GB (cgroup-aware)")
     logger.info(f"Memory threshold: {chunk_threshold:.1f}GB (safety factor: {safety_factor*100:.0f}%)")
     
     # Also display GPU info for reference
