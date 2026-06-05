@@ -11,6 +11,7 @@ import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, zoom
 
+from ._base import Constants
 from .common.spatial_mode import determine_spatial_radii, determine_spatial_profile
 
 
@@ -328,6 +329,59 @@ def coarse_large_radius_response(
     # NaN at the true NoData footprint so the large-radius response does not leak
     # finite values into the exterior.
     return da.where(da.isnan(gpu_arr), cp.float32(cp.nan), upsampled)
+
+
+def multiscale_response_fields(
+    gpu_arr: da.Array,
+    scales,
+    *,
+    block_fn,
+    depth_for_scale,
+    pixel_size: float = 1.0,
+    pixel_scale_x: Optional[float] = None,
+    pixel_scale_y: Optional[float] = None,
+    is_geographic: bool = False,
+    coarse_cache: Optional[dict] = None,
+    **block_kwargs,
+) -> List[da.Array]:
+    """Per-scale response fields as dask arrays, large scales via the coarse path.
+
+    For each scale, ``block_fn(block, scale=<scale>, pixel_size=..., ...)`` computes
+    that scale's response on a CuPy block.  When the scale's required halo
+    (``depth_for_scale(scale)``) would exceed ``Constants.MAX_DEPTH`` and the DEM is
+    projected, the response is computed on a globally-coarsened copy and upsampled
+    (no oversized per-chunk halo), exactly as ``multiscale_terrain`` does; otherwise
+    it is a bounded ``map_overlap``.  This keeps large ``--radii`` accurate without
+    the rechunk-merge OOM.  All returned arrays share ``gpu_arr``'s chunking, so a
+    downstream ``da.map_blocks(combine, gpu_arr, *fields)`` aligns block-wise.
+    """
+    F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geographic else 1
+    if coarse_cache is None:
+        coarse_cache = {}
+    # The map_overlap halo must stay below the smallest chunk; a halo >= a chunk
+    # makes dask rechunk that field (fewer blocks), so it no longer aligns with
+    # gpu_arr in the downstream da.map_blocks/map_overlap ("shapes do not align").
+    min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
+    halo_cap = max(1, min(Constants.MAX_DEPTH, int(min_chunk) - 1))
+    fields: List[da.Array] = []
+    for s in scales:
+        d = int(depth_for_scale(float(s)))
+        if F > 1 and d > Constants.MAX_DEPTH:
+            fields.append(coarse_large_radius_response(
+                gpu_arr, block_fn=block_fn, radius_kw="scale", radius=float(s),
+                factor=F,
+                depth_for_radius=lambda sc: min(int(depth_for_scale(sc)), Constants.MAX_DEPTH) + 1,
+                pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
+                pixel_scale_y=pixel_scale_y, coarse_cache=coarse_cache, **block_kwargs))
+        else:
+            fields.append(gpu_arr.map_overlap(
+                block_fn, depth=max(1, min(d, halo_cap)),
+                boundary="reflect", dtype=cp.float32,
+                meta=cp.empty((0, 0), dtype=cp.float32),
+                scale=float(s), pixel_size=pixel_size,
+                pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+                **block_kwargs))
+    return fields
 
 
 def _smooth_for_radius(

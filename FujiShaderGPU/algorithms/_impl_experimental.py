@@ -11,12 +11,13 @@ import logging
 from typing import List
 import cupy as cp
 import dask.array as da
+from cupyx.scipy.ndimage import gaussian_filter
 
 from ._base import DaskAlgorithm, Constants
 from ._global_stats import compute_global_stats
 from ._nan_utils import (
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
-    _smooth_for_radius,
+    _smooth_for_radius, multiscale_response_fields,
     large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
 )
 from ._normalization import NORMAL_PERCENTILE
@@ -26,6 +27,67 @@ from .common.kernels import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _sorted_scales_and_pair_weights(scales, weights):
+    """Sort scales ascending (carrying weights) and derive per-consecutive-pair
+    weights, mirroring ``kernel_scale_space_surprise``.  Returns
+    ``(sorted_scales, pair_weights_or_None)``."""
+    scale_list = [float(s) for s in scales]
+    wl = None
+    if weights is not None and len(list(weights)) == len(scale_list):
+        wl = [float(w) for w in weights]
+    kept = [(s, (wl[i] if wl is not None else None))
+            for i, s in enumerate(scale_list) if s > 0]
+    kept.sort(key=lambda t: t[0])
+    if len(kept) < 2:
+        kept = [(1.0, None), (2.0, None), (4.0, None)]
+    sorted_scales = [s for s, _ in kept]
+    sorted_w = [w for _, w in kept] if all(w is not None for _, w in kept) else None
+    pair_w = None
+    if sorted_w is not None and len(sorted_scales) >= 2:
+        pw = [0.5 * (sorted_w[i] + sorted_w[i + 1]) for i in range(len(sorted_scales) - 1)]
+        psum = float(sum(pw))
+        if psum > 1e-12:
+            pair_w = [p / psum for p in pw]
+    return sorted_scales, pair_w
+
+
+def _sss_smooth_block(block, *, scale, pixel_size=1.0, pixel_scale_x=None,
+                      pixel_scale_y=None, **_ignored):
+    """One scale's gaussian smooth, matching ``kernel_scale_space_surprise``
+    (NaN -> per-block nanmean fill, then gaussian, mode='reflect')."""
+    nan_mask = cp.isnan(block)
+    work = cp.where(nan_mask, cp.nanmean(block), block) if bool(nan_mask.any()) else block
+    return gaussian_filter(work, sigma=max(float(scale), 0.5), mode='reflect').astype(cp.float32)
+
+
+def _sss_combine_block(block, *smooths, pair_w=None, norm_min=0.0, norm_scale=1.0,
+                       enhancement=2.0, normalize=True):
+    """Combine per-scale smooths into the surprise map.
+
+    ``surprise = Σ pair_w[i]·|smooth[i+1] - smooth[i]|`` (the per-pixel ``work``
+    cancels in ``response[i+1]-response[i] = smooth[i]-smooth[i+1]``), then the
+    same p99-normalization + gamma enhancement as the original kernel."""
+    nan_mask = cp.isnan(block)
+    n = len(smooths)
+    surprise = cp.zeros(block.shape, dtype=cp.float32)
+    if n >= 2:
+        if pair_w is not None:
+            for i in range(n - 1):
+                surprise += cp.float32(pair_w[i]) * cp.abs(smooths[i + 1] - smooths[i])
+        else:
+            for i in range(n - 1):
+                surprise += cp.abs(smooths[i + 1] - smooths[i])
+            surprise /= cp.float32(max(1, n - 1))
+    if normalize:
+        scale = float(norm_scale)
+        if scale > 1e-9:
+            base = cp.clip((surprise - float(norm_min)) / scale, 0.0, None)
+            surprise = cp.power(base, 1.0 / max(1e-3, float(enhancement)))
+        else:
+            surprise = cp.zeros_like(surprise)
+    return cp.where(nan_mask, cp.float32(cp.nan), surprise).astype(cp.float32)
 
 ###############################################################################
 # Scale-Space Surprise
@@ -78,23 +140,11 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
         weights = params.get('weights', None)
         enhancement = float(params.get('enhancement', 2.0))
         normalize = bool(params.get('normalize', True))
-        # 4-sigma Gaussian kernel needs ~4*max_scale of halo for a seam-free
-        # core (was 3-sigma, which left a slight tile-boundary discontinuity).
-        seamless_depth = int(max(1, cp.ceil(max(scales) * 4).item())) + 1
-        # Bound the halo: a depth approaching/exceeding the chunk size forces
-        # dask to rechunk-merge whole strips of chunks together, which exhausts
-        # VRAM on big rasters with large --radii (the RMM-pool OOM).  Cap at
-        # MAX_DEPTH like the other multi-scale algorithms and below the chunk;
-        # scales beyond the cap are approximated (truncated halo) instead of
-        # crashing the run.
-        chunk_cap = int(min(gpu_arr.chunksize)) - 1 if hasattr(gpu_arr, "chunksize") else seamless_depth
-        depth = max(1, min(seamless_depth, Constants.MAX_DEPTH, int(min(gpu_arr.shape)) - 1, chunk_cap))
-        if seamless_depth > depth:
-            logger.warning(
-                "scale_space_surprise: max scale %.0f needs a %d-px halo (> cap %d); "
-                "very large radii are approximated to stay within memory.",
-                float(max(scales)), seamless_depth, depth,
-            )
+        is_geo = bool(params.get('is_geographic_dem', False))
+        ps = float(params.get('pixel_size', 1.0))
+        psx = params.get('pixel_scale_x', None)
+        psy = params.get('pixel_scale_y', None)
+
         stats = params.get('global_stats', None)
         stats_ok = isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9
         if normalize and not stats_ok:
@@ -105,17 +155,25 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
                 {'scales': scales, 'enhancement': enhancement, 'normalize': False,
                  'weights': weights},
                 downsample_factor=params.get('downsample_factor', None),
-                depth=depth,
+                depth=min(int(max(1, cp.ceil(max(scales) * 4).item())) + 1, Constants.MAX_DEPTH),
                 algorithm_name='scale_space_surprise',
             )
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):
             stats = (0.0, 1.0)
-        return gpu_arr.map_overlap(
-            compute_scale_space_surprise_block, depth=depth,
-            boundary='reflect', dtype=cp.float32,
-            meta=cp.empty((0, 0), dtype=cp.float32),
-            scales=scales, enhancement=enhancement, normalize=normalize,
-            norm_min=stats[0], norm_scale=stats[1], weights=weights)
+
+        # Per-scale gaussian smooths: small scales at full resolution, large scales
+        # on a coarsened overview (no oversized halo -> accurate large --radii, no
+        # rechunk-merge OOM).  The surprise then combines |smooth[i+1]-smooth[i]|.
+        sorted_scales, pair_w = _sorted_scales_and_pair_weights(scales, weights)
+        smooths = multiscale_response_fields(
+            gpu_arr, sorted_scales, block_fn=_sss_smooth_block,
+            depth_for_scale=lambda s: int(max(1, round(s * 4))) + 1,
+            pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo)
+        return da.map_blocks(
+            _sss_combine_block, gpu_arr, *smooths,
+            dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
+            pair_w=pair_w, norm_min=float(stats[0]), norm_scale=float(stats[1]),
+            enhancement=enhancement, normalize=normalize)
 
     def get_default_params(self):
         return {

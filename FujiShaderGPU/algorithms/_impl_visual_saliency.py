@@ -13,11 +13,28 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
 from ._base import DaskAlgorithm, Constants
-from ._nan_utils import restore_nan, resolve_block_weights
+from ._nan_utils import restore_nan, resolve_block_weights, multiscale_response_fields
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
 
 logger = logging.getLogger(__name__)
+
+
+def _vs_fill(block):
+    """NaN -> finite per-block fill (nanmean), matching compute_visual_saliency_block."""
+    nan_mask = cp.isnan(block)
+    if not bool(nan_mask.any()):
+        return block.astype(cp.float32, copy=False)
+    fill = cp.nanmean(block)
+    fill = cp.where(cp.isfinite(fill), fill, cp.float32(0.0))
+    return cp.where(nan_mask, fill, block).astype(cp.float32)
+
+
+def _vs_smooth_block(block, *, scale, pixel_size=1.0, pixel_scale_x=None,
+                     pixel_scale_y=None, **_ignored):
+    """One conspicuity scale's gaussian smooth of the NaN-filled DEM (mode='nearest')."""
+    work = _vs_fill(block)
+    return gaussian_filter(work, sigma=max(0.5, float(scale)), mode='nearest').astype(cp.float32)
 
 
 def _weighted_mean_maps(maps, weights, ref):
@@ -128,30 +145,84 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
     return result.astype(cp.float32)
 
 
+def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
+                      pixel_scale_x=None, pixel_scale_y=None,
+                      normalize=True, norm_min=None, norm_scale=None):
+    """Itti intensity + orientation conspicuity from precomputed per-scale smooths.
+
+    Equivalent to compute_visual_saliency_block, but the smooths arrive as
+    arguments (large scales computed via the coarse-overview path).  NaN that the
+    coarse path re-masked into a smooth is refilled so large/small scales are
+    treated identically; the true NoData footprint is restored at the end.
+    """
+    nan_mask = cp.isnan(block)
+    fillv = cp.nanmean(block)
+    fillv = cp.where(cp.isfinite(fillv), fillv, cp.float32(0.0))
+    sm = [cp.where(cp.isnan(s), fillv, s).astype(cp.float32) for s in smooths]
+    n = len(sm)
+    wvec = resolve_block_weights(weights, n)
+    c_indices = [0, 1]
+    deltas = [2, 3]
+    intensity_maps = []
+    intensity_w = []
+    for ci in c_indices:
+        for d in deltas:
+            si = ci + d
+            if si >= n:
+                continue
+            fm = cp.abs(sm[ci] - sm[si])
+            intensity_maps.append(_compress_saliency_feature(fm))
+            if wvec is not None:
+                intensity_w.append(float(wvec[ci]))
+    I = _weighted_mean_maps(intensity_maps, intensity_w if wvec is not None else None, block)
+    ori_maps = []
+    ori_w = []
+    orientations = [0.0, cp.pi / 4, cp.pi / 2, 3 * cp.pi / 4]
+    step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
+    step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
+    if abs(step_y) < 1e-9:
+        step_y = float(pixel_size if pixel_size else 1.0)
+    if abs(step_x) < 1e-9:
+        step_x = float(pixel_size if pixel_size else 1.0)
+    for j in range(min(3, n)):
+        gy, gx = cp.gradient(sm[j], step_y, step_x)
+        mag = cp.sqrt(gx * gx + gy * gy) + 1e-8
+        theta = cp.arctan2(gy, gx)
+        for o in orientations:
+            resp = mag * cp.maximum(cp.cos(2.0 * (theta - o)), 0.0)
+            ori_maps.append(_compress_saliency_feature(resp))
+            if wvec is not None:
+                ori_w.append(float(wvec[j]))
+    O = _weighted_mean_maps(ori_maps, ori_w if wvec is not None else None, block)
+    sal = 0.5 * (I + O)
+    if normalize:
+        if norm_min is None or norm_scale is None:
+            norm_min, norm_scale = visual_saliency_stat_func(sal)
+        if float(norm_scale) > 1e-9:
+            result = (sal - float(norm_min)) / float(norm_scale)
+        else:
+            result = cp.zeros_like(sal)
+        result = cp.maximum(result, 0.0)
+    else:
+        result = sal
+    return restore_nan(result, nan_mask).astype(cp.float32)
+
+
 class VisualSaliencyAlgorithm(DaskAlgorithm):
     """Visual saliency based on Itti-style conspicuity maps."""
     def process(self, gpu_arr, **params):
         radii = params.get('radii')
         scales = [float(r) for r in radii] if radii else params.get('scales', [2, 4, 8, 16])
         weights = params.get('weights', None)
-        max_scale = max(scales)
-        # Bound the conspicuity halo: a depth approaching/exceeding the chunk size
-        # forces dask to rechunk-merge strips of chunks, exhausting VRAM on big
-        # rasters with large --radii (RMM-pool OOM).  Cap at MAX_DEPTH (like the
-        # other multi-scale algorithms) and below the chunk; larger scales are
-        # approximated (truncated halo) rather than crashing.
-        seamless_depth = int(max_scale * 5)
-        chunk_cap = int(min(gpu_arr.chunksize)) - 1 if hasattr(gpu_arr, "chunksize") else seamless_depth
-        depth = max(1, min(seamless_depth, Constants.MAX_DEPTH, chunk_cap))
-        if seamless_depth > depth:
-            logger.warning(
-                "visual_saliency: max scale %.0f needs a %d-px halo (> cap %d); "
-                "very large radii are approximated to stay within memory.",
-                float(max_scale), seamless_depth, depth,
-            )
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
+        is_geo = bool(params.get('is_geographic_dem', False))
+        # Conspicuity scales (>=4, matching compute_visual_saliency_block).
+        use_scales = [max(0.5, float(s)) for s in scales]
+        if len(use_scales) < 4:
+            use_scales = [2.0, 4.0, 8.0, 16.0]
+
         stats = params.get('global_stats', None)
         stats_ok = isinstance(stats, (tuple, list)) and len(stats) >= 2
         if not stats_ok:
@@ -165,18 +236,28 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
                      'pixel_scale_y': pixel_scale_y, 'normalize': False,
                      'weights': weights},
                     downsample_factor=params.get('downsample_factor', None),
-                    depth=depth)
+                    depth=min(int(max(use_scales) * 5), Constants.MAX_DEPTH))
             else:
                 stats = (0.0, 1.0)
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
             stats = (0.0, 1.0)
-        return gpu_arr.map_overlap(
-            compute_visual_saliency_block, depth=depth,
-            boundary='reflect', dtype=cp.float32,
+
+        # Per-scale smooths: small scales full-res, large scales on a coarsened
+        # overview (accurate large --radii, no rechunk-merge OOM).  The combine
+        # then builds intensity (scale diffs) + orientation (gradients).
+        smooths = multiscale_response_fields(
+            gpu_arr, use_scales, block_fn=_vs_smooth_block,
+            depth_for_scale=lambda s: int(s * 5),
+            pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
+            pixel_scale_y=pixel_scale_y, is_geographic=is_geo)
+        # Small halo so the orientation gradient is seam-free at chunk borders.
+        return da.map_overlap(
+            _vs_combine_block, gpu_arr, *smooths,
+            depth=2, boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            scales=scales, pixel_size=pixel_size,
+            weights=weights, pixel_size=pixel_size,
             pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-            normalize=True, norm_min=stats[0], norm_scale=stats[1], weights=weights)
+            normalize=True, norm_min=stats[0], norm_scale=stats[1])
 
     def get_default_params(self):
         return {

@@ -5,7 +5,6 @@ Fractal Anomaly algorithm implementation.
 Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
-import logging
 from typing import List, Tuple
 import cupy as cp
 import numpy as np
@@ -13,11 +12,12 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, median_filter
 
 from ._base import DaskAlgorithm, classify_resolution, Constants
-from ._nan_utils import handle_nan_with_gaussian, restore_nan, resolve_block_weights
+from ._nan_utils import (
+    handle_nan_with_gaussian, restore_nan, resolve_block_weights,
+    multiscale_response_fields,
+)
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
-
-logger = logging.getLogger(__name__)
 
 
 def compute_roughness_multiscale(block, radii, window_mult=3, detrend=True):
@@ -51,21 +51,57 @@ def compute_roughness_multiscale(block, radii, window_mult=3, detrend=True):
     return cp.stack(sigmas, axis=-1)
 
 
+def _fractal_roughness_block(block, *, scale, pixel_size=1.0, pixel_scale_x=None,
+                             pixel_scale_y=None, **_ignored):
+    """One scale's detrended roughness (matches compute_roughness_multiscale,
+    ``window_mult=3, detrend=True``).  Used as the per-scale primitive so large
+    radii can be computed on a coarsened overview via the shared coarse path."""
+    sigma = max(0.8, float(scale) * 3.0 / 6.0)
+    nan_mask = cp.isnan(block)
+    if bool(nan_mask.any()):
+        trend, _ = handle_nan_with_gaussian(block, sigma=sigma, mode='nearest')
+        residual = block - trend
+        energy, _ = handle_nan_with_gaussian(residual ** 2, sigma=sigma, mode='nearest')
+    else:
+        trend = gaussian_filter(block, sigma=sigma, mode='nearest')
+        residual = block - trend
+        energy = gaussian_filter(residual ** 2, sigma=sigma, mode='nearest')
+    return cp.sqrt(cp.maximum(energy, 1e-8)).astype(cp.float32)
+
+
 def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
                                   normalize=True, mean_global=None, std_global=None,
                                   relief_p10=None, relief_p75=None,
                                   smoothing_sigma=1.2, despeckle_threshold=0.35,
                                   despeckle_alpha_max=0.30, detail_boost=0.35,
                                   weights=None):
-    """Compute fractal anomaly from detrended multiscale roughness.
+    """Compute fractal anomaly from detrended multiscale roughness (full-resolution
+    block; used by the global-stats pre-pass).  The main pass computes the same
+    feature from per-scale roughness fields (coarse path for large radii) via
+    ``_fractal_feature_from_roughness``.
 
     The unified ``--weights`` (when length-matching ``radii``) replaces the
     default ``sqrt(scale)`` weighting of the log-log roughness regression, so a
     user can emphasize particular scales in the fractal-slope fit.  Absent or
     mismatched weights keep the original ``sqrt(scale)`` behavior.
     """
-    nan_mask = cp.isnan(block)
     sigmas = compute_roughness_multiscale(block, radii, window_mult=3, detrend=True)
+    return _fractal_feature_from_roughness(
+        block, sigmas, radii=radii, weights=weights, normalize=normalize,
+        mean_global=mean_global, std_global=std_global, relief_p10=relief_p10,
+        relief_p75=relief_p75, smoothing_sigma=smoothing_sigma,
+        despeckle_threshold=despeckle_threshold, despeckle_alpha_max=despeckle_alpha_max,
+        detail_boost=detail_boost)
+
+
+def _fractal_feature_from_roughness(block, sigmas, *, radii, weights=None, normalize=True,
+                                    mean_global=None, std_global=None, relief_p10=None,
+                                    relief_p75=None, smoothing_sigma=1.2,
+                                    despeckle_threshold=0.35, despeckle_alpha_max=0.30,
+                                    detail_boost=0.35):
+    """Regression -> feature -> despeckle -> normalize half of fractal_anomaly,
+    given a precomputed per-scale roughness stack ``sigmas`` (H, W, N)."""
+    nan_mask = cp.isnan(block)
     fit_scales = cp.asarray(radii, dtype=cp.float32)
     log_scales = cp.log(fit_scales)
     log_sigmas = cp.log(cp.maximum(sigmas, 1e-5))
@@ -137,6 +173,25 @@ def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
     return result.astype(cp.float32)
 
 
+def _fractal_combine_block(block, *roughness, radii, weights=None, normalize=True,
+                           mean_global=None, std_global=None, relief_p10=None,
+                           relief_p75=None, smoothing_sigma=1.2, despeckle_threshold=0.35,
+                           despeckle_alpha_max=0.30, detail_boost=0.35):
+    """Stack the per-scale roughness fields (large radii from the coarse path) and
+    run the fractal feature/regression.  NaN that the coarse path re-masked into a
+    roughness field is floored to 1e-8 (those pixels are the NoData footprint and
+    are re-masked at the end)."""
+    sig = cp.stack(
+        [cp.where(cp.isnan(r), cp.float32(1e-8), r).astype(cp.float32) for r in roughness],
+        axis=-1)
+    return _fractal_feature_from_roughness(
+        block, sig, radii=radii, weights=weights, normalize=normalize,
+        mean_global=mean_global, std_global=std_global, relief_p10=relief_p10,
+        relief_p75=relief_p75, smoothing_sigma=smoothing_sigma,
+        despeckle_threshold=despeckle_threshold, despeckle_alpha_max=despeckle_alpha_max,
+        detail_boost=detail_boost)
+
+
 def fractal_stat_func(data):
     """Compute robust center/scale: p80(abs(centered)) maps to +/-1."""
     valid_data = data[~cp.isnan(data)]
@@ -160,29 +215,19 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         rp10 = params.get('relief_p10', None)
         rp75 = params.get('relief_p75', None)
         weights = params.get('weights', None)
+        is_geo = bool(params.get('is_geographic_dem', False))
+        psx = params.get('pixel_scale_x', None)
+        psy = params.get('pixel_scale_y', None)
         if radii is None:
             radii = self._determine_optimal_radii(ps)
         if len(radii) < 5:
             radii = [4, 8, 16, 32, 64]
         max_r = max(radii)
         # Roughness uses a Gaussian with sigma = r/2 (window_mult=3, /6), whose
-        # 4-sigma kernel needs ~2r of halo.  The extra +16 covers the feature
-        # smoothing (smoothing_sigma) and the size-3 median.  The previous 3r
-        # read ~1.5x more halo than required (core results unchanged).
-        seamless_depth = max_r * 2 + 16
-        # Bound the halo: a depth approaching/exceeding the chunk size forces dask
-        # to rechunk-merge strips of chunks, exhausting VRAM on big rasters with
-        # large --radii (RMM-pool OOM).  Cap at MAX_DEPTH (like the other
-        # multi-scale algorithms) and below the chunk; larger radii are
-        # approximated (truncated halo) rather than crashing.
-        chunk_cap = int(min(gpu_arr.chunksize)) - 1 if hasattr(gpu_arr, "chunksize") else seamless_depth
-        depth = max(1, min(seamless_depth, Constants.MAX_DEPTH, chunk_cap))
-        if seamless_depth > depth:
-            logger.warning(
-                "fractal_anomaly: max radius %.0f needs a %d-px halo (> cap %d); "
-                "very large radii are approximated to stay within memory.",
-                float(max_r), seamless_depth, depth,
-            )
+        # 4-sigma kernel needs ~2r of halo (+16 for the feature smoothing + median).
+        # Bound the stats pre-pass at MAX_DEPTH; the main pass computes large radii
+        # on a coarsened overview (no oversized halo) instead.
+        stats_depth = min(max_r * 2 + 16, Constants.MAX_DEPTH)
         stats = params.get('global_stats', None)
         stats_ok = (isinstance(stats, (tuple, list)) and len(stats) >= 2
                      and float(stats[1]) > 1e-9)
@@ -195,7 +240,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
                      'despeckle_threshold': ds_thr, 'despeckle_alpha_max': ds_am,
                      'detail_boost': db, 'weights': weights},
                     downsample_factor=params.get('downsample_factor', None),
-                    depth=depth, algorithm_name='fractal_anomaly')
+                    depth=stats_depth, algorithm_name='fractal_anomaly')
             else:
                 stats = (0.0, 0.5)
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):
@@ -204,14 +249,31 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             if isinstance(stats, (tuple, list)) and len(stats) >= 4:
                 rp10, rp75 = float(stats[2]), float(stats[3])
         mean_D, std_D = float(stats[0]), float(stats[1])
-        return gpu_arr.map_overlap(
-            compute_fractal_dimension_block, depth=depth,
-            boundary='reflect', dtype=cp.float32,
+
+        # Per-scale roughness: small radii full-res, large radii on a coarsened
+        # overview (accurate large --radii, no rechunk-merge OOM).  The combine
+        # then runs the log-log regression + despeckle on the roughness stack.
+        roughness = multiscale_response_fields(
+            gpu_arr, radii, block_fn=_fractal_roughness_block,
+            depth_for_scale=lambda r: int(2 * r) + 16,
+            pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo)
+        # The combine only needs a small halo for the feature smoothing + size-3
+        # median, but the per-block relief percentile (relief_conf) matches the
+        # original's full-resolution block when it sees the same neighborhood, so
+        # use the original halo bounded by MAX_DEPTH and the chunk size (a halo
+        # >= a chunk would rechunk and misalign the inputs).
+        min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
+        combine_depth = max(int(4 * max(0.0, sm_sig)) + 4,
+                            min(2 * max_r + 16, Constants.MAX_DEPTH))
+        combine_depth = max(2, min(combine_depth, int(min_chunk) - 1))
+        return da.map_overlap(
+            _fractal_combine_block, gpu_arr, *roughness,
+            depth=combine_depth, boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            radii=radii, normalize=True, mean_global=mean_D, std_global=std_D,
+            radii=radii, weights=weights, normalize=True,
+            mean_global=mean_D, std_global=std_D,
             relief_p10=rp10, relief_p75=rp75, smoothing_sigma=sm_sig,
-            despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am, detail_boost=db,
-            weights=weights)
+            despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am, detail_boost=db)
 
     def _determine_optimal_radii(self, pixel_size):
         """Determine optimal radii based on resolution."""
