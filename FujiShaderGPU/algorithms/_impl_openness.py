@@ -14,7 +14,7 @@ from ._nan_utils import (
     _resolve_spatial_radii_weights,
     _combine_multiscale_dask,
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
-    large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
+    large_radius_threshold, multiscale_response_fields,
 )
 from ._global_stats import apply_display_stretch_dask
 from ._normalization import robust_unsigned_stretch_stat_func
@@ -146,35 +146,15 @@ class OpennessAlgorithm(DaskAlgorithm):
         if mode == "spatial":
             is_geo = bool(params.get("is_geographic_dem", False))
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
-            F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1
-            _depth = lambda md: int(md) + 1
-            cache = {}
-            responses = []
-            for r in radii:
-                max_dist = int(max(2, round(float(r))))
-                if F > 1 and max_dist > thr:
-                    # Large radius from a coarsened DEM (no large per-chunk halo).
-                    responses.append(coarse_large_radius_response(
-                        gpu_arr, block_fn=compute_openness_spatial_block,
-                        radius_kw="max_distance", radius=max_dist, factor=F,
-                        depth_for_radius=_depth, pixel_size=pixel_size,
-                        pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-                        coarse_cache=cache,
-                        openness_type=openness_type, num_directions=num_directions,
-                    ))
-                else:
-                    responses.append(
-                        gpu_arr.map_overlap(
-                            compute_openness_spatial_block,
-                            depth=_depth(max_dist),
-                            boundary='reflect',
-                            dtype=cp.float32,
-                            meta=cp.empty((0, 0), dtype=cp.float32),
-                            openness_type=openness_type, num_directions=num_directions,
-                            max_distance=max_dist, pixel_size=pixel_size,
-                            pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-                        )
-                    )
+            # Large radius from a coarsened DEM (no large per-chunk halo).
+            responses = multiscale_response_fields(
+                gpu_arr, [float(int(max(2, round(float(r))))) for r in radii],
+                block_fn=compute_openness_spatial_block, radius_kw="max_distance",
+                depth_for_scale=lambda md: int(md) + 1,
+                is_large=lambda md: int(md) > thr,
+                pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
+                pixel_scale_y=pixel_scale_y, is_geographic=is_geo,
+                openness_type=openness_type, num_directions=num_directions)
             result = _combine_multiscale_dask(responses, weights=weights, agg=agg)
         else:
             result = gpu_arr.map_overlap(

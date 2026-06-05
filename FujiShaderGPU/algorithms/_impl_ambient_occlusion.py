@@ -15,7 +15,7 @@ from ._nan_utils import (
     _resolve_spatial_radii_weights,
     _combine_multiscale_dask,
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
-    large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
+    large_radius_threshold, multiscale_response_fields,
 )
 from ._global_stats import apply_display_stretch_dask
 from ._normalization import robust_unsigned_stretch_stat_func
@@ -160,34 +160,14 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
         if mode == "spatial":
             is_geo = bool(params.get("is_geographic_dem", False))
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
-            F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1
-            _depth = lambda rr: int(rr) + 1
-            cache = {}
-            responses = []
-            for r in radii:
-                r_use = float(max(1, int(round(float(r)))))
-                if F > 1 and int(r_use) > thr:
-                    responses.append(coarse_large_radius_response(
-                        gpu_arr, block_fn=compute_ambient_occlusion_spatial_block,
-                        radius_kw="radius", radius=r_use, factor=F,
-                        depth_for_radius=_depth, pixel_size=pixel_size,
-                        pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-                        coarse_cache=cache,
-                        num_samples=num_samples, intensity=intensity,
-                    ))
-                else:
-                    responses.append(
-                        gpu_arr.map_overlap(
-                            compute_ambient_occlusion_spatial_block,
-                            depth=_depth(r_use),
-                            boundary='reflect',
-                            dtype=cp.float32,
-                            meta=cp.empty((0, 0), dtype=cp.float32),
-                            num_samples=num_samples, radius=r_use,
-                            intensity=intensity, pixel_size=pixel_size,
-                            pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-                        )
-                    )
+            responses = multiscale_response_fields(
+                gpu_arr, [float(max(1, int(round(float(r))))) for r in radii],
+                block_fn=compute_ambient_occlusion_spatial_block, radius_kw="radius",
+                depth_for_scale=lambda rr: int(rr) + 1,
+                is_large=lambda rr: int(rr) > thr,
+                pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
+                pixel_scale_y=pixel_scale_y, is_geographic=is_geo,
+                num_samples=num_samples, intensity=intensity)
             result = _combine_multiscale_dask(responses, weights=weights, agg=agg)
         else:
             result = gpu_arr.map_overlap(

@@ -143,6 +143,12 @@ class SpecularAlgorithm(DaskAlgorithm):
             params.get("radii"), params.get("weights", None), ps)
         agg = params.get("agg", "mean")
         if mode == "spatial":
+            # NOTE: specular keeps its own per-radius loop (the other spatial
+            # algorithms use multiscale_response_fields) because its coarse path
+            # also rescales the roughness kernel into the coarse grid
+            # (roughness_scale -> rs/F) and uses a roughness-dependent halo
+            # (max(rs, 2r+1)); the generic helper passes identical block kwargs to
+            # the coarse and full-res branches, so it cannot express that.
             is_geo = bool(params.get("is_geographic_dem", False))
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
             F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1

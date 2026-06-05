@@ -337,6 +337,8 @@ def multiscale_response_fields(
     *,
     block_fn,
     depth_for_scale,
+    radius_kw: str = "scale",
+    is_large=None,
     pixel_size: float = 1.0,
     pixel_scale_x: Optional[float] = None,
     pixel_scale_y: Optional[float] = None,
@@ -346,41 +348,53 @@ def multiscale_response_fields(
 ) -> List[da.Array]:
     """Per-scale response fields as dask arrays, large scales via the coarse path.
 
-    For each scale, ``block_fn(block, scale=<scale>, pixel_size=..., ...)`` computes
-    that scale's response on a CuPy block.  When the scale's required halo
-    (``depth_for_scale(scale)``) would exceed ``Constants.MAX_DEPTH`` and the DEM is
-    projected, the response is computed on a globally-coarsened copy and upsampled
-    (no oversized per-chunk halo), exactly as ``multiscale_terrain`` does; otherwise
-    it is a bounded ``map_overlap``.  This keeps large ``--radii`` accurate without
-    the rechunk-merge OOM.  All returned arrays share ``gpu_arr``'s chunking, so a
-    downstream ``da.map_blocks(combine, gpu_arr, *fields)`` aligns block-wise.
+    Shared by every spatial / multi-scale algorithm.  For each scale,
+    ``block_fn(block, <radius_kw>=<scale>, pixel_size=..., ...)`` computes that
+    scale's response on a CuPy block.  A scale is "large" when ``is_large(scale)``
+    is true (default: ``depth_for_scale(scale) > Constants.MAX_DEPTH``); on a
+    projected DEM a large scale is computed on a globally-coarsened copy and
+    upsampled (no oversized per-chunk halo), exactly as ``multiscale_terrain``
+    does, otherwise it is a bounded ``map_overlap``.  This keeps large ``--radii``
+    accurate without the rechunk-merge OOM.
+
+    ``radius_kw`` is the block_fn's radius/scale keyword ("scale" for the intrinsic
+    algorithms, "radius" for the spatial-switch algorithms).  ``is_large`` lets the
+    switch algorithms keep their chunk-relative ``large_radius_threshold`` instead
+    of the MAX_DEPTH rule.  All returned arrays share ``gpu_arr``'s chunking, so a
+    downstream ``da.map_blocks/map_overlap(combine, gpu_arr, *fields)`` aligns
+    block-wise.
     """
     F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geographic else 1
     if coarse_cache is None:
         coarse_cache = {}
     # The map_overlap halo must stay below the smallest chunk; a halo >= a chunk
     # makes dask rechunk that field (fewer blocks), so it no longer aligns with
-    # gpu_arr in the downstream da.map_blocks/map_overlap ("shapes do not align").
+    # gpu_arr in the downstream combine ("shapes do not align").  This is the only
+    # cap applied here -- callers control the actual halo via depth_for_scale, and
+    # the coarse-vs-full split via is_large -- so each algorithm keeps its exact
+    # prior halo behavior.
     min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
-    halo_cap = max(1, min(Constants.MAX_DEPTH, int(min_chunk) - 1))
+    chunk_cap = max(1, int(min_chunk) - 1)
     fields: List[da.Array] = []
     for s in scales:
-        d = int(depth_for_scale(float(s)))
-        if F > 1 and d > Constants.MAX_DEPTH:
+        sv = float(s)
+        d = int(depth_for_scale(sv))
+        large = is_large(sv) if is_large is not None else (d > Constants.MAX_DEPTH)
+        if F > 1 and large:
             fields.append(coarse_large_radius_response(
-                gpu_arr, block_fn=block_fn, radius_kw="scale", radius=float(s),
+                gpu_arr, block_fn=block_fn, radius_kw=radius_kw, radius=sv,
                 factor=F,
-                depth_for_radius=lambda sc: min(int(depth_for_scale(sc)), Constants.MAX_DEPTH) + 1,
+                depth_for_radius=lambda sc: max(1, int(depth_for_scale(sc))),
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
                 pixel_scale_y=pixel_scale_y, coarse_cache=coarse_cache, **block_kwargs))
         else:
             fields.append(gpu_arr.map_overlap(
-                block_fn, depth=max(1, min(d, halo_cap)),
+                block_fn, depth=max(1, min(d, chunk_cap)),
                 boundary="reflect", dtype=cp.float32,
                 meta=cp.empty((0, 0), dtype=cp.float32),
-                scale=float(s), pixel_size=pixel_size,
+                pixel_size=pixel_size,
                 pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
-                **block_kwargs))
+                **{radius_kw: sv}, **block_kwargs))
     return fields
 
 
