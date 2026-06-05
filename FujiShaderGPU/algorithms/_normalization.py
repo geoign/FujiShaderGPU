@@ -42,45 +42,6 @@ def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) 
     return cp.zeros_like(block)
 
 
-# --- NPR Edges ---
-
-def npr_stat_func(data: cp.ndarray) -> Tuple[float, float]:
-    """Statistics for NPR edges (gradient percentile)."""
-    # Compute the gradient simply
-    dy, dx = cp.gradient(data)
-    gradient_mag = cp.sqrt(dx**2 + dy**2)
-    valid_grad = gradient_mag[~cp.isnan(gradient_mag)]
-
-    if len(valid_grad) > 0:
-        return (float(cp.percentile(valid_grad, 70)),
-                float(cp.percentile(valid_grad, 90)))
-    return (0.1, 0.3)
-
-
-# --- LRM ---
-
-def lrm_stat_func(data: cp.ndarray) -> Tuple[float]:
-    """Return robust signed scale: p80(abs(value)) maps to +/-1."""
-    valid_data = data[~cp.isnan(data)]
-    if len(valid_data) == 0:
-        return (1.0,)
-
-    scale = float(cp.percentile(cp.abs(valid_data), NORMAL_PERCENTILE))
-    if scale > 1e-9:
-        return (scale,)
-    return (1.0,)
-
-
-# --- TPI/LRM shared ---
-
-def tpi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
-    """Normalization for TPI/LRM."""
-    max_abs = stats[0]
-    if max_abs > 0:
-        return block / max_abs
-    return cp.zeros_like(block)
-
-
 def robust_unsigned_stretch_stat_func(data: cp.ndarray) -> Tuple[float, float]:
     """Robust contrast-stretch stats for bounded maps concentrated in a narrow
     high band (ambient_occlusion, openness): map [p1, p99] -> [0, 1].
@@ -100,9 +61,6 @@ def robust_unsigned_stretch_stat_func(data: cp.ndarray) -> Tuple[float, float]:
 __all__ = [
     "rvi_stat_func",
     "rvi_norm_func",
-    "npr_stat_func",
-    "lrm_stat_func",
-    "tpi_norm_func",
     "robust_unsigned_stretch_stat_func",
     "NORMAL_PERCENTILE",
     "OVERFLOW_LIMIT",

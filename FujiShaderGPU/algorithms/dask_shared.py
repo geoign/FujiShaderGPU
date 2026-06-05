@@ -57,9 +57,6 @@ from ._global_stats import (
 from ._normalization import (
     rvi_stat_func,
     rvi_norm_func,
-    npr_stat_func,
-    lrm_stat_func,
-    tpi_norm_func,
 )
 
 # ---------------------------------------------------------------------------

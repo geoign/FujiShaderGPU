@@ -1454,7 +1454,7 @@ def run_pipeline(
             params['radii'] = radii
             logger.info(f"Setting radii for {algorithm}: {radii}")
 
-        # Normalized algorithms (RVI/LRM/fractal_anomaly/scale_space_surprise/
+        # Normalized algorithms (RVI/fractal_anomaly/scale_space_surprise/
         # visual_saliency/multiscale_terrain): derive the display range
         # (-1..1 / 0..1) from a robust p99 of the algorithm's own FULL-RESOLUTION
         # output, pooled over tiles stratified across the whole valid extent.
