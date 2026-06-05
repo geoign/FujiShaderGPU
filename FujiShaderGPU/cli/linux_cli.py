@@ -722,6 +722,13 @@ writes them out as Cloud-Optimized GeoTIFF."""
             # (a radius is a spatial scale here).  Explicit --radii overrides its
             # own --scales/--mst-weights, which still work when --radii is omitted.
             "multiscale_terrain",
+            # Intrinsically multi-scale algorithms: the unified --radii feeds
+            # their scale/radii set (overriding their own --vs-scales /
+            # --surprise-scales / --fractal-radii, which still work when --radii
+            # is omitted).
+            "visual_saliency",
+            "scale_space_surprise",
+            "fractal_anomaly",
         }
         if args.algorithm in spatial_mode_algorithms:
             algo_params['mode'] = getattr(args, 'mode', 'local')

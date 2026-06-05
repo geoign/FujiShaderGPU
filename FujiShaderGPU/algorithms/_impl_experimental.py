@@ -28,9 +28,13 @@ from .common.kernels import (
 # Scale-Space Surprise
 ###############################################################################
 
-def compute_scale_space_surprise_block(block, *, scales, enhancement=2.0,
+def compute_scale_space_surprise_block(block, *, scales=None, radii=None, enhancement=2.0,
                                       normalize=True, norm_min=None, norm_scale=None):
     """Scale-Space Surprise Map: emphasize the amount of feature change across scales."""
+    if radii:  # unified --radii feeds the scale-space scales
+        scales = [float(r) for r in radii]
+    if not scales:
+        scales = [1.0, 2.0, 4.0, 8.0, 16.0]
     nan_mask = cp.isnan(block)
     surprise = kernel_scale_space_surprise(
         block, scales=scales, enhancement=enhancement,
@@ -65,7 +69,8 @@ def scale_space_surprise_stat_func(data):
 
 class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr, **params):
-        scales = params.get('scales', [1.0, 2.0, 4.0, 8.0, 16.0])
+        radii = params.get('radii')
+        scales = [float(r) for r in radii] if radii else params.get('scales', [1.0, 2.0, 4.0, 8.0, 16.0])
         enhancement = float(params.get('enhancement', 2.0))
         normalize = bool(params.get('normalize', True))
         # 4-sigma Gaussian kernel needs ~4*max_scale of halo for a seam-free

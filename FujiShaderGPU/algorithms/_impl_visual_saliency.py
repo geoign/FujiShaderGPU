@@ -31,11 +31,13 @@ def visual_saliency_stat_func(data):
     return (0.0, scale if scale > 1e-9 else 1.0)
 
 
-def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16],
+def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
                                  pixel_size=1.0, pixel_scale_x=None,
                                  pixel_scale_y=None, normalize=True,
                                  norm_min=None, norm_scale=None):
     """Itti-style saliency (intensity + orientation conspicuity) for DEM."""
+    if radii:  # unified --radii feeds the conspicuity scales
+        scales = [float(r) for r in radii]
     nan_mask = cp.isnan(block)
     if nan_mask.any():
         fill = cp.nanmean(block)
@@ -100,7 +102,8 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16],
 class VisualSaliencyAlgorithm(DaskAlgorithm):
     """Visual saliency based on Itti-style conspicuity maps."""
     def process(self, gpu_arr, **params):
-        scales = params.get('scales', [2, 4, 8, 16])
+        radii = params.get('radii')
+        scales = [float(r) for r in radii] if radii else params.get('scales', [2, 4, 8, 16])
         max_scale = max(scales)
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
