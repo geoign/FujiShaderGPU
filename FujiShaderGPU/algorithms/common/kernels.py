@@ -13,25 +13,52 @@ def scale_space_surprise(
     enhancement: float = 2.0,
     normalize: bool = True,
     nan_mask: cp.ndarray | None = None,
+    weights: Iterable[float] | None = None,
 ) -> cp.ndarray:
-    """Scale-Space Surprise Map kernel on a single CuPy block."""
+    """Scale-Space Surprise Map kernel on a single CuPy block.
+
+    ``weights`` (the unified ``--weights``, length-matching ``scales``) weights
+    each consecutive-scale surprise term by the mean of its two scales' weights;
+    absent/mismatched weights keep the original equal averaging.
+    """
     if nan_mask is None:
         nan_mask = cp.isnan(block)
     work = cp.where(nan_mask, cp.nanmean(block), block) if nan_mask.any() else block
 
-    sorted_scales = sorted(float(s) for s in scales if float(s) > 0)
-    if len(sorted_scales) < 2:
-        sorted_scales = [1.0, 2.0, 4.0]
+    scale_list = [float(s) for s in scales]
+    weight_list = None
+    if weights is not None:
+        wl = list(weights)
+        if len(wl) == len(scale_list):
+            weight_list = [float(w) for w in wl]
+    # Keep only positive scales, carrying weights along, then sort by scale.
+    kept = [(s, (weight_list[i] if weight_list is not None else None))
+            for i, s in enumerate(scale_list) if s > 0]
+    kept.sort(key=lambda t: t[0])
+    if len(kept) < 2:
+        kept = [(1.0, None), (2.0, None), (4.0, None)]
+    sorted_scales = [s for s, _ in kept]
+    sorted_w = [w for _, w in kept] if all(w is not None for _, w in kept) else None
 
     responses = []
     for sigma in sorted_scales:
         blur = gaussian_filter(work, sigma=sigma, mode='reflect')
         responses.append(work - blur)
 
+    n_pair = max(1, len(responses) - 1)
+    pair_w = None
+    if sorted_w is not None and len(responses) >= 2:
+        pw = [0.5 * (sorted_w[i] + sorted_w[i + 1]) for i in range(len(responses) - 1)]
+        psum = float(sum(pw))
+        if psum > 1e-12:
+            pair_w = [p / psum for p in pw]
+
     surprise = cp.zeros_like(work, dtype=cp.float32)
     for i in range(len(responses) - 1):
-        surprise += cp.abs(responses[i + 1] - responses[i])
-    surprise /= max(1, len(responses) - 1)
+        term = cp.abs(responses[i + 1] - responses[i])
+        surprise += term * pair_w[i] if pair_w is not None else term
+    if pair_w is None:
+        surprise /= n_pair
 
     if normalize:
         valid = surprise[~nan_mask] if nan_mask.any() else surprise.ravel()

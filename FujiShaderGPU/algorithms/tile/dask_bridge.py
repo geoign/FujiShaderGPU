@@ -335,6 +335,10 @@ def _direct_rvi(block, params, algo):
 
 
 def _direct_npr_edges(block, params):
+    # Spatial (multi-radius) mode has a coarse-large-radius path; defer to the
+    # Dask implementation so the tile backend matches it exactly.
+    if str(params.get("mode", "local")).lower() == "spatial":
+        raise _FallbackToDask()
     from .._impl_npr_edges import compute_npr_edges_block
 
     return compute_npr_edges_block(
@@ -349,70 +353,32 @@ def _direct_npr_edges(block, params):
 def _direct_visual_saliency(block, params):
     from .._impl_visual_saliency import compute_visual_saliency_block, visual_saliency_stat_func
 
-    stats = params.get("global_stats", None)
-    if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
-        raw = compute_visual_saliency_block(
-            block, scales=params.get("scales", [2, 4, 8, 16]),
-            pixel_size=params.get("pixel_size", 1.0),
-            pixel_scale_x=params.get("pixel_scale_x", None),
-            pixel_scale_y=params.get("pixel_scale_y", None),
-            normalize=False,
-        )
-        stats = visual_saliency_stat_func(raw)
-    return compute_visual_saliency_block(
-        block, scales=params.get("scales", [2, 4, 8, 16]),
+    # Pass radii/weights through so the unified --radii/--weights take effect
+    # (the block resolves radii->scales internally), matching the Dask path.
+    radii = params.get("radii", None)
+    weights = params.get("weights", None)
+    common = dict(
+        scales=params.get("scales", [2, 4, 8, 16]), radii=radii, weights=weights,
         pixel_size=params.get("pixel_size", 1.0),
         pixel_scale_x=params.get("pixel_scale_x", None),
         pixel_scale_y=params.get("pixel_scale_y", None),
-        normalize=True, norm_min=stats[0], norm_scale=stats[1],
+    )
+    stats = params.get("global_stats", None)
+    if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
+        raw = compute_visual_saliency_block(block, normalize=False, **common)
+        stats = visual_saliency_stat_func(raw)
+    return compute_visual_saliency_block(
+        block, normalize=True, norm_min=stats[0], norm_scale=stats[1], **common,
     )
 
 
 def _direct_multiscale_terrain(block, params):
-    from .._base import Constants
-    from .._nan_utils import handle_nan_with_gaussian, restore_nan
-    from .._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
-
-    scales = params.get("scales", [1, 10, 50, 100])
-    weights = params.get("weights", None)
-    if weights is None:
-        weights = [1.0 / max(float(s), 1e-6) for s in scales]
-    weights_gpu = cp.asarray(weights, dtype=cp.float32)
-    weights_gpu = weights_gpu / cp.maximum(weights_gpu.sum(), cp.float32(1e-6))
-
-    details = []
-    for scale in scales:
-        smoothed, nan_mask = handle_nan_with_gaussian(
-            block, sigma=max(float(scale), 0.5), mode="nearest",
-        )
-        details.append(restore_nan(block - smoothed, nan_mask))
-
-    stats = params.get("global_stats", None)
-    if isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9:
-        norm_min, norm_scale = float(stats[0]), float(stats[1])
-    else:
-        combined_raw = cp.zeros_like(block, dtype=cp.float32)
-        for idx, detail in enumerate(details):
-            valid = ~cp.isnan(detail)
-            combined_raw[valid] += detail[valid] * weights_gpu[idx]
-        valid_data = combined_raw[~cp.isnan(combined_raw)]
-        if valid_data.size > 0:
-            norm_min = float(cp.percentile(valid_data, 1))
-            norm_scale = float(cp.percentile(cp.maximum(valid_data - norm_min, 0.0), NORMAL_PERCENTILE))
-        else:
-            norm_min, norm_scale = 0.0, 1.0
-        if norm_scale <= 1e-9:
-            norm_scale = 1.0
-
-    nan_mask = cp.isnan(block)
-    combined = cp.zeros_like(block, dtype=cp.float32)
-    for idx, detail in enumerate(details):
-        valid = ~cp.isnan(detail)
-        combined[valid] += detail[valid] * weights_gpu[idx]
-    result = cp.clip((combined - norm_min) / norm_scale, 0, OVERFLOW_LIMIT)
-    result = cp.power(result, Constants.DEFAULT_GAMMA)
-    result[nan_mask] = cp.nan
-    return result.astype(cp.float32)
+    # The previous direct reimplementation ignored the unified --radii (read only
+    # "scales") and upper-clipped the normalized tail at OVERFLOW_LIMIT, whereas
+    # the Dask path resolves scales from radii, leaves the tail unclipped
+    # (cp.maximum(...,0)), and has a coarse-large-radius path.  Defer to the Dask
+    # implementation so the tile backend matches it exactly.
+    raise _FallbackToDask()
 
 
 def _direct_fractal_anomaly(block, params, algo):
@@ -429,12 +395,13 @@ def _direct_fractal_anomaly(block, params, algo):
     ds_thr = float(params.get("despeckle_threshold", 0.35))
     ds_am = float(params.get("despeckle_alpha_max", 0.30))
     db = float(params.get("detail_boost", 0.35))
+    weights = params.get("weights", None)
     stats = params.get("global_stats", None)
     if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):
         raw = compute_fractal_dimension_block(
             block, radii=radii, normalize=False, smoothing_sigma=sm_sig,
             despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am,
-            detail_boost=db,
+            detail_boost=db, weights=weights,
         )
         stats = fractal_stat_func(raw)
     rp10 = params.get("relief_p10", None)
@@ -446,7 +413,7 @@ def _direct_fractal_anomaly(block, params, algo):
         mean_global=float(stats[0]), std_global=float(stats[1]),
         relief_p10=rp10, relief_p75=rp75, smoothing_sigma=sm_sig,
         despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am,
-        detail_boost=db,
+        detail_boost=db, weights=weights,
     )
 
 

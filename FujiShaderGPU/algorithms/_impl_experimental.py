@@ -29,7 +29,8 @@ from .common.kernels import (
 ###############################################################################
 
 def compute_scale_space_surprise_block(block, *, scales=None, radii=None, enhancement=2.0,
-                                      normalize=True, norm_min=None, norm_scale=None):
+                                      normalize=True, norm_min=None, norm_scale=None,
+                                      weights=None):
     """Scale-Space Surprise Map: emphasize the amount of feature change across scales."""
     if radii:  # unified --radii feeds the scale-space scales
         scales = [float(r) for r in radii]
@@ -38,7 +39,7 @@ def compute_scale_space_surprise_block(block, *, scales=None, radii=None, enhanc
     nan_mask = cp.isnan(block)
     surprise = kernel_scale_space_surprise(
         block, scales=scales, enhancement=enhancement,
-        normalize=False, nan_mask=nan_mask)
+        normalize=False, nan_mask=nan_mask, weights=weights)
     if normalize:
         if norm_scale is None:
             _min, _scale = scale_space_surprise_stat_func(surprise)
@@ -71,6 +72,7 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr, **params):
         radii = params.get('radii')
         scales = [float(r) for r in radii] if radii else params.get('scales', [1.0, 2.0, 4.0, 8.0, 16.0])
+        weights = params.get('weights', None)
         enhancement = float(params.get('enhancement', 2.0))
         normalize = bool(params.get('normalize', True))
         # 4-sigma Gaussian kernel needs ~4*max_scale of halo for a seam-free
@@ -86,7 +88,8 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
                 gpu_arr,
                 scale_space_surprise_stat_func,
                 compute_scale_space_surprise_block,
-                {'scales': scales, 'enhancement': enhancement, 'normalize': False},
+                {'scales': scales, 'enhancement': enhancement, 'normalize': False,
+                 'weights': weights},
                 downsample_factor=params.get('downsample_factor', None),
                 depth=depth,
                 algorithm_name='scale_space_surprise',
@@ -98,7 +101,7 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
             boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             scales=scales, enhancement=enhancement, normalize=normalize,
-            norm_min=stats[0], norm_scale=stats[1])
+            norm_min=stats[0], norm_scale=stats[1], weights=weights)
 
     def get_default_params(self):
         return {

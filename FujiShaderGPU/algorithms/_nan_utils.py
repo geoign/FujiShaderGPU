@@ -120,6 +120,31 @@ def _resolve_spatial_radii_weights(
     return resolved_radii, [v / s for v in cleaned]
 
 
+def resolve_block_weights(weights, n: int) -> Optional[cp.ndarray]:
+    """Normalize a per-scale weight list to a cupy float32 vector of length ``n``.
+
+    Returns ``None`` (→ caller keeps its default equal/intrinsic weighting) when
+    weights are absent, the wrong length, non-finite, or non-positive.  Used by
+    the intrinsically multi-scale algorithms (visual_saliency, scale_space_surprise,
+    fractal_anomaly) so the unified ``--weights`` influences their scale mixing
+    without changing behavior when no weights are supplied.
+    """
+    if weights is None or n <= 0:
+        return None
+    try:
+        vals = [float(w) for w in weights]
+    except (TypeError, ValueError):
+        return None
+    if len(vals) != n:
+        return None
+    arr = cp.asarray(vals, dtype=cp.float32)
+    arr = cp.where(cp.isfinite(arr) & (arr > 0), arr, cp.float32(0.0))
+    s = float(arr.sum())
+    if s <= 1e-12:
+        return None
+    return arr / s
+
+
 def _combine_multiscale_dask(
     responses: List[da.Array],
     *,

@@ -12,7 +12,7 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, median_filter
 
 from ._base import DaskAlgorithm, classify_resolution
-from ._nan_utils import handle_nan_with_gaussian, restore_nan
+from ._nan_utils import handle_nan_with_gaussian, restore_nan, resolve_block_weights
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
 
@@ -52,15 +52,24 @@ def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
                                   normalize=True, mean_global=None, std_global=None,
                                   relief_p10=None, relief_p75=None,
                                   smoothing_sigma=1.2, despeckle_threshold=0.35,
-                                  despeckle_alpha_max=0.30, detail_boost=0.35):
-    """Compute fractal anomaly from detrended multiscale roughness."""
+                                  despeckle_alpha_max=0.30, detail_boost=0.35,
+                                  weights=None):
+    """Compute fractal anomaly from detrended multiscale roughness.
+
+    The unified ``--weights`` (when length-matching ``radii``) replaces the
+    default ``sqrt(scale)`` weighting of the log-log roughness regression, so a
+    user can emphasize particular scales in the fractal-slope fit.  Absent or
+    mismatched weights keep the original ``sqrt(scale)`` behavior.
+    """
     nan_mask = cp.isnan(block)
     sigmas = compute_roughness_multiscale(block, radii, window_mult=3, detrend=True)
     fit_scales = cp.asarray(radii, dtype=cp.float32)
     log_scales = cp.log(fit_scales)
     log_sigmas = cp.log(cp.maximum(sigmas, 1e-5))
-    scale_w = cp.sqrt(fit_scales)
-    scale_w = scale_w / cp.sum(scale_w)
+    scale_w = resolve_block_weights(weights, len(radii))
+    if scale_w is None:
+        scale_w = cp.sqrt(fit_scales)
+        scale_w = scale_w / cp.sum(scale_w)
     w3 = scale_w.reshape(1, 1, -1)
     mean_log_scale = cp.sum(log_scales * scale_w)
     mean_log_sigma = cp.sum(log_sigmas * w3, axis=2)
@@ -147,6 +156,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         db = float(params.get('detail_boost', 0.35))
         rp10 = params.get('relief_p10', None)
         rp75 = params.get('relief_p75', None)
+        weights = params.get('weights', None)
         if radii is None:
             radii = self._determine_optimal_radii(ps)
         if len(radii) < 5:
@@ -167,7 +177,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
                     gpu_arr, fractal_stat_func, compute_fractal_dimension_block,
                     {'radii': radii, 'normalize': False, 'smoothing_sigma': sm_sig,
                      'despeckle_threshold': ds_thr, 'despeckle_alpha_max': ds_am,
-                     'detail_boost': db},
+                     'detail_boost': db, 'weights': weights},
                     downsample_factor=params.get('downsample_factor', None),
                     depth=depth, algorithm_name='fractal_anomaly')
             else:
@@ -184,7 +194,8 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             meta=cp.empty((0, 0), dtype=cp.float32),
             radii=radii, normalize=True, mean_global=mean_D, std_global=std_D,
             relief_p10=rp10, relief_p75=rp75, smoothing_sigma=sm_sig,
-            despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am, detail_boost=db)
+            despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am, detail_boost=db,
+            weights=weights)
 
     def _determine_optimal_radii(self, pixel_size):
         """Determine optimal radii based on resolution."""
