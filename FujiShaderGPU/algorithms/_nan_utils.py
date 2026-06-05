@@ -264,6 +264,13 @@ def coarse_large_radius_response(
     else:
         coarse = da.coarsen(_nanmean_dispatch, gpu_arr, {0: factor, 1: factor}, trim_excess=True)
         if coarse_cache is not None:
+            # Materialise the (small) coarse DEM once so multiple large radii reuse
+            # it instead of re-reading and re-coarsening the full-resolution array
+            # for each radius (otherwise N large radii = N full-DEM reads).
+            try:
+                coarse = coarse.persist()
+            except Exception:
+                pass
             coarse_cache["coarse"] = coarse
 
     r_coarse = max(1, int(round(float(radius) / float(factor))))

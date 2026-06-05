@@ -718,6 +718,10 @@ writes them out as Cloud-Optimized GeoTIFF."""
             "ambient_occlusion",
             "openness",
             "multi_light_uncertainty",
+            # multiscale_terrain uses the unified --radii as its gaussian scales
+            # (a radius is a spatial scale here).  Explicit --radii overrides its
+            # own --scales/--mst-weights, which still work when --radii is omitted.
+            "multiscale_terrain",
         }
         if args.algorithm in spatial_mode_algorithms:
             algo_params['mode'] = getattr(args, 'mode', 'local')
