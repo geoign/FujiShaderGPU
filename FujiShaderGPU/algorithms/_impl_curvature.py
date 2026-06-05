@@ -73,7 +73,8 @@ class CurvatureAlgorithm(DaskAlgorithm):
                 smoothed = _smooth_for_radius(block, radius,
                     pixel_size=pixel_size, algorithm_name="curvature")
                 return compute_curvature_block(smoothed,
-                    curvature_type=curvature_type, pixel_size=pixel_size)
+                    curvature_type=curvature_type, pixel_size=pixel_size,
+                    pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y)
             is_geo = bool(params.get("is_geographic_dem", False))
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
             F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1

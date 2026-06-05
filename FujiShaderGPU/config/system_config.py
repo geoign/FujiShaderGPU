@@ -4,7 +4,6 @@ FujiShaderGPU/config/system_config.py
 
 import logging
 import math
-import multiprocessing
 from importlib.util import find_spec
 from typing import List, Optional
 
@@ -14,6 +13,7 @@ from osgeo import gdal
 from ..config.gpu_config_manager import _gpu_config_manager
 from ..config.auto_tune import auto_tune
 from ..utils.memory import container_memory_total_gb
+from ..utils.cpu import container_cpu_count
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,10 @@ def get_gpu_config(
 def detect_optimal_system_config() -> dict:
     """Detect hardware and derive an optimization level."""
     config = {
-        "cpu_count": multiprocessing.cpu_count(),
+        # Container-aware: cgroup CPU quota, not the host core count (avoids
+        # over-sizing worker pools on RunPod/Colab/k8s where the host dwarfs
+        # the usable slice).  Mirrors the memory_gb treatment below.
+        "cpu_count": container_cpu_count(),
         # Container-aware: cgroup cap, not host RAM (avoids over-sizing on
         # RunPod/Colab/k8s where the host total dwarfs the usable limit).
         "memory_gb": int(container_memory_total_gb()),
