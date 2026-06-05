@@ -81,6 +81,15 @@ Examples:
         help="Number of GDAL parallel threads (default: ALL_CPUS)",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=(
+            "Worker processes for the parallel fill/streaming pass "
+            "(default: auto = min(CPU count, 32)). Use 1 to force the serial path."
+        ),
+    )
+    parser.add_argument(
         "--nodata",
         type=str,
         default=None,
@@ -149,6 +158,7 @@ def main(argv=None) -> None:
             nodata_override=_parse_nodata(args.nodata),
             detect_nodata=args.detect_nodata,
             nodata_border_fraction=args.nodata_border_fraction,
+            max_workers=args.workers,
         )
     except Exception as exc:
         logger.error("Preprocessing failed: %s", exc)

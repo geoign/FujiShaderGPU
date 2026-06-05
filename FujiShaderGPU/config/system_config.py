@@ -9,11 +9,11 @@ from importlib.util import find_spec
 from typing import List, Optional
 
 import cupy as cp
-import psutil
 from osgeo import gdal
 
 from ..config.gpu_config_manager import _gpu_config_manager
 from ..config.auto_tune import auto_tune
+from ..utils.memory import container_memory_total_gb
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,9 @@ def detect_optimal_system_config() -> dict:
     """Detect hardware and derive an optimization level."""
     config = {
         "cpu_count": multiprocessing.cpu_count(),
-        "memory_gb": psutil.virtual_memory().total // (1024**3),
+        # Container-aware: cgroup cap, not host RAM (avoids over-sizing on
+        # RunPod/Colab/k8s where the host total dwarfs the usable limit).
+        "memory_gb": int(container_memory_total_gb()),
         "gpu_detected": False,
         "gpu_name": "Unknown",
         "vram_gb": 0.0,

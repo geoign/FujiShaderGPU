@@ -51,6 +51,11 @@ from ..io.output_encoding import (
     quantize_params,
 )
 from ..config.auto_tune import compute_dask_chunk
+from ..utils.memory import (
+    container_memory_available_gb,
+    container_memory_total_gb,
+)
+from ..utils.paths import resolve_tmp_dir
 from .dask_cluster import make_cluster
 from .dask_io import (
     is_zarr_path,
@@ -75,7 +80,9 @@ def _configure_gdal_read_performance() -> None:
     run.  ``setdefault`` is used so explicit user environment overrides win.
     """
     try:
-        avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+        # Container-aware: psutil alone reports host RAM, so a cgroup-capped
+        # worker would inherit an oversized GDAL cache and OOM on read.
+        avail_gb = container_memory_available_gb()
     except Exception:
         avail_gb = 8.0
     # GDAL interprets a bare integer < 100000 as megabytes.
@@ -129,17 +136,7 @@ def _log_overview_availability(src_cog: str) -> None:
 
 def _select_chunk_temp_parent(data_nbytes: int) -> Path:
     """Choose and diagnose the temporary directory for chunk GeoTIFFs."""
-    selected_from = None
-    for env_name in ("FUJISHADER_TMP_DIR", "CPL_TMPDIR", "TMPDIR", "TMP", "TEMP"):
-        value = os.environ.get(env_name)
-        if value:
-            selected_from = env_name
-            parent = Path(value)
-            break
-    else:
-        parent = Path(tempfile.gettempdir())
-
-    parent.mkdir(parents=True, exist_ok=True)
+    parent, selected_from = resolve_tmp_dir(Path(tempfile.gettempdir()))
     usage = shutil.disk_usage(parent)
     estimated = max(data_nbytes, int(data_nbytes * 0.75))
     origin = f" from ${selected_from}" if selected_from else " from tempfile default"
@@ -490,10 +487,9 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         except Exception:
             pass
 
-    # Check free DRAM and enable prefetch
-    mem_info = psutil.virtual_memory()
-    available_ram_gb = mem_info.available / (1024**3)
-    
+    # Check free DRAM and enable prefetch (container-aware, not host RAM)
+    available_ram_gb = container_memory_available_gb()
+
     if available_ram_gb > 20:  # when more than 20GB is free
         logger.info(f"Enabling chunk prefetching (available DRAM: {available_ram_gb:.1f}GB)")
         
@@ -1311,10 +1307,9 @@ def run_pipeline(
     _configure_gdal_read_performance()
     _log_overview_availability(src_cog)
 
-    # Check memory status
-    mem = psutil.virtual_memory()
-    logger.info(f"System memory: {mem.total / 2**30:.1f} GB total, "
-                f"{mem.available / 2**30:.1f} GB available")
+    # Check memory status (container-aware: reports the cgroup cap, not host RAM)
+    logger.info(f"System memory: {container_memory_total_gb():.1f} GB total, "
+                f"{container_memory_available_gb():.1f} GB available")
 
     # Get the memory fraction (from algo_params, else default)
     memory_fraction = algo_params.pop('memory_fraction', None)

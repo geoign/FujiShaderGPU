@@ -25,8 +25,10 @@ Fill modes
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -34,13 +36,22 @@ import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.windows import Window
+from rasterio.windows import transform as rio_window_transform
 from osgeo import gdal
 
+from ..utils.cpu import container_cpu_count
+from ..utils.memory import container_memory_available_gb
 from ..utils.nodata_handler import _edge_connected_mask
+from ..utils.paths import resolve_tmp_dir
 
 logger = logging.getLogger(__name__)
 
 FILL_MODES = ("none", "enclosed", "all")
+
+# Strips cut per worker for the parallel fill pass.  >1 so the process pool can
+# load-balance uneven strips (ocean compresses fast, terrain is heavy) instead
+# of stranding fast workers while a few heavy strips finish the tail.
+STRIPS_PER_WORKER = 6
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +325,7 @@ def preprocess_dem_to_cog(
     nodata_override: Optional[float] = None,
     detect_nodata: bool = True,
     nodata_border_fraction: float = 0.5,
+    max_workers: Optional[int] = None,
 ) -> None:
     """Convert ``input_path`` (any GDAL raster) into a FujiShaderGPU-ready COG.
 
@@ -477,12 +489,16 @@ def preprocess_dem_to_cog(
                 "No fill required, but NoData normalisation needs the streaming path."
             )
 
-        # ---- 2) Stream full-resolution to a temporary tiled GeoTIFF ---------
-        tmp_parent = out_path.resolve().parent
-        tmp_parent.mkdir(parents=True, exist_ok=True)
+        # ---- 2) Stream full-resolution staging, then convert to COG ---------
+        # Honor FUJISHADER_TMP_DIR / CPL_TMPDIR / TMPDIR (a large persistent
+        # volume on RunPod/Colab) before defaulting next to the output, so the
+        # full-resolution staging file(s) do not land on a small disk.
+        tmp_parent, tmp_origin = resolve_tmp_dir(out_path.resolve().parent)
+        if tmp_origin:
+            logger.info("Staging temporary file(s) in %s (from $%s)", tmp_parent, tmp_origin)
         band_rows = _band_height(width)
 
-        profile = {
+        base_profile = {
             "driver": "GTiff",
             "height": height,
             "width": width,
@@ -497,64 +513,47 @@ def preprocess_dem_to_cog(
             "zlevel": zstd_level,
             "predictor": 3,
             "BIGTIFF": "YES",
-            "num_threads": num_threads,
         }
         if out_nodata is not None:
-            profile["nodata"] = out_nodata
+            base_profile["nodata"] = out_nodata
 
-        fd, tmp_name = tempfile.mkstemp(suffix=".tmp.tif", dir=str(tmp_parent))
-        os.close(fd)
-        tmp_tiff = Path(tmp_name)
-        try:
-            with rasterio.open(tmp_tiff, "w", **profile) as dst:
-                for row in range(0, height, band_rows):
-                    bh = min(band_rows, height - row)
-                    window = Window(0, row, width, bh)
-                    band_ma = src.read(
-                        1, window=window, out_dtype=np.float32, masked=True,
-                    )
-                    arr = np.ma.getdata(band_ma).astype(np.float32, copy=True)
-                    wmask = np.ma.getmaskarray(band_ma) | ~np.isfinite(arr)
-                    for v in extra_nodata:
-                        wmask = wmask | (arr == np.float32(v))
-                    # Normalise every NoData cell to NaN up front, so finite
-                    # sentinels (e.g. -9999) are handled identically to declared
-                    # NoData regardless of fill mode (the fill step below then
-                    # overwrites only the cells it is meant to fill).
-                    if wmask.any():
-                        arr = np.where(wmask, np.float32(np.nan), arr).astype(np.float32)
+        common = dict(
+            width=width, height=height, band_rows=band_rows, ch=ch, cw=cw,
+            do_fill=do_fill, surface=surface, exterior_coarse=exterior_coarse,
+            extra_nodata=extra_nodata, fill_mode=fill_mode, out_nodata=out_nodata,
+            out_path=out_path, block_size=block_size,
+            overview_count=overview_count, zstd_level=zstd_level,
+        )
 
-                    if do_fill and wmask.any():
-                        # Sample the global coarse surface at this band's pixel
-                        # centres (bilinear) -- seamless across bands.
-                        fill_vals, ext = _sample_coarse(
-                            surface, exterior_coarse, row, bh, width, height, ch, cw,
-                        )
-                        if fill_mode == "enclosed":
-                            fill_here = wmask & ~ext
-                        else:  # all
-                            fill_here = wmask
-                        arr = np.where(fill_here, fill_vals, arr).astype(np.float32)
+        # The per-band fill is embarrassingly parallel across horizontal strips.
+        # The serial Python loop is single-threaded and CPU-bound -- it leaves a
+        # multi-core box almost entirely idle -- so for large rasters we fan the
+        # strips out to worker processes (each writes its own GeoTIFF), mosaic
+        # them with a VRT, and run a single multi-threaded COG translate.
+        #
+        # Size the pool to the *container's* CPU budget, not os.cpu_count():
+        # under a CFS quota (RunPod/Colab/k8s) the host may show 64 cores while
+        # the container is throttled to ~7.  Spawning 32 workers there just
+        # oversubscribes the quota -- dozens of runnable processes thrash a
+        # handful of effective cores and run slower than a right-sized pool.
+        n_bands_total = math.ceil(height / band_rows)
+        cpu_budget = container_cpu_count()
+        if max_workers is None:
+            n_workers = min(cpu_budget, n_bands_total)
+        else:
+            n_workers = max(1, min(int(max_workers), n_bands_total))
+        logger.info(
+            "Container CPU budget: %d cores (host reports %d); fill workers: %d",
+            cpu_budget, os.cpu_count() or 1, n_workers,
+        )
 
-                    if out_nodata is None:
-                        # 'all' mode must be fully dense; replace any residual NaN.
-                        if not np.isfinite(arr).all():
-                            arr = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
-                    else:
-                        # Remaining masked cells become the NaN nodata sentinel.
-                        arr = np.where(np.isfinite(arr), arr, np.float32(np.nan))
-
-                    dst.write(arr, 1, window=window)
-
-            # ---- 3) Convert the temp GeoTIFF into the final COG ------------
-            _translate_to_cog(
-                tmp_tiff, out_path,
-                block_size=block_size,
-                overview_count=overview_count, zstd_level=zstd_level,
-                num_threads=num_threads,
+        if n_workers <= 1:
+            _stream_fill_serial(src, tmp_parent, base_profile, num_threads, **common)
+        else:
+            _stream_fill_parallel(
+                in_path, tmp_parent, base_profile, num_threads,
+                n_workers=n_workers, n_bands_total=n_bands_total, **common,
             )
-        finally:
-            tmp_tiff.unlink(missing_ok=True)
 
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
     logger.info("[OK] COG written: %s (%.1f MB, fill=%s)", out_path, size_mb, fill_mode)
@@ -592,3 +591,238 @@ def _sample_coarse(
             exterior_coarse.astype(np.float32), coords, order=1, mode="nearest"
         ) > 0.5
     return fill_vals, ext
+
+
+def _apply_band_fill(
+    band_ma,
+    *,
+    row_off: int,
+    bh: int,
+    width: int,
+    height: int,
+    ch: int,
+    cw: int,
+    do_fill: bool,
+    surface,
+    exterior_coarse,
+    extra_nodata: list,
+    fill_mode: str,
+    out_nodata: Optional[float],
+) -> np.ndarray:
+    """NoData-normalise (and optionally fill) one full-width row band.
+
+    The single source of truth for the per-band maths so the serial and parallel
+    streaming paths produce identical pixels.  ``row_off`` is the band's offset in
+    the *global* grid, so the coarse fill is sampled at the same positions in both
+    paths and across strip boundaries (seamless).
+    """
+    arr = np.ma.getdata(band_ma).astype(np.float32, copy=True)
+    wmask = np.ma.getmaskarray(band_ma) | ~np.isfinite(arr)
+    for v in extra_nodata:
+        wmask = wmask | (arr == np.float32(v))
+    # Normalise every NoData cell to NaN up front, so finite sentinels (e.g.
+    # -9999) are handled identically to declared NoData regardless of fill mode
+    # (the fill step below then overwrites only the cells it is meant to fill).
+    if wmask.any():
+        arr = np.where(wmask, np.float32(np.nan), arr).astype(np.float32)
+
+    if do_fill and wmask.any():
+        # Sample the global coarse surface at this band's pixel centres
+        # (bilinear) -- seamless across bands.
+        fill_vals, ext = _sample_coarse(
+            surface, exterior_coarse, row_off, bh, width, height, ch, cw,
+        )
+        if fill_mode == "enclosed":
+            fill_here = wmask & ~ext
+        else:  # all
+            fill_here = wmask
+        arr = np.where(fill_here, fill_vals, arr).astype(np.float32)
+
+    if out_nodata is None:
+        # 'all' mode must be fully dense; replace any residual NaN.
+        if not np.isfinite(arr).all():
+            arr = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
+    else:
+        # Remaining masked cells become the NaN nodata sentinel.
+        arr = np.where(np.isfinite(arr), arr, np.float32(np.nan))
+    return arr
+
+
+def _stream_fill_serial(
+    src,
+    tmp_parent: Path,
+    base_profile: dict,
+    num_threads: str,
+    *,
+    width: int,
+    height: int,
+    band_rows: int,
+    ch: int,
+    cw: int,
+    do_fill: bool,
+    surface,
+    exterior_coarse,
+    extra_nodata: list,
+    fill_mode: str,
+    out_nodata: Optional[float],
+    out_path: Path,
+    block_size: int,
+    overview_count: int,
+    zstd_level: int,
+) -> None:
+    """Single-process streaming: one temp GeoTIFF, then translate to COG."""
+    profile = dict(base_profile)
+    profile["num_threads"] = num_threads
+    fd, tmp_name = tempfile.mkstemp(suffix=".tmp.tif", dir=str(tmp_parent))
+    os.close(fd)
+    tmp_tiff = Path(tmp_name)
+    try:
+        with rasterio.open(tmp_tiff, "w", **profile) as dst:
+            for row in range(0, height, band_rows):
+                bh = min(band_rows, height - row)
+                band_ma = src.read(
+                    1, window=Window(0, row, width, bh),
+                    out_dtype=np.float32, masked=True,
+                )
+                arr = _apply_band_fill(
+                    band_ma, row_off=row, bh=bh, width=width, height=height,
+                    ch=ch, cw=cw, do_fill=do_fill, surface=surface,
+                    exterior_coarse=exterior_coarse, extra_nodata=extra_nodata,
+                    fill_mode=fill_mode, out_nodata=out_nodata,
+                )
+                dst.write(arr, 1, window=Window(0, row, width, bh))
+        _translate_to_cog(
+            tmp_tiff, out_path, block_size=block_size,
+            overview_count=overview_count, zstd_level=zstd_level,
+            num_threads=num_threads,
+        )
+    finally:
+        tmp_tiff.unlink(missing_ok=True)
+
+
+def _process_strip(task: tuple) -> str:
+    """Worker process: fill one horizontal strip into its own GeoTIFF.
+
+    Runs in a separate process, so it opens an independent input handle and
+    writes a standalone strip; the parent mosaics the strips via a VRT.  Returns
+    the strip path.
+    """
+    (in_path, strip_path, strip_start, strip_h, width, height, band_rows,
+     ch, cw, surface, exterior_coarse, extra_nodata, do_fill, fill_mode,
+     out_nodata, strip_profile, gdal_cachemax_mb) = task
+
+    profile = dict(strip_profile)
+    profile["height"] = strip_h
+    profile["transform"] = rio_window_transform(
+        Window(0, strip_start, width, strip_h), strip_profile["transform"],
+    )
+    # Bound this worker's GDAL block cache (process-wide; SetCacheMax takes
+    # effect immediately, unlike the GDAL_CACHEMAX config option which is only
+    # read when the cache is first created).  Keeps N workers within the cgroup.
+    gdal.SetCacheMax(int(gdal_cachemax_mb) * 1024 * 1024)
+    with rasterio.open(in_path) as src, \
+            rasterio.open(strip_path, "w", **profile) as dst:
+        for r in range(strip_start, strip_start + strip_h, band_rows):
+            bh = min(band_rows, strip_start + strip_h - r)
+            band_ma = src.read(
+                1, window=Window(0, r, width, bh),
+                out_dtype=np.float32, masked=True,
+            )
+            arr = _apply_band_fill(
+                band_ma, row_off=r, bh=bh, width=width, height=height,
+                ch=ch, cw=cw, do_fill=do_fill, surface=surface,
+                exterior_coarse=exterior_coarse, extra_nodata=extra_nodata,
+                fill_mode=fill_mode, out_nodata=out_nodata,
+            )
+            dst.write(arr, 1, window=Window(0, r - strip_start, width, bh))
+    return strip_path
+
+
+def _stream_fill_parallel(
+    in_path: Path,
+    tmp_parent: Path,
+    base_profile: dict,
+    num_threads: str,
+    *,
+    n_workers: int,
+    n_bands_total: int,
+    width: int,
+    height: int,
+    band_rows: int,
+    ch: int,
+    cw: int,
+    do_fill: bool,
+    surface,
+    exterior_coarse,
+    extra_nodata: list,
+    fill_mode: str,
+    out_nodata: Optional[float],
+    out_path: Path,
+    block_size: int,
+    overview_count: int,
+    zstd_level: int,
+) -> None:
+    """Multi-process streaming: per-strip GeoTIFFs -> VRT mosaic -> one COG translate."""
+    # Cut MORE strips than workers so the pool load-balances dynamically.  Work
+    # per row is very uneven -- ocean/NoData strips compress fast and finish
+    # early, terrain strips are 3x heavier -- so equal-sized strips per worker
+    # leave fast workers idle while a few heavy ones grind out the tail (only
+    # ~2/7 cores busy near the end).  Many small strips let an idle worker steal
+    # the next queued strip, keeping every core busy until the very end.
+    n_strips = min(n_bands_total, max(n_workers, n_workers * STRIPS_PER_WORKER))
+    bands_per_strip = math.ceil(n_bands_total / n_strips)
+    # Strip writes are single-threaded (process-level parallelism already
+    # saturates the cores); ALL_CPUS is reserved for the final COG translate.
+    strip_profile = dict(base_profile)
+    strip_profile["num_threads"] = "1"
+    # Per-worker GDAL block cache, bounded by ~40% of container-available RAM so
+    # the pool stays within the cgroup cap (default GDAL cache would be sized
+    # from host RAM and N workers could together exceed the container limit).
+    cache_budget_mb = int(container_memory_available_gb() * 1024 * 0.4)
+    gdal_cachemax_mb = max(512, min(2048, cache_budget_mb // max(1, n_workers)))
+
+    tasks = []
+    strip_paths: list[Path] = []
+    si = 0
+    for strip_start in range(0, height, bands_per_strip * band_rows):
+        strip_h = min(bands_per_strip * band_rows, height - strip_start)
+        fd, sp = tempfile.mkstemp(suffix=f".strip{si:04d}.tif", dir=str(tmp_parent))
+        os.close(fd)
+        strip_paths.append(Path(sp))
+        tasks.append((
+            str(in_path), sp, strip_start, strip_h, width, height, band_rows,
+            ch, cw, surface, exterior_coarse, extra_nodata, do_fill, fill_mode,
+            out_nodata, strip_profile, gdal_cachemax_mb,
+        ))
+        si += 1
+
+    vrt_path: Optional[Path] = None
+    try:
+        logger.info(
+            "Parallel fill: %d strips (~%d rows each) across %d worker processes "
+            "(GDAL cache %dMB/worker)",
+            len(tasks), bands_per_strip * band_rows, n_workers, gdal_cachemax_mb,
+        )
+        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+            futures = [ex.submit(_process_strip, t) for t in tasks]
+            for fut in as_completed(futures):
+                fut.result()  # re-raise any worker exception
+
+        vrt_path = Path(
+            tempfile.mkstemp(suffix=".mosaic.vrt", dir=str(tmp_parent))[1]
+        )
+        vrt = gdal.BuildVRT(str(vrt_path), [str(p) for p in strip_paths])
+        if vrt is None:
+            raise RuntimeError("BuildVRT failed to mosaic fill strips.")
+        vrt = None  # flush/close
+
+        _translate_to_cog(
+            vrt_path, out_path, block_size=block_size,
+            overview_count=overview_count, zstd_level=zstd_level,
+            num_threads=num_threads,
+        )
+    finally:
+        for p in strip_paths:
+            p.unlink(missing_ok=True)
+        if vrt_path is not None:
+            vrt_path.unlink(missing_ok=True)
