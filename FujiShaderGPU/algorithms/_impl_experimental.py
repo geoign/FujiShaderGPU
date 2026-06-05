@@ -7,11 +7,12 @@ Experimental algorithm implementations:
 Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
+import logging
 from typing import List
 import cupy as cp
 import dask.array as da
 
-from ._base import DaskAlgorithm
+from ._base import DaskAlgorithm, Constants
 from ._global_stats import compute_global_stats
 from ._nan_utils import (
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
@@ -23,6 +24,8 @@ from .common.kernels import (
     scale_space_surprise as kernel_scale_space_surprise,
     multi_light_uncertainty as kernel_multi_light_uncertainty,
 )
+
+logger = logging.getLogger(__name__)
 
 ###############################################################################
 # Scale-Space Surprise
@@ -77,10 +80,21 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
         normalize = bool(params.get('normalize', True))
         # 4-sigma Gaussian kernel needs ~4*max_scale of halo for a seam-free
         # core (was 3-sigma, which left a slight tile-boundary discontinuity).
-        depth = int(max(1, cp.ceil(max(scales) * 4).item())) + 1
-        # map_overlap reflect cannot use a halo >= the array size; clamp for
-        # small inputs (large rasters keep the full 4-sigma halo).
-        depth = max(1, min(depth, int(min(gpu_arr.shape)) - 1))
+        seamless_depth = int(max(1, cp.ceil(max(scales) * 4).item())) + 1
+        # Bound the halo: a depth approaching/exceeding the chunk size forces
+        # dask to rechunk-merge whole strips of chunks together, which exhausts
+        # VRAM on big rasters with large --radii (the RMM-pool OOM).  Cap at
+        # MAX_DEPTH like the other multi-scale algorithms and below the chunk;
+        # scales beyond the cap are approximated (truncated halo) instead of
+        # crashing the run.
+        chunk_cap = int(min(gpu_arr.chunksize)) - 1 if hasattr(gpu_arr, "chunksize") else seamless_depth
+        depth = max(1, min(seamless_depth, Constants.MAX_DEPTH, int(min(gpu_arr.shape)) - 1, chunk_cap))
+        if seamless_depth > depth:
+            logger.warning(
+                "scale_space_surprise: max scale %.0f needs a %d-px halo (> cap %d); "
+                "very large radii are approximated to stay within memory.",
+                float(max(scales)), seamless_depth, depth,
+            )
         stats = params.get('global_stats', None)
         stats_ok = isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9
         if normalize and not stats_ok:

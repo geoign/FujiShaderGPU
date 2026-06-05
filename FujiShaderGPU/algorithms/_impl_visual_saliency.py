@@ -5,16 +5,19 @@ Visual Saliency algorithm implementation.
 Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
+import logging
 from typing import List, Tuple
 import cupy as cp
 import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
-from ._base import DaskAlgorithm
+from ._base import DaskAlgorithm, Constants
 from ._nan_utils import restore_nan, resolve_block_weights
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
+
+logger = logging.getLogger(__name__)
 
 
 def _weighted_mean_maps(maps, weights, ref):
@@ -132,6 +135,20 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         scales = [float(r) for r in radii] if radii else params.get('scales', [2, 4, 8, 16])
         weights = params.get('weights', None)
         max_scale = max(scales)
+        # Bound the conspicuity halo: a depth approaching/exceeding the chunk size
+        # forces dask to rechunk-merge strips of chunks, exhausting VRAM on big
+        # rasters with large --radii (RMM-pool OOM).  Cap at MAX_DEPTH (like the
+        # other multi-scale algorithms) and below the chunk; larger scales are
+        # approximated (truncated halo) rather than crashing.
+        seamless_depth = int(max_scale * 5)
+        chunk_cap = int(min(gpu_arr.chunksize)) - 1 if hasattr(gpu_arr, "chunksize") else seamless_depth
+        depth = max(1, min(seamless_depth, Constants.MAX_DEPTH, chunk_cap))
+        if seamless_depth > depth:
+            logger.warning(
+                "visual_saliency: max scale %.0f needs a %d-px halo (> cap %d); "
+                "very large radii are approximated to stay within memory.",
+                float(max_scale), seamless_depth, depth,
+            )
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
@@ -148,13 +165,13 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
                      'pixel_scale_y': pixel_scale_y, 'normalize': False,
                      'weights': weights},
                     downsample_factor=params.get('downsample_factor', None),
-                    depth=int(max_scale * 5))
+                    depth=depth)
             else:
                 stats = (0.0, 1.0)
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
             stats = (0.0, 1.0)
         return gpu_arr.map_overlap(
-            compute_visual_saliency_block, depth=int(max_scale * 5),
+            compute_visual_saliency_block, depth=depth,
             boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             scales=scales, pixel_size=pixel_size,

@@ -5,16 +5,19 @@ Fractal Anomaly algorithm implementation.
 Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
+import logging
 from typing import List, Tuple
 import cupy as cp
 import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, median_filter
 
-from ._base import DaskAlgorithm, classify_resolution
+from ._base import DaskAlgorithm, classify_resolution, Constants
 from ._nan_utils import handle_nan_with_gaussian, restore_nan, resolve_block_weights
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
+
+logger = logging.getLogger(__name__)
 
 
 def compute_roughness_multiscale(block, radii, window_mult=3, detrend=True):
@@ -166,7 +169,20 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         # 4-sigma kernel needs ~2r of halo.  The extra +16 covers the feature
         # smoothing (smoothing_sigma) and the size-3 median.  The previous 3r
         # read ~1.5x more halo than required (core results unchanged).
-        depth = max_r * 2 + 16
+        seamless_depth = max_r * 2 + 16
+        # Bound the halo: a depth approaching/exceeding the chunk size forces dask
+        # to rechunk-merge strips of chunks, exhausting VRAM on big rasters with
+        # large --radii (RMM-pool OOM).  Cap at MAX_DEPTH (like the other
+        # multi-scale algorithms) and below the chunk; larger radii are
+        # approximated (truncated halo) rather than crashing.
+        chunk_cap = int(min(gpu_arr.chunksize)) - 1 if hasattr(gpu_arr, "chunksize") else seamless_depth
+        depth = max(1, min(seamless_depth, Constants.MAX_DEPTH, chunk_cap))
+        if seamless_depth > depth:
+            logger.warning(
+                "fractal_anomaly: max radius %.0f needs a %d-px halo (> cap %d); "
+                "very large radii are approximated to stay within memory.",
+                float(max_r), seamless_depth, depth,
+            )
         stats = params.get('global_stats', None)
         stats_ok = (isinstance(stats, (tuple, list)) and len(stats) >= 2
                      and float(stats[1]) > 1e-9)
