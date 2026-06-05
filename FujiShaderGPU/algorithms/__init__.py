@@ -22,7 +22,6 @@ try:
     from .tile.visual_saliency import VisualSaliencyAlgorithm  # noqa: F401
     from .tile.npr_edges import NPREdgesAlgorithm  # noqa: F401
     from .tile.ambient_occlusion import AmbientOcclusionAlgorithm  # noqa: F401
-    from .tile.lrm import LRMAlgorithm  # noqa: F401
     from .tile.openness import OpennessAlgorithm  # noqa: F401
     from .tile.fractal_anomaly import FractalAnomalyAlgorithm  # noqa: F401
     from .tile.scale_space_surprise import ScaleSpaceSurpriseAlgorithm  # noqa: F401
@@ -40,7 +39,6 @@ try:
         "VisualSaliencyAlgorithm",
         "NPREdgesAlgorithm",
         "AmbientOcclusionAlgorithm",
-        "LRMAlgorithm",
         "OpennessAlgorithm",
         "FractalAnomalyAlgorithm",
         "ScaleSpaceSurpriseAlgorithm",

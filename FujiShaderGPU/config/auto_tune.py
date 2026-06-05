@@ -20,7 +20,6 @@ ALGORITHM_COMPLEXITY: Dict[str, float] = {
     "slope": 0.8,
     "atmospheric_scattering": 0.9,
     "curvature": 1.0,
-    "lrm": 1.1,
     "npr_edges": 1.1,
     "rvi": 1.2,
     "visual_saliency": 1.4,

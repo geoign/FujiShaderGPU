@@ -71,6 +71,5 @@ algorithm_complexity:
   visual_saliency: 1.4
   npr_edges: 1.1
   ambient_occlusion: 2.0
-  lrm: 1.1
   openness: 1.8
   fractal_anomaly: 1.6

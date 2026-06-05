@@ -12,7 +12,6 @@ from .dask.curvature import CurvatureAlgorithm
 from .dask.visual_saliency import VisualSaliencyAlgorithm
 from .dask.npr_edges import NPREdgesAlgorithm
 from .dask.ambient_occlusion import AmbientOcclusionAlgorithm
-from .dask.lrm import LRMAlgorithm
 from .dask.openness import OpennessAlgorithm
 from .dask.fractal_anomaly import FractalAnomalyAlgorithm
 from .dask.scale_space_surprise import ScaleSpaceSurpriseAlgorithm
@@ -29,7 +28,6 @@ ALGORITHMS = {
     'visual_saliency': VisualSaliencyAlgorithm(),
     'npr_edges': NPREdgesAlgorithm(),
     'ambient_occlusion': AmbientOcclusionAlgorithm(),
-    'lrm': LRMAlgorithm(),
     'openness': OpennessAlgorithm(),
     'fractal_anomaly': FractalAnomalyAlgorithm(),
     'scale_space_surprise': ScaleSpaceSurpriseAlgorithm(),

@@ -56,7 +56,6 @@ def determine_optimal_downsample_factor(
             'visual_saliency': 1.4,        # multiscale feature extraction
             'npr_edges': 1.1,              # edge detection
             'ambient_occlusion': 2.0,      # most expensive
-            'lrm': 1.1,                    # Gaussian filter
             'openness': 1.8,               # multi-direction search
             'fractal_anomaly': 1.6,        # multiscale regression
         }

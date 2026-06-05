@@ -346,25 +346,6 @@ def _direct_npr_edges(block, params):
     )
 
 
-def _direct_lrm(block, params):
-    from .._impl_lrm import compute_lrm_block
-    from .._normalization import lrm_stat_func
-
-    kernel_size = params.get("kernel_size", 25)
-    stats = params.get("global_stats", None)
-    stats_ok = (
-        isinstance(stats, (tuple, list)) and len(stats) >= 1 and float(stats[0]) > 1e-9
-    )
-    scale = float(stats[0]) if stats_ok else float(lrm_stat_func(
-        compute_lrm_block(block, kernel_size=kernel_size, normalize=False)
-    )[0])
-    if not np.isfinite(scale) or scale <= 1e-9:
-        scale = 1.0
-    return compute_lrm_block(
-        block, kernel_size=kernel_size, std_global=scale, normalize=True,
-    )
-
-
 def _direct_visual_saliency(block, params):
     from .._impl_visual_saliency import compute_visual_saliency_block, visual_saliency_stat_func
 
@@ -489,8 +470,6 @@ def _process_direct(algo, class_name, dem_gpu, params):
         return _direct_rvi(dem_gpu, p, algo)
     if class_name == "NPREdgesAlgorithm":
         return _direct_npr_edges(dem_gpu, p)
-    if class_name == "LRMAlgorithm":
-        return _direct_lrm(dem_gpu, p)
     if class_name == "VisualSaliencyAlgorithm":
         return _direct_visual_saliency(dem_gpu, p)
     if class_name == "MultiscaleDaskAlgorithm":

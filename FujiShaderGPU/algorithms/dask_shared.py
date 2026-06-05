@@ -9,7 +9,7 @@ Phase 2: six large algorithms (_impl_rvi, _impl_npr_edges,
          _impl_ambient_occlusion, _impl_openness, _impl_specular,
          _impl_fractal_anomaly)
 Phase 3: remaining eight algorithms (_impl_hillshade, _impl_slope,
-         _impl_visual_saliency, _impl_lrm, _impl_atmospheric_scattering,
+         _impl_visual_saliency, _impl_atmospheric_scattering,
          _impl_multiscale_terrain,
          _impl_curvature, _impl_experimental)
 """
@@ -120,9 +120,6 @@ from ._impl_visual_saliency import (
     compute_visual_saliency_block, VisualSaliencyAlgorithm,
 )
 
-# --- _impl_lrm.py ---
-from ._impl_lrm import compute_lrm_block, LRMAlgorithm
-
 # --- _impl_atmospheric_scattering.py ---
 from ._impl_atmospheric_scattering import (
     compute_atmospheric_scattering_block,
@@ -160,7 +157,6 @@ ALGORITHMS = {
     'visual_saliency': VisualSaliencyAlgorithm(),
     'npr_edges': NPREdgesAlgorithm(),
     'ambient_occlusion': AmbientOcclusionAlgorithm(),
-    'lrm': LRMAlgorithm(),
     'openness': OpennessAlgorithm(),
     'fractal_anomaly': FractalAnomalyAlgorithm(),
     'scale_space_surprise': ScaleSpaceSurpriseAlgorithm(),

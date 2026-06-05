@@ -8,7 +8,7 @@ the result can optionally be quantized to a compact integer COG:
 - Integer encodings reserve **0 for NoData**.  The data->DN mapping depends on
   whether the algorithm's range is signed (straddles 0) or unsigned:
     * unsigned (e.g. slope 0..90, AO 0..1): data occupies ``[1, MAX]``.
-    * signed (e.g. RVI -3..3, LRM -1.5..1.5):
+    * signed (e.g. RVI -3..3, fractal_anomaly):
         - ``int16`` uses the full symmetric range ``[-MAX, +MAX]`` so both signs
           get maximum tonal resolution; ``DN = 0`` (== value ~0, i.e. flat ground)
           doubles as NoData -- visually negligible since it is the flat midtone.
@@ -37,7 +37,6 @@ _NORM_HEADROOM = 1.176
 OUTPUT_VALUE_RANGES: Dict[str, Tuple[float, float]] = {
     # Signed, normalized to +/-1 with int headroom.
     "rvi": (-_NORM_HEADROOM, _NORM_HEADROOM),
-    "lrm": (-_NORM_HEADROOM, _NORM_HEADROOM),
     "fractal_anomaly": (-_NORM_HEADROOM, _NORM_HEADROOM),
     # Unsigned [0, 1], physically bounded -- left at native range (no pre-stat).
     "hillshade": (0.0, 1.0),

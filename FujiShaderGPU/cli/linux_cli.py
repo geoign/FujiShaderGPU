@@ -180,14 +180,6 @@ writes them out as Cloud-Optimized GeoTIFF."""
             help="Analysis radius (pixels, default: 10)"
         )
         
-        # LRM-specific
-        parser.add_argument(
-            "--kernel-size",
-            type=int,
-            default=25,
-            help="Kernel size for trend removal (default: 25)"
-        )
-        
         # Openness-specific
         parser.add_argument(
             "--openness-type",
@@ -623,11 +615,6 @@ writes them out as Cloud-Optimized GeoTIFF."""
             if hasattr(args, 'curvature_type'):
                 algo_params['curvature_type'] = args.curvature_type
 
-        # LRM-specific
-        elif args.algorithm == 'lrm':
-            if hasattr(args, 'kernel_size'):
-                algo_params['kernel_size'] = args.kernel_size
-
         # Openness-specific
         elif args.algorithm == 'openness':
             if hasattr(args, 'radius'):
@@ -729,6 +716,8 @@ writes them out as Cloud-Optimized GeoTIFF."""
             "visual_saliency",
             "scale_space_surprise",
             "fractal_anomaly",
+            # npr_edges spatial = outlines at multiple smoothing scales.
+            "npr_edges",
         }
         if args.algorithm in spatial_mode_algorithms:
             algo_params['mode'] = getattr(args, 'mode', 'local')

@@ -10,7 +10,12 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter, convolve, binary_dilation
 
 from ._base import Constants, DaskAlgorithm, classify_resolution
-from ._nan_utils import restore_nan
+from ._nan_utils import (
+    restore_nan,
+    _resolve_spatial_radii_weights, _combine_multiscale_dask,
+    large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
+    _smooth_for_radius,
+)
 
 
 def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
@@ -152,6 +157,17 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     return result.astype(cp.float32)
 
 
+def compute_npr_edges_spatial_block(block, *, edge_sigma=1.0, threshold_low=0.1,
+                                    threshold_high=0.3, pixel_size=1.0,
+                                    pixel_scale_x=None, pixel_scale_y=None,
+                                    radius=4.0):
+    """Edges of the terrain viewed at a given spatial scale (DEM pre-smoothed)."""
+    smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="npr_edges")
+    return compute_npr_edges_block(
+        smoothed, edge_sigma=edge_sigma, threshold_low=threshold_low,
+        threshold_high=threshold_high, pixel_size=pixel_size)
+
+
 class NPREdgesAlgorithm(DaskAlgorithm):
     """NPR outline algorithm (simplified)."""
 
@@ -160,6 +176,41 @@ class NPREdgesAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
         threshold_low = params.get('threshold_low', 0.1)
         threshold_high = params.get('threshold_high', 0.3)
+        psx = params.get('pixel_scale_x', None)
+        psy = params.get('pixel_scale_y', None)
+        mode = str(params.get("mode", "local")).lower()
+        radii, weights = _resolve_spatial_radii_weights(
+            params.get("radii"), params.get("weights", None), pixel_size)
+        agg = params.get("agg", "mean")
+
+        if mode == "spatial":
+            # Outlines at multiple scales: pre-smooth the DEM at each radius,
+            # detect edges, weighted-combine (large radii via the coarse path).
+            is_geo = bool(params.get("is_geographic_dem", False))
+            thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
+            F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1
+            _depth = lambda rr: max(3, int(float(rr) * 2 + 1))
+            cache = {}
+            responses = []
+            for radius in radii:
+                if F > 1 and int(round(float(radius))) > thr:
+                    responses.append(coarse_large_radius_response(
+                        gpu_arr, block_fn=compute_npr_edges_spatial_block,
+                        radius_kw="radius", radius=float(radius), factor=F,
+                        depth_for_radius=_depth, pixel_size=pixel_size,
+                        pixel_scale_x=psx, pixel_scale_y=psy, coarse_cache=cache,
+                        edge_sigma=edge_sigma, threshold_low=threshold_low,
+                        threshold_high=threshold_high,
+                    ))
+                else:
+                    responses.append(gpu_arr.map_overlap(
+                        compute_npr_edges_spatial_block, depth=_depth(radius),
+                        boundary="reflect", dtype=cp.float32,
+                        meta=cp.empty((0, 0), dtype=cp.float32),
+                        edge_sigma=edge_sigma, threshold_low=threshold_low,
+                        threshold_high=threshold_high, pixel_size=pixel_size,
+                        pixel_scale_x=psx, pixel_scale_y=psy, radius=float(radius)))
+            return _combine_multiscale_dask(responses, weights=weights, agg=agg)
 
         depth = 3
         if edge_sigma != 1.0:
@@ -182,11 +233,13 @@ class NPREdgesAlgorithm(DaskAlgorithm):
             'edge_sigma': 1.0,
             'threshold_low': 0.1,
             'threshold_high': 0.3,
-            'pixel_size': 1.0
+            'pixel_size': 1.0,
+            'mode': 'local', 'radii': None, 'weights': None,
         }
 
 
 __all__ = [
     "compute_npr_edges_block",
+    "compute_npr_edges_spatial_block",
     "NPREdgesAlgorithm",
 ]

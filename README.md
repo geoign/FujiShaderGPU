@@ -128,14 +128,14 @@ fujishadergpu in.tif out_slope.tif --algorithm slope --output-dtype int16 --outp
 
 - `--output-dtype {float32,int16,uint8}` (default `float32`, unchanged behavior).
 - **NoData = 0** for both integer types; valid data is stretched to fill the
-  remaining codes for maximum tonal resolution. Normalized algorithms (RVI, LRM,
+  remaining codes for maximum tonal resolution. Normalized algorithms (RVI,
   fractal_anomaly, visual_saliency, scale_space_surprise, multiscale_terrain) map
   their robust **p99** value to display magnitude `1` via an overview pre-pass, so
   float32 lands in `-1..1` (signed) / `0..1` (unsigned); physical maps keep their
   native range (slope `0..90`, hillshade/AO/openness `0..1`). int16/uint8 reserve
   a little headroom (value `±1` → ~85% of the code range) so the unclipped tail is
   preserved. Override with `--output-range lo,hi`.
-- Signed outputs (RVI / LRM / fractal_anomaly): `int16` uses the full symmetric
+- Signed outputs (RVI / fractal_anomaly): `int16` uses the full symmetric
   `[-32767, +32767]` (DN 0 = value ~0 = flat ground, doubling as NoData — visually
   negligible); `uint8` centers value 0 at `128`.
 - GDAL `scale`/`offset` are recorded so the physical value is recoverable
@@ -157,7 +157,6 @@ Current Dask algorithms:
 - `visual_saliency`
 - `npr_edges`
 - `ambient_occlusion`
-- `lrm`
 - `openness`
 - `fractal_anomaly`
 - `scale_space_surprise`
@@ -175,7 +174,6 @@ Windows/macOS tile path uses the same canonical algorithm names as Dask:
 - `visual_saliency`
 - `npr_edges`
 - `ambient_occlusion`
-- `lrm`
 - `openness`
 - `fractal_anomaly`
 - `scale_space_surprise`

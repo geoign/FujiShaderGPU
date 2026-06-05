@@ -1087,7 +1087,6 @@ def _compute_rvi_overview_coarse_field(
 # the run's params, filtered to the block's signature).
 _NORM_STAT_SPECS = {
     "rvi": ("_impl_rvi", "compute_rvi_efficient_block", "rvi_stat_func"),
-    "lrm": ("_impl_lrm", "compute_lrm_block", "lrm_stat_func"),
     "fractal_anomaly": ("_impl_fractal_anomaly",
                         "compute_fractal_dimension_block", "fractal_stat_func"),
     "scale_space_surprise": ("_impl_experimental",
@@ -1637,7 +1636,7 @@ def run_pipeline(
                 "unit": unit,
                 "data_type": "float32"
             }
-        elif algorithm in ['lrm', 'rvi', 'fractal_anomaly']:
+        elif algorithm in ['rvi', 'fractal_anomaly']:
             # Signed terrain anomaly outputs map p80(abs(value)) to +/-1,
             # with overflow preserved for strong extrema.
             attrs = {

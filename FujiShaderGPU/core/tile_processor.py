@@ -55,7 +55,6 @@ DEFAULT_ALGORITHMS = {
     "visual_saliency": "VisualSaliencyAlgorithm",
     "npr_edges": "NPREdgesAlgorithm",
     "ambient_occlusion": "AmbientOcclusionAlgorithm",
-    "lrm": "LRMAlgorithm",
     "openness": "OpennessAlgorithm",
     "fractal_anomaly": "FractalAnomalyAlgorithm",
     "scale_space_surprise": "ScaleSpaceSurpriseAlgorithm",
@@ -66,11 +65,10 @@ GLOBAL_STATS_NATIVE_ALGOS = {
     "rvi",
     "multiscale_terrain",
     "visual_saliency",
-    "lrm",
     "fractal_anomaly",
 }
 NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges"}
-SIGNED_NORMALIZATION_ALGOS = {"rvi", "lrm", "fractal_anomaly"}
+SIGNED_NORMALIZATION_ALGOS = {"rvi", "fractal_anomaly"}
 
 
 def _sanitize_spatial_radii_weights_for_tile(
@@ -847,58 +845,6 @@ def _compute_global_visual_saliency_stats(
         return (mn, scale)
     except Exception as exc:
         logger.warning(f"Failed to compute visual saliency global stats; fallback to per-tile stats: {exc}")
-        return None
-
-
-def _compute_global_lrm_scale(
-    input_cog_path: str,
-    nodata: Optional[float],
-    pixel_size: float,
-    kernel_size: int,
-    elevation_scale: float = 1.0,
-) -> Optional[Tuple[float]]:
-    """Estimate global robust LRM scale once."""
-    try:
-        from ..algorithms.dask_shared import compute_lrm_block, lrm_stat_func
-    except Exception as exc:
-        logger.warning(f"LRM global stats helpers unavailable: {exc}")
-        return None
-
-    try:
-        with rasterio.open(input_cog_path, "r") as src:
-            sample_max = 2048
-            scale_factor = max(src.width / sample_max, src.height / sample_max, 1.0)
-            sample_w = max(128, int(src.width / scale_factor))
-            sample_h = max(128, int(src.height / scale_factor))
-            sample_ma = src.read(
-                1,
-                out_shape=(sample_h, sample_w),
-                resampling=Resampling.nearest,
-                out_dtype=np.float32,
-                masked=True,
-            )
-            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
-
-        if nodata is not None:
-            sample = _replace_nodata_with_nan(sample, nodata)
-
-        sample_gpu = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
-        lrm_raw = compute_lrm_block(
-            sample_gpu,
-            kernel_size=max(3, int(kernel_size / max(scale_factor, 1.0))),
-            pixel_size=float(pixel_size * scale_factor),
-            std_global=None,
-            normalize=False,
-        )
-        stats = lrm_stat_func(lrm_raw)
-        if not stats:
-            return None
-        scale = float(stats[0])
-        if not np.isfinite(scale) or scale <= 0:
-            return None
-        return (scale,)
-    except Exception as exc:
-        logger.warning(f"Failed to compute global LRM stats; fallback to per-run stats: {exc}")
         return None
 
 
@@ -2013,20 +1959,6 @@ def process_dem_tiles(
                     logger.info(
                         "Visual saliency global normalization stats fixed for all tiles: "
                         f"min={global_vs_stats[0]:.6f}, p80_scale={global_vs_stats[1]:.6f}"
-                    )
-            elif algorithm == "lrm":
-                global_lrm_stats = _compute_global_lrm_scale(
-                    input_cog_path=input_cog_path,
-                    nodata=nodata,
-                    pixel_size=float(pixel_size),
-                    kernel_size=int(algo_params.get("kernel_size", 25)),
-                    elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
-                )
-                if global_lrm_stats is not None:
-                    algo_params["global_stats"] = global_lrm_stats
-                    logger.info(
-                        "LRM global normalization stats fixed for all tiles: "
-                        f"scale={global_lrm_stats[0]:.6f}"
                     )
             elif algorithm == "fractal_anomaly":
                 global_fractal_stats = _compute_global_fractal_stats(
