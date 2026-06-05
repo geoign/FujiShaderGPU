@@ -219,6 +219,12 @@ Run spatial-mode curvature (radius-integrated):
 fujishadergpu input.tif output.tif --algorithm curvature --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
 ```
 
+Run spatial-mode npr_edges (outlines at multiple smoothing scales):
+
+```bash
+fujishadergpu input.tif output.tif --algorithm npr_edges --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
+```
+
 Dask/Tile path RVI with explicit radii:
 
 ```bash
@@ -318,5 +324,6 @@ python -m pip check
   - `ambient_occlusion`
   - `openness`
   - `multi_light_uncertainty`
+  - `npr_edges`
   - `--mode local` (adjacent-pixel computation)
   - `--mode spatial --radii ... --weights ...` (multi-radius spatial integration)

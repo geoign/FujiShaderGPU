@@ -57,7 +57,6 @@ slow full-resolution reads).
   - `_impl_visual_saliency.py` — Visual Saliency
   - `_impl_npr_edges.py` — NPR Edges
   - `_impl_ambient_occlusion.py` — Ambient Occlusion
-  - `_impl_lrm.py` — LRM (Local Relief Model)
   - `_impl_openness.py` — Openness
   - `_impl_fractal_anomaly.py` — Fractal Anomaly
   - `_impl_experimental.py` — Scale-Space Surprise + Multi-Light Uncertainty
@@ -154,7 +153,6 @@ Registered in `algorithms/dask_registry.py` (and `dask_shared.py` ALGORITHMS):
 - `visual_saliency`
 - `npr_edges`
 - `ambient_occlusion`
-- `lrm`
 - `openness`
 - `fractal_anomaly`
 - `scale_space_surprise`
@@ -281,7 +279,7 @@ pytest -q -o addopts='' tests
 
 - Current structure treats modular algorithm files as canonical.
 - Algorithm implementations live in individual `_impl_*.py` modules; `dask_shared.py` is a thin re-export hub for backward compatibility.
-- `hillshade`, `slope`, `specular`, `atmospheric_scattering`, `curvature`, `ambient_occlusion`, `openness`, `multi_light_uncertainty` support unified local/spatial mode on both Dask and tile paths.
+- `hillshade`, `slope`, `specular`, `atmospheric_scattering`, `curvature`, `ambient_occlusion`, `openness`, `multi_light_uncertainty`, `npr_edges` support unified local/spatial mode (`npr_edges` spatial = outlines at multiple smoothing scales; tile path bridges via Dask-shared). Intrinsically multi-scale algorithms (`rvi`, `multiscale_terrain`, `visual_saliency`, `scale_space_surprise`, `fractal_anomaly`) consume the unified `--radii` as their scale set.
 
 ## 12. Dynamic GPU Optimization
 
@@ -316,12 +314,16 @@ Calibration anchors (derived from validated presets for known GPUs) are defined 
 ALGORITHM_COMPLEXITY = {
     "hillshade": 0.8,  "slope": 0.8,
     "atmospheric_scattering": 0.9,  "curvature": 1.0,
-    "lrm": 1.1,  "npr_edges": 1.1,  "rvi": 1.2,
-    "visual_saliency": 1.4,  "specular": 1.5,
+    "npr_edges": 1.1,  "rvi": 1.2,
+    "visual_saliency": 1.4,
     "multiscale_terrain": 1.5,  "fractal_anomaly": 1.6,
-    "openness": 1.8,  "ambient_occlusion": 2.0,
+    "openness": 1.8,  "ambient_occlusion": 2.0,  "specular": 2.0,
 }
 ```
+
+> `specular` was raised `1.5 → 2.0` so a single padded block (surface normals +
+> multiple filters, ~3× baseline per-pixel VRAM) stays within the RMM device pool
+> on small-but-large datasets; see `config/auto_tune.py`.
 
 - **chunk_size** is scaled by `1 / complexity^0.4` (complex algorithms get smaller chunks).
 - **Worker throttling** uses complexity in per-tile VRAM estimation.
@@ -509,7 +511,7 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
 ### 14.2 Encoding rules
 
 - **NoData = 0** for both integer types (NaN → 0).
-- Normalized algorithms (RVI, LRM, fractal_anomaly, visual_saliency,
+- Normalized algorithms (RVI, fractal_anomaly, visual_saliency,
   scale_space_surprise, multiscale_terrain) derive their display scale from a
   **full-extent overview pre-pass**: the algorithm runs on a decimated, whole-raster
   COG overview and its robust **p99** (`NORMAL_PERCENTILE`) sets the value mapped to
