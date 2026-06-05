@@ -24,7 +24,12 @@ ALGORITHM_COMPLEXITY: Dict[str, float] = {
     "npr_edges": 1.1,
     "rvi": 1.2,
     "visual_saliency": 1.4,
-    "specular": 1.5,
+    # specular is the heaviest spatial block: a single padded block peaks at
+    # ~3x the baseline per-pixel VRAM (surface normals + multiple filters).  At
+    # complexity 1.5 a small-but-large dataset (low data/VRAM ratio -> no extra
+    # shrink) got a 12k chunk whose block exhausted the RMM pool; 2.0 keeps it
+    # within the device pool.
+    "specular": 2.0,
     "multiscale_terrain": 1.5,
     "fractal_anomaly": 1.6,
     "openness": 1.8,

@@ -33,8 +33,17 @@ def compute_specular_block(block, *, roughness_scale=50.0, shininess=20.0,
     sign_y = 1.0 if (pixel_scale_y is None or float(pixel_scale_y) >= 0.0) else -1.0
     dz_d_east = dx * sign_x
     dz_d_north = dy * sign_y
-    normal = cp.stack([-dz_d_east, -dz_d_north, cp.ones_like(dx)], axis=-1)
-    normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
+    # Unit surface normal, kept as separate components instead of an (H, W, 3)
+    # stack: the stacked-and-normalised array (plus its division temporary)
+    # tripled peak VRAM on large chunks -- enough to exhaust the RMM pool on a
+    # 12k chunk.  The component form is algebraically identical.
+    inv_norm = cp.float32(1.0) / cp.sqrt(
+        dz_d_east * dz_d_east + dz_d_north * dz_d_north + cp.float32(1.0)
+    )
+    n_x = (-dz_d_east) * inv_norm
+    n_y = (-dz_d_north) * inv_norm
+    n_z = inv_norm
+    del dz_d_east, dz_d_north, inv_norm, dx, dy
     kernel_size = max(3, int(roughness_scale))
     if nan_mask.any():
         filled = cp.where(nan_mask, 0, block)
@@ -72,18 +81,18 @@ def compute_specular_block(block, *, roughness_scale=50.0, shininess=20.0,
     ])
     view_dir = cp.array([0, 0, 1])
     half_vec = (light_dir + view_dir) / cp.linalg.norm(light_dir + view_dir)
-    n_dot_h = cp.sum(normal * half_vec.reshape(1, 1, 3), axis=-1)
+    n_dot_h = n_x * half_vec[0] + n_y * half_vec[1] + n_z * half_vec[2]
     n_dot_h = cp.clip(n_dot_h, 0, 1)
     exponent = shininess * (1.0 - roughness * 0.8)
     specular = cp.power(n_dot_h, exponent)
     gloss_boost = 0.95 + 0.70 * (1.0 - roughness)
     specular = cp.clip(specular * gloss_boost, 0.0, 1.0)
-    n_dot_v = cp.clip(normal[..., 2], 0.0, 1.0)
+    n_dot_v = cp.clip(n_z, 0.0, 1.0)
     f0 = cp.float32(0.06)
     fresnel = f0 + (1.0 - f0) * cp.power(1.0 - n_dot_v, 5.0)
     specular = cp.clip(specular * (0.80 + 0.45 * fresnel), 0.0, 1.0)
     specular = specular / (1.0 + 0.35 * specular)
-    n_dot_l = cp.sum(normal * light_dir.reshape(1, 1, 3), axis=-1)
+    n_dot_l = n_x * light_dir[0] + n_y * light_dir[1] + n_z * light_dir[2]
     n_dot_l = cp.clip(n_dot_l, 0, 1)
     diffuse = n_dot_l * 0.28
     result = diffuse * 0.36 + specular * 0.64
