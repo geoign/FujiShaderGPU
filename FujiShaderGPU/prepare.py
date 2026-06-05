@@ -85,8 +85,9 @@ Examples:
         type=int,
         default=None,
         help=(
-            "Worker processes for the parallel fill/streaming pass "
-            "(default: auto = min(CPU count, 32)). Use 1 to force the serial path."
+            "Worker processes for the parallel fill/streaming pass (default: auto = "
+            "min(container CPU budget, band count); the container CPU budget is the "
+            "cgroup quota, not the host core count). Use 1 to force the serial path."
         ),
     )
     parser.add_argument(

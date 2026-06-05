@@ -57,8 +57,9 @@ writes them out as Cloud-Optimized GeoTIFF."""
         parser.add_argument(
             "--memory-fraction",
             type=float,
-            default=0.4,  # changed to a more conservative default
-            help="GPU memory fraction (default: 0.4)"  # help text also updated
+            default=None,
+            help="GPU device-memory fraction. Default: auto (VRAM-aware, ~0.60-0.85 "
+                 "via auto_tune). Pass an explicit value to override."
         )
 
         parser.add_argument(

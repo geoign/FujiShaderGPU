@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import tempfile
+import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -255,7 +256,7 @@ def _translate_source_to_cog_fast(
         # BuildVRT has srcNodata support while TranslateOptions does not.  The
         # VRT keeps the fast path inside GDAL while preserving the NaN NoData
         # contract used by the streaming path.
-        vrt_path = f"/vsimem/fujishader_prepare_{os.getpid()}_{id(src_path)}.vrt"
+        vrt_path = f"/vsimem/fujishader_prepare_{os.getpid()}_{uuid.uuid4().hex}.vrt"
         vrt = gdal.BuildVRT(
             vrt_path,
             [str(src_path)],

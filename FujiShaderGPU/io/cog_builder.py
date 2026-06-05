@@ -15,11 +15,33 @@ from typing import List, Optional
 from osgeo import gdal
 
 from ..config.gdal_config import _configure_gdal_ultra_performance
+from ..utils.cpu import container_cpu_count
+from ..utils.memory import container_memory_available_gb
 
 logger = logging.getLogger(__name__)
 
 # Keep current non-exception behavior and silence GDAL 4.0 future warning.
 gdal.DontUseExceptions()
+
+
+def _gdal_num_threads() -> str:
+    """GDAL NUM_THREADS bounded to the container CPU budget.
+
+    GDAL's ``ALL_CPUS`` resolves (via sched affinity) to the host core count and
+    ignores the CFS quota, so on a throttled container (e.g. 6.8 of 64 cores) it
+    oversubscribes the cgroup.  Pin to the cgroup-aware count instead.
+    """
+    return str(max(1, container_cpu_count()))
+
+
+def _gdal_cachemax_mb() -> int:
+    """GDAL_CACHEMAX (MB) bounded to a fraction of the container's free RAM.
+
+    The previous hardcoded 16 GB / 4 GB values were sized for the host total and
+    can pressure the cgroup memory cap when combined with other buffers.
+    """
+    avail_gb = container_memory_available_gb()
+    return int(max(512, min(8192, avail_gb * 1024 * 0.25)))
 
 
 def _detect_nodata_from_tiles(tile_files: List[str]) -> Optional[float]:
@@ -70,19 +92,26 @@ def _create_vrt_command_line_ultra(
 
 def _create_overviews_gdal_api(tiff_path: str) -> None:
     """Fallback: build overviews via GDAL Python API."""
+    # Save/restore process-global GDAL config so these don't leak into later
+    # operations (notably GDAL_NUM_THREADS oversubscribing the cgroup).
+    _keys = ("COMPRESS_OVERVIEW", "GDAL_TIFF_OVR_BLOCKSIZE", "GDAL_NUM_THREADS")
+    _saved = {k: gdal.GetConfigOption(k, None) for k in _keys}
     gdal.SetConfigOption("COMPRESS_OVERVIEW", "ZSTD")
     gdal.SetConfigOption("GDAL_TIFF_OVR_BLOCKSIZE", "512")
-    gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+    gdal.SetConfigOption("GDAL_NUM_THREADS", _gdal_num_threads())
+    try:
+        ds = gdal.Open(tiff_path, gdal.GA_Update)
+        if ds is None:
+            raise ValueError("Failed to open TIFF for overview creation")
 
-    ds = gdal.Open(tiff_path, gdal.GA_Update)
-    if ds is None:
-        raise ValueError("Failed to open TIFF for overview creation")
-
-    levels = [2, 4, 8, 16, 32, 64, 128, 256]
-    result = ds.BuildOverviews("AVERAGE", levels)
-    ds = None
-    if result != 0:
-        raise ValueError("BuildOverviews failed")
+        levels = [2, 4, 8, 16, 32, 64, 128, 256]
+        result = ds.BuildOverviews("AVERAGE", levels)
+        ds = None
+        if result != 0:
+            raise ValueError("BuildOverviews failed")
+    finally:
+        for k, v in _saved.items():
+            gdal.SetConfigOption(k, v)
 
 
 def _get_overview_count(tiff_path: str) -> int:
@@ -114,10 +143,10 @@ def _create_qgis_optimized_overviews(tiff_path: str) -> None:
         "YES",
         "--config",
         "GDAL_NUM_THREADS",
-        "ALL_CPUS",
+        _gdal_num_threads(),
         "--config",
         "GDAL_CACHEMAX",
-        "4096",
+        str(_gdal_cachemax_mb()),
         "--config",
         "GDAL_TIFF_OVR_BLOCKSIZE",
         "512",
@@ -212,7 +241,7 @@ def _create_cog_ultra_fast(
         "OVERVIEW_COMPRESS=ZSTD",
         "BIGTIFF=YES",
         "BLOCKSIZE=512",
-        "NUM_THREADS=ALL_CPUS",
+        f"NUM_THREADS={_gdal_num_threads()}",
         "OVERVIEWS=IGNORE_EXISTING",
         "OVERVIEW_RESAMPLING=AVERAGE",
         "OVERVIEW_COUNT=8",
@@ -325,7 +354,7 @@ def _create_cog_gtiff_ultra_fast(
         "COMPRESS=ZSTD",
         "ZLEVEL=1",
         "BIGTIFF=YES",
-        "NUM_THREADS=ALL_CPUS",
+        f"NUM_THREADS={_gdal_num_threads()}",
     ]
 
     try:
@@ -356,7 +385,7 @@ def _create_cog_gtiff_ultra_fast(
             "OVERVIEW_COMPRESS=ZSTD",
             "BIGTIFF=YES",
             "BLOCKSIZE=512",
-            "NUM_THREADS=ALL_CPUS",
+            f"NUM_THREADS={_gdal_num_threads()}",
             "OVERVIEWS=FORCE_USE_EXISTING",
             "OVERVIEW_RESAMPLING=AVERAGE",
         ]
@@ -486,13 +515,13 @@ def _create_vrt_and_cog_external_cli(
 
         cmd_cog = [
             gdal_translate,
-            "--config", "GDAL_NUM_THREADS", "ALL_CPUS",
-            "--config", "GDAL_CACHEMAX", "16384",
+            "--config", "GDAL_NUM_THREADS", _gdal_num_threads(),
+            "--config", "GDAL_CACHEMAX", str(_gdal_cachemax_mb()),
             "-of", "COG",
             "-co", "COMPRESS=ZSTD",
             "-co", "LEVEL=1",
             "-co", "OVERVIEW_COMPRESS=ZSTD",
-            "-co", "NUM_THREADS=ALL_CPUS",
+            "-co", f"NUM_THREADS={_gdal_num_threads()}",
             "-co", "BLOCKSIZE=512",
             "-co", "BIGTIFF=YES",
             "-co", "OVERVIEWS=IGNORE_EXISTING",

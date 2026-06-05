@@ -7,6 +7,8 @@ import os
 
 from osgeo import gdal
 
+from ..utils.cpu import container_cpu_count
+
 
 def _configure_gdal_ultra_performance(gpu_config: dict):
     """Tune GDAL I/O options based on available system RAM."""
@@ -37,7 +39,9 @@ def _configure_gdal_ultra_performance(gpu_config: dict):
         "VSI_CACHE_SIZE": str(cache_bytes),
         "GDAL_SWATH_SIZE": str(int(cache_mb * swath_multiplier)),
         "GDAL_FORCE_CACHING": "YES",
-        "GDAL_NUM_THREADS": "ALL_CPUS",
+        # Container-aware: ALL_CPUS resolves to the host core count and ignores
+        # the CFS quota, oversubscribing a throttled container.
+        "GDAL_NUM_THREADS": str(max(1, container_cpu_count())),
         "GDAL_HTTP_MULTIPLEX": "YES",
         "GDAL_HTTP_VERSION": "2",
         "CPL_VSIL_CURL_CACHE_SIZE": str(cache_bytes),
