@@ -51,6 +51,7 @@ from ..io.output_encoding import (
     quantize_params,
 )
 from ..config.auto_tune import compute_dask_chunk
+from ..utils.cpu import container_cpu_count
 from ..utils.memory import (
     container_memory_available_gb,
     container_memory_total_gb,
@@ -899,8 +900,10 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
 
 def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
     """For older GDAL: build overviews on a temporary TIFF, then convert to COG."""
-    # Get CPU count for parallel processing
-    num_cpus = os.cpu_count() or 1
+    # Container-aware CPU budget for GDAL threads: os.cpu_count() reports the
+    # host (e.g. 64) while a cgroup CFS quota may cap us at ~7, so the host count
+    # would oversubscribe the quota.
+    num_cpus = container_cpu_count()
 
     _build_zstd_overviews(src, cog_options)
     _assert_has_overviews(src)

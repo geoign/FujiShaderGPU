@@ -16,7 +16,6 @@ from ..core.tile_compute import (
 from ..io.raster_info import detect_pixel_size_from_cog, metric_pixel_scales_from_metadata
 from ..utils.types import TileResult
 from ..utils.scale_analysis import analyze_terrain_scales, _get_default_scales
-from ..utils.nodata_handler import _handle_nodata_ultra_fast
 from ..io.cog_builder import _build_vrt_and_cog_ultra_fast
 from ..io.cog_validator import _validate_cog_for_qgis
 from ..io.output_encoding import (
