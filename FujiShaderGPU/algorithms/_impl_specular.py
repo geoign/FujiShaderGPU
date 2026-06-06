@@ -154,19 +154,26 @@ class SpecularAlgorithm(DaskAlgorithm):
             # Coarsen for large radii on geographic DEMs too (pixel-based; the
             # roughness kernel and metric scales below are scaled by F as well).
             F = coarsen_factor_for_shape(gpu_arr.shape)
+            # Unified overview source (shared decimated read): when present the
+            # coarse grid uses its decimation, so the roughness kernel must scale by
+            # the SAME factor (not F) to stay metric-consistent on that grid.
+            _ov_dem = params.get("_overview_coarse_dem")
+            _ov_decim = params.get("_overview_decimation")
+            _coarse_fac = float(_ov_decim) if (_ov_dem is not None and _ov_decim) else float(F)
             cache = {}
             responses = []
             for radius in radii:
                 depth = max(int(rs), int(float(radius) * 2 + 1))
                 if F > 1 and int(round(float(radius))) > thr:
                     # Scale the roughness kernel into the coarse grid as well.
-                    rs_coarse = max(3.0, float(rs) / F)
+                    rs_coarse = max(3.0, float(rs) / _coarse_fac)
                     responses.append(coarse_large_radius_response(
                         gpu_arr, block_fn=compute_specular_spatial_block,
                         radius_kw="radius", radius=float(radius), factor=F,
                         depth_for_radius=lambda rc, _rs=rs_coarse: max(int(_rs), int(rc * 2 + 1)),
                         pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
                         coarse_cache=cache,
+                        coarse_dem=_ov_dem, coarse_decimation=_ov_decim,
                         roughness_scale=rs_coarse, shininess=sh,
                         roughness_norm_scale=rns, geographic_mode=geo,
                         light_azimuth=laz, light_altitude=lal,

@@ -193,7 +193,9 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
         smooths = multiscale_response_fields(
             gpu_arr, sorted_scales, block_fn=_sss_smooth_block,
             depth_for_scale=lambda s: int(max(1, round(s * 4))) + 1,
-            pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo)
+            pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo,
+            coarse_dem=params.get("_overview_coarse_dem"),
+            coarse_decimation=params.get("_overview_decimation"))
         return da.map_blocks(
             _sss_combine_block, gpu_arr, *smooths,
             dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
@@ -260,6 +262,8 @@ class MultiLightUncertaintyAlgorithm(DaskAlgorithm):
                 depth_for_scale=lambda rr: max(2, int(float(rr) * 2 + 1)),
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo,
+                coarse_dem=params.get("_overview_coarse_dem"),
+                coarse_decimation=params.get("_overview_decimation"),
                 azimuths=azimuths, altitude=altitude, z_factor=z_factor,
                 uncertainty_weight=uw)
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)

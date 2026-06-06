@@ -65,7 +65,9 @@ class SlopeAlgorithm(DaskAlgorithm):
                 depth_for_scale=lambda rr: max(2, int(float(rr) * 2 + 1)),
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-                pixel_scale_y=pixel_scale_y, is_geographic=is_geo, unit=unit)
+                pixel_scale_y=pixel_scale_y, is_geographic=is_geo,
+                coarse_dem=params.get("_overview_coarse_dem"),
+                coarse_decimation=params.get("_overview_decimation"), unit=unit)
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
         return gpu_arr.map_overlap(
             compute_slope_block, depth=1, boundary='reflect',

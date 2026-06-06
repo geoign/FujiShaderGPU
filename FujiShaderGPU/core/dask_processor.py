@@ -1732,6 +1732,33 @@ def run_pipeline(
             if _ngs:
                 params["_npr_grad_stats"] = _ngs
 
+        # Unified coarse source: read ONE decimated overview of the DEM and share it
+        # across every algorithm's large-radius path (the coarse-overview combine is
+        # the seam-free, memory-bounded RVI method).  All multiscale algorithms then
+        # derive their large radii from this single cheap read instead of a
+        # full-resolution da.coarsen pass each.  Injected for any spatial run with
+        # explicit radii; algorithms that do not use the coarse path ignore it.
+        _overview_dem = None
+        _overview_decim = None
+        if (
+            params.get("radii")
+            and str(params.get("mode", "")).lower() == "spatial"
+            and "_overview_coarse_dem" not in params
+            and not is_zarr_path(src_cog)
+        ):
+            try:
+                from ..algorithms._nan_utils import read_overview_coarse_dem
+                _overview_dem, _overview_decim = read_overview_coarse_dem(src_cog)
+                if _overview_dem is not None:
+                    params["_overview_coarse_dem"] = _overview_dem
+                    params["_overview_decimation"] = _overview_decim
+                    logger.info(
+                        "Unified overview coarse source: %dx%d (decimation=%.1fx)",
+                        int(_overview_dem.shape[1]), int(_overview_dem.shape[0]),
+                        float(_overview_decim))
+            except Exception as exc:
+                logger.warning("Unified overview coarse source unavailable: %s", exc)
+
         # fractal_anomaly / visual_saliency hybrid coarse path (RVI-style): when the
         # user gives explicit large --radii, precompute their per-scale response
         # fields (roughness / smooth) from the COG overview.  The algorithm then
@@ -1778,7 +1805,8 @@ def run_pipeline(
                 _large = [r for r in _radii if _pred(r)]
                 if _large:
                     _fields, _decim = compute_overview_scale_fields(
-                        src_cog, large_radii=_large, block_fn=_bfn)
+                        src_cog, large_radii=_large, block_fn=_bfn,
+                        coarse_dem=_overview_dem, decimation=_overview_decim)
                     if _fields:
                         params[f"{_pfx}_large_fields"] = _fields
                         params[f"{_pfx}_full_shape"] = tuple(int(s) for s in gpu_arr.shape)
@@ -1841,7 +1869,7 @@ def run_pipeline(
             k: v for k, v in params.items()
             if not (k.startswith("_rvi_coarse_field")
                     or k in ("_fractal_large_fields", "_vs_large_fields",
-                             "_sss_large_fields"))
+                             "_sss_large_fields", "_overview_coarse_dem"))
         }
         logger.info(f"Computing {algorithm} with parameters: {_log_params}")
 
@@ -1865,6 +1893,7 @@ def run_pipeline(
             "_fractal_large_fields", "_fractal_full_shape",
             "_vs_large_fields", "_vs_full_shape",
             "_sss_large_fields", "_sss_full_shape",
+            "_overview_coarse_dem", "_overview_decimation",
         ):
             params.pop(_k, None)
 

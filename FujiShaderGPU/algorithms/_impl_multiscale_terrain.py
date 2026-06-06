@@ -181,6 +181,8 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                     depth_for_radius=lambda sc: min(int(4 * sc) + 1, Constants.MAX_DEPTH),
                     pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
                     coarse_cache=cache,
+                    coarse_dem=params.get("_overview_coarse_dem"),
+                    coarse_decimation=params.get("_overview_decimation"),
                 )
                 results.append(gpu_arr - smooth_up)
             else:

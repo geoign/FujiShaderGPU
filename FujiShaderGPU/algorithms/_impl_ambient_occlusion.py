@@ -167,6 +167,8 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
                 is_large=lambda rr: int(rr) > thr,
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
                 pixel_scale_y=pixel_scale_y, is_geographic=is_geo,
+                coarse_dem=params.get("_overview_coarse_dem"),
+                coarse_decimation=params.get("_overview_decimation"),
                 num_samples=num_samples, intensity=intensity)
             result = _combine_multiscale_dask(responses, weights=weights, agg=agg)
         else:

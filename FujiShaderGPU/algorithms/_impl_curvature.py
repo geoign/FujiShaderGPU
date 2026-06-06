@@ -83,7 +83,10 @@ class CurvatureAlgorithm(DaskAlgorithm):
                 depth_for_scale=lambda rr: max(3, int(float(rr) * 2 + 2)),
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
-                is_geographic=is_geo, curvature_type=ct)
+                is_geographic=is_geo,
+                coarse_dem=params.get("_overview_coarse_dem"),
+                coarse_decimation=params.get("_overview_decimation"),
+                curvature_type=ct)
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
         return gpu_arr.map_overlap(
             compute_curvature_block, depth=2, boundary='reflect',

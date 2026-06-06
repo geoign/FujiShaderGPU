@@ -226,6 +226,8 @@ class NPREdgesAlgorithm(DaskAlgorithm):
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
                 is_geographic=is_geo, edge_sigma=edge_sigma,
+                coarse_dem=params.get("_overview_coarse_dem"),
+                coarse_decimation=params.get("_overview_decimation"),
                 threshold_low=threshold_low, threshold_high=threshold_high,
                 grad_stats_map=params.get("_npr_grad_stats"))
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)

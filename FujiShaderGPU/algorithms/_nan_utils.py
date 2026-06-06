@@ -274,6 +274,8 @@ def coarse_large_radius_response(
     pixel_scale_x: Optional[float] = None,
     pixel_scale_y: Optional[float] = None,
     coarse_cache: Optional[dict] = None,
+    coarse_dem: Optional[cp.ndarray] = None,
+    coarse_decimation: Optional[float] = None,
     **block_kwargs,
 ) -> da.Array:
     """One large-radius spatial response computed on a coarsened DEM, upsampled.
@@ -283,8 +285,37 @@ def coarse_large_radius_response(
     and the small coarse result is bilinearly upsampled to full resolution.
     Intended for projected DEMs (metric pixel scales scale linearly with factor).
     ``coarse_cache`` (a dict) avoids re-coarsening the array for multiple radii.
+
+    ``coarse_dem`` (a concrete CuPy overview read once from the COG, with its own
+    ``coarse_decimation``) short-circuits the da.coarsen pass: the block function
+    runs on that single overview array directly.  This is the unified, RVI-style
+    coarse source -- every algorithm derives its large radii from the same cheap
+    decimated overview read instead of a full-resolution da.coarsen per algorithm.
     """
     H, W = int(gpu_arr.shape[0]), int(gpu_arr.shape[1])
+    if coarse_dem is not None and coarse_decimation is not None:
+        # Unified overview path: one decimated read serves all radii / algorithms.
+        fac = float(coarse_decimation)
+        r_coarse = max(1, int(round(float(radius) / fac)))
+        kw = dict(block_kwargs)
+        kw[radius_kw] = r_coarse
+        kw["pixel_size"] = float(pixel_size) * fac
+        if pixel_scale_x is not None:
+            kw["pixel_scale_x"] = float(pixel_scale_x) * fac
+        if pixel_scale_y is not None:
+            kw["pixel_scale_y"] = float(pixel_scale_y) * fac
+        # The overview is the whole (small) array -> run the block once, no halo.
+        coarse_resp = block_fn(coarse_dem, **kw).astype(cp.float32)
+        upsampled = gpu_arr.map_blocks(
+            _upsample_coarse_response_block,
+            dtype=cp.float32,
+            meta=cp.empty((0, 0), dtype=cp.float32),
+            coarse=coarse_resp,
+            full_h=H,
+            full_w=W,
+        )
+        return da.where(da.isnan(gpu_arr), cp.float32(cp.nan), upsampled)
+
     if coarse_cache is not None and "coarse" in coarse_cache:
         coarse = coarse_cache["coarse"]
     else:
@@ -344,6 +375,8 @@ def multiscale_response_fields(
     pixel_scale_y: Optional[float] = None,
     is_geographic: bool = False,
     coarse_cache: Optional[dict] = None,
+    coarse_dem: Optional[cp.ndarray] = None,
+    coarse_decimation: Optional[float] = None,
     **block_kwargs,
 ) -> List[da.Array]:
     """Per-scale response fields as dask arrays, large scales via the coarse path.
@@ -391,7 +424,9 @@ def multiscale_response_fields(
                 factor=F,
                 depth_for_radius=lambda sc: max(1, int(depth_for_scale(sc))),
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-                pixel_scale_y=pixel_scale_y, coarse_cache=coarse_cache, **block_kwargs))
+                pixel_scale_y=pixel_scale_y, coarse_cache=coarse_cache,
+                coarse_dem=coarse_dem, coarse_decimation=coarse_decimation,
+                **block_kwargs))
         else:
             fields.append(gpu_arr.map_overlap(
                 block_fn, depth=max(1, min(d, chunk_cap)),
@@ -667,23 +702,12 @@ def hybrid_multiscale_response_combine(
         _combine_fn=combine_fn, _combine_kwargs=combine_kwargs)
 
 
-def compute_overview_scale_fields(
-    src_cog: str,
-    *,
-    large_radii,
-    block_fn,
-    sample_max: int = 2048,
-):
-    """Per-large-scale response fields from the COG overview (RVI-style fast path).
+def read_overview_coarse_dem(src_cog: str, *, sample_max: int = 2048):
+    """Read one decimated overview of the DEM as a concrete CuPy array.
 
-    Reads a single decimated overview window (``Resampling.average``) and runs
-    ``block_fn(coarse, scale=r/decimation)`` for each large radius, returning
-    ``({int(radius): cupy_field}, decimation)``.  The decimated read avoids
-    materialising the huge full-resolution halo a large radius would need.  Returns
-    ``({}, 1.0)`` if there are no large radii; ``(None, 1.0)`` on failure so callers
-    fall back to the bounded single-block path."""
-    if not large_radii:
-        return {}, 1.0
+    Returns ``(coarse_dem, decimation)`` (NaN at NoData) or ``(None, 1.0)`` on
+    failure.  This single cheap read is the unified coarse source shared by every
+    algorithm's large-radius path (instead of a full-resolution da.coarsen each)."""
     try:
         import rasterio
         from rasterio.enums import Resampling
@@ -703,12 +727,40 @@ def compute_overview_scale_fields(
             sample = np.where(
                 np.isclose(sample, float(nodata), rtol=0.0, atol=1e-6),
                 np.nan, sample).astype(np.float32, copy=False)
-        coarse = cp.asarray(sample, dtype=cp.float32)
+        return cp.asarray(sample, dtype=cp.float32), float(scale)
+    except Exception:
+        return None, 1.0
+
+
+def compute_overview_scale_fields(
+    src_cog: str,
+    *,
+    large_radii,
+    block_fn,
+    sample_max: int = 2048,
+    coarse_dem: Optional[cp.ndarray] = None,
+    decimation: Optional[float] = None,
+):
+    """Per-large-scale response fields from the COG overview (RVI-style fast path).
+
+    Runs ``block_fn(coarse, scale=r/decimation)`` for each large radius on a single
+    decimated overview, returning ``({int(radius): cupy_field}, decimation)``.  Pass
+    a pre-read ``coarse_dem`` + ``decimation`` to reuse the shared overview read;
+    otherwise it reads one itself.  Returns ``({}, 1.0)`` if there are no large
+    radii; ``(None, 1.0)`` on failure so callers fall back to the single-block
+    path."""
+    if not large_radii:
+        return {}, 1.0
+    if coarse_dem is None or decimation is None:
+        coarse_dem, decimation = read_overview_coarse_dem(src_cog, sample_max=sample_max)
+    if coarse_dem is None:
+        return None, 1.0
+    try:
         fields = {}
         for r in large_radii:
-            r_c = max(1.0, float(r) / float(scale))
-            fields[int(round(float(r)))] = block_fn(coarse, scale=r_c).astype(cp.float32)
-        return fields, float(scale)
+            r_c = max(1.0, float(r) / float(decimation))
+            fields[int(round(float(r)))] = block_fn(coarse_dem, scale=r_c).astype(cp.float32)
+        return fields, float(decimation)
     except Exception:
         return None, 1.0
 
@@ -731,4 +783,5 @@ __all__ = [
     "_bilinear_sample_coarse",
     "hybrid_multiscale_response_combine",
     "compute_overview_scale_fields",
+    "read_overview_coarse_dem",
 ]

@@ -99,6 +99,8 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
                 pixel_scale_y=pixel_scale_y, is_geographic=geographic_mode,
+                coarse_dem=params.get("_overview_coarse_dem"),
+                coarse_decimation=params.get("_overview_decimation"),
                 azimuth=azimuth, altitude=altitude, z_factor=z_factor,
                 geographic_mode=geographic_mode)
             stacked = da.stack(results, axis=0)
