@@ -13,11 +13,21 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
 from ._base import DaskAlgorithm, Constants
-from ._nan_utils import restore_nan, resolve_block_weights, multiscale_response_fields
+from ._nan_utils import (
+    restore_nan, resolve_block_weights, multiscale_response_fields,
+    hybrid_multiscale_response_combine,
+)
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
 
 logger = logging.getLogger(__name__)
+
+
+def vs_large_scale_predicate(scale) -> bool:
+    """A conspicuity scale is "large" when its gaussian halo (~5*sigma) would
+    exceed MAX_DEPTH, i.e. the single-block path would truncate it.  Such scales
+    are taken from the overview via the hybrid coarse path instead."""
+    return int(float(scale) * 5) > Constants.MAX_DEPTH
 
 
 def _vs_fill(block):
@@ -244,6 +254,29 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
                 stats = (0.0, 1.0)
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
             stats = (0.0, 1.0)
+
+        # Hybrid coarse path (RVI-style): when the orchestrator supplies the
+        # large-scale smooth fields precomputed from the COG overview, compute the
+        # small conspicuity scales at full resolution (bounded halo) and sample the
+        # large scales from their concrete overview fields inside one depth-0
+        # combine.  Accurate for large --radii (true low-frequency smooth, not a
+        # MAX_DEPTH-truncated gaussian) and bounded in VRAM on huge streaming
+        # rasters (no per-large-scale Dask field whose GPU intermediates accumulate).
+        large_fields = params.get("_vs_large_fields")
+        if large_fields:
+            full_shape = params.get("_vs_full_shape", tuple(int(s) for s in gpu_arr.shape))
+            return hybrid_multiscale_response_combine(
+                gpu_arr, [float(s) for s in use_scales],
+                small_block_fn=_vs_smooth_block,
+                combine_fn=_vs_combine_block,
+                depth_for_scale=lambda s: int(float(s) * 5),
+                large_fields=large_fields, full_shape=full_shape,
+                radius_kw="scale", pixel_size=pixel_size,
+                pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+                combine_kwargs=dict(
+                    weights=weights, pixel_size=pixel_size,
+                    pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+                    normalize=True, norm_min=stats[0], norm_scale=stats[1]))
 
         # Single self-contained block per output tile (bounds device memory).  The
         # coarse-overview decomposition into many per-scale smooth fields fed a deep

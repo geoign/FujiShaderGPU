@@ -18,9 +18,17 @@ from ._global_stats import compute_global_stats
 from ._nan_utils import (
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
     _smooth_for_radius, multiscale_response_fields,
-    large_radius_threshold,
+    large_radius_threshold, hybrid_multiscale_response_combine,
 )
 from ._normalization import NORMAL_PERCENTILE
+
+
+def sss_large_scale_predicate(scale) -> bool:
+    """A scale-space-surprise scale is "large" when its gaussian halo (~4*sigma)
+    would exceed MAX_DEPTH.  Such scales are taken from the overview via the hybrid
+    coarse path instead of a MAX_DEPTH-truncated halo (the truncation drove the
+    tile-boundary seams)."""
+    return int(max(1, round(float(scale) * 4)) + 1) > Constants.MAX_DEPTH
 from .common.kernels import (
     scale_space_surprise as kernel_scale_space_surprise,
     multi_light_uncertainty as kernel_multi_light_uncertainty,
@@ -165,6 +173,23 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
         # on a coarsened overview (no oversized halo -> accurate large --radii, no
         # rechunk-merge OOM).  The surprise then combines |smooth[i+1]-smooth[i]|.
         sorted_scales, pair_w = _sorted_scales_and_pair_weights(scales, weights)
+        # Hybrid coarse path (RVI-style): large scales' smooths come precomputed
+        # from the COG overview (sampled per-block by global coords, no halo) and
+        # the small scales are full-resolution bounded-halo fields, all fused in one
+        # depth-0 combine.  Accurate large scales (no MAX_DEPTH halo truncation -> no
+        # tile-boundary seam) and bounded VRAM on huge streaming rasters.
+        large_fields = params.get("_sss_large_fields")
+        if large_fields:
+            full_shape = params.get("_sss_full_shape", tuple(int(s) for s in gpu_arr.shape))
+            return hybrid_multiscale_response_combine(
+                gpu_arr, sorted_scales, small_block_fn=_sss_smooth_block,
+                combine_fn=_sss_combine_block,
+                depth_for_scale=lambda s: int(max(1, round(float(s) * 4))) + 1,
+                large_fields=large_fields, full_shape=full_shape,
+                radius_kw="scale", pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
+                combine_kwargs=dict(
+                    pair_w=pair_w, norm_min=float(stats[0]), norm_scale=float(stats[1]),
+                    enhancement=enhancement, normalize=normalize))
         smooths = multiscale_response_fields(
             gpu_arr, sorted_scales, block_fn=_sss_smooth_block,
             depth_for_scale=lambda s: int(max(1, round(s * 4))) + 1,

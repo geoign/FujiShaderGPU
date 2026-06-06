@@ -575,6 +575,144 @@ def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
     return result
 
 
+def _hybrid_combine_wrapper(dem, *small_blocks, _scales_order, _small_scales,
+                            _large_scales, _large_list, _full_h, _full_w,
+                            _combine_fn, _combine_kwargs, block_info=None):
+    """Assemble the full ordered per-scale field list for one output block and run
+    the algorithm's pointwise combine.
+
+    Small scales arrive as already-trimmed, block-aligned Dask fields (positional
+    ``small_blocks``).  Large scales are bilinearly sampled from their concrete
+    coarse (overview) field at this block's *global* pixel coordinates -- valid
+    only under ``map_blocks`` (depth 0), where ``array-location`` is the true
+    global core position (under ``map_overlap`` it is the padded-coordinate
+    position, so this combine MUST stay depth-0; the per-scale fields already
+    carry their own halos)."""
+    if block_info is not None and block_info.get(0) is not None:
+        loc = block_info[0]["array-location"]
+        r0, r1 = int(loc[0][0]), int(loc[0][1])
+        c0, c1 = int(loc[1][0]), int(loc[1][1])
+    else:  # pragma: no cover - non-dask fallback
+        r0, c0 = 0, 0
+        r1, c1 = int(dem.shape[0]), int(dem.shape[1])
+    small_map = {int(round(float(s))): b for s, b in zip(_small_scales, small_blocks)}
+    large_map = {int(round(float(s))): cf for s, cf in zip(_large_scales, _large_list)}
+    fields = []
+    for s in _scales_order:
+        k = int(round(float(s)))
+        if k in small_map:
+            fields.append(small_map[k])
+        else:
+            up = _bilinear_sample_coarse(large_map[k], r0, r1, c0, c1, _full_h, _full_w)
+            fields.append(up.astype(cp.float32))
+    return _combine_fn(dem, *fields, **_combine_kwargs)
+
+
+def hybrid_multiscale_response_combine(
+    gpu_arr: da.Array,
+    scales,
+    *,
+    small_block_fn,
+    combine_fn,
+    depth_for_scale,
+    large_fields: dict,
+    full_shape,
+    radius_kw: str = "scale",
+    pixel_size: float = 1.0,
+    pixel_scale_x: Optional[float] = None,
+    pixel_scale_y: Optional[float] = None,
+    combine_kwargs: Optional[dict] = None,
+    **block_kwargs,
+) -> da.Array:
+    """RVI-style hybrid multiscale combine (bounded VRAM + accurate large scales).
+
+    Small scales (those NOT in ``large_fields``) are computed at full resolution as
+    bounded-halo ``map_overlap`` fields.  Large scales arrive precomputed as
+    concrete coarse fields in ``large_fields`` (``{int(scale): cupy_field}``), each
+    produced by running ``small_block_fn`` on a coarsened overview; they are sampled
+    per output block by global coordinates and bilinearly upsampled inside a single
+    depth-0 ``map_blocks`` combine.  This keeps per-chunk device memory bounded on
+    huge streaming rasters (no per-large-scale Dask field whose intermediates
+    accumulate) while keeping the large, low-frequency scales accurate (true
+    overview response instead of a MAX_DEPTH-truncated halo).
+
+    ``combine_fn(dem_block, *ordered_fields, **combine_kwargs)`` is the algorithm's
+    existing per-pixel combine (e.g. roughness->fractal feature, smooths->saliency).
+    """
+    combine_kwargs = dict(combine_kwargs or {})
+    full_h, full_w = int(full_shape[0]), int(full_shape[1])
+    min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
+    chunk_cap = max(1, int(min_chunk) - 1)
+    large_keys = {int(round(float(s))) for s in large_fields.keys()}
+    scales_f = [float(s) for s in scales]
+    small_scales = [s for s in scales_f if int(round(s)) not in large_keys]
+    large_scales = [s for s in scales_f if int(round(s)) in large_keys]
+    small_fields = [
+        gpu_arr.map_overlap(
+            small_block_fn,
+            depth=max(1, min(int(depth_for_scale(s)), chunk_cap)),
+            boundary="reflect", dtype=cp.float32,
+            meta=cp.empty((0, 0), dtype=cp.float32),
+            pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
+            pixel_scale_y=pixel_scale_y, **{radius_kw: s}, **block_kwargs)
+        for s in small_scales
+    ]
+    large_list = [large_fields[int(round(s))] for s in large_scales]
+    return da.map_blocks(
+        _hybrid_combine_wrapper, gpu_arr, *small_fields,
+        dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
+        _scales_order=scales_f, _small_scales=small_scales,
+        _large_scales=large_scales, _large_list=large_list,
+        _full_h=full_h, _full_w=full_w,
+        _combine_fn=combine_fn, _combine_kwargs=combine_kwargs)
+
+
+def compute_overview_scale_fields(
+    src_cog: str,
+    *,
+    large_radii,
+    block_fn,
+    sample_max: int = 2048,
+):
+    """Per-large-scale response fields from the COG overview (RVI-style fast path).
+
+    Reads a single decimated overview window (``Resampling.average``) and runs
+    ``block_fn(coarse, scale=r/decimation)`` for each large radius, returning
+    ``({int(radius): cupy_field}, decimation)``.  The decimated read avoids
+    materialising the huge full-resolution halo a large radius would need.  Returns
+    ``({}, 1.0)`` if there are no large radii; ``(None, 1.0)`` on failure so callers
+    fall back to the bounded single-block path."""
+    if not large_radii:
+        return {}, 1.0
+    try:
+        import rasterio
+        from rasterio.enums import Resampling
+    except Exception:
+        return None, 1.0
+    try:
+        with rasterio.open(src_cog) as src:
+            scale = max(src.width / sample_max, src.height / sample_max, 1.0)
+            sw = max(128, int(src.width / scale))
+            sh = max(128, int(src.height / scale))
+            sample_ma = src.read(
+                1, out_shape=(sh, sw), resampling=Resampling.average,
+                out_dtype=np.float32, masked=True)
+            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
+            nodata = src.nodata
+        if nodata is not None and not np.isnan(float(nodata)):
+            sample = np.where(
+                np.isclose(sample, float(nodata), rtol=0.0, atol=1e-6),
+                np.nan, sample).astype(np.float32, copy=False)
+        coarse = cp.asarray(sample, dtype=cp.float32)
+        fields = {}
+        for r in large_radii:
+            r_c = max(1.0, float(r) / float(scale))
+            fields[int(round(float(r)))] = block_fn(coarse, scale=r_c).astype(cp.float32)
+        return fields, float(scale)
+    except Exception:
+        return None, 1.0
+
+
 __all__ = [
     "handle_nan_with_gaussian",
     "handle_nan_with_uniform",
@@ -591,4 +729,6 @@ __all__ = [
     "coarsen_factor_for_shape",
     "coarse_large_radius_response",
     "_bilinear_sample_coarse",
+    "hybrid_multiscale_response_combine",
+    "compute_overview_scale_fields",
 ]

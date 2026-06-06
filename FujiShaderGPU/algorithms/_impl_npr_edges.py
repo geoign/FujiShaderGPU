@@ -20,8 +20,15 @@ from ._nan_utils import (
 
 def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
                           threshold_low: float = 0.1, threshold_high: float = 0.3,
-                          pixel_size: float = 1.0) -> cp.ndarray:
-    """NPR-style outline extraction (simplified v2)."""
+                          pixel_size: float = 1.0, grad_stats=None,
+                          _return_grad: bool = False) -> cp.ndarray:
+    """NPR-style outline extraction (simplified v2).
+
+    ``grad_stats`` = (base_threshold, threshold_range, grad_mean) supplies the
+    edge-detection threshold from a GLOBAL gradient distribution instead of the
+    per-block one, which differs tile-to-tile and produces tile-boundary seams.
+    ``_return_grad`` returns the gradient magnitude (used by the global-stats
+    prepass that derives ``grad_stats``)."""
     nan_mask = cp.isnan(block)
     resolution_class = classify_resolution(pixel_size)
 
@@ -71,11 +78,27 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
         local_range = local_max - local_min
         gradient_mag = cp.maximum(gradient_mag, local_range * 0.3)
 
+    # Global-stats prepass hook: return the gradient magnitude so the caller can
+    # pool it across stratified tiles into a global threshold.
+    if _return_grad:
+        return restore_nan(gradient_mag, nan_mask).astype(cp.float32)
+
     gradient_dir = cp.arctan2(dy, dx)
 
     # Adaptive thresholding
     valid_grad = gradient_mag[~nan_mask] if nan_mask.any() else gradient_mag.ravel()
-    if len(valid_grad) > 0:
+    if grad_stats is not None:
+        # Global threshold (seam-free): base/range/mean computed once over the
+        # whole raster instead of per block.
+        base_threshold = float(grad_stats[0])
+        threshold_range = float(grad_stats[1])
+        grad_mean = float(grad_stats[2])
+        actual_threshold_low = base_threshold + threshold_range * threshold_low * 0.5
+        actual_threshold_high = base_threshold + threshold_range * threshold_high
+        min_threshold = grad_mean * 0.1
+        actual_threshold_low = max(actual_threshold_low, min_threshold)
+        actual_threshold_high = max(actual_threshold_high, min_threshold * 2)
+    elif len(valid_grad) > 0:
         grad_std = cp.std(valid_grad)
         grad_mean = cp.mean(valid_grad)
 
@@ -160,12 +183,20 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
 def compute_npr_edges_spatial_block(block, *, edge_sigma=1.0, threshold_low=0.1,
                                     threshold_high=0.3, pixel_size=1.0,
                                     pixel_scale_x=None, pixel_scale_y=None,
-                                    radius=4.0):
+                                    radius=4.0, grad_stats_map=None,
+                                    _return_grad=False):
     """Edges of the terrain viewed at a given spatial scale (DEM pre-smoothed)."""
     smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="npr_edges")
+    # Global per-radius gradient threshold (seam-free) when provided.  Large radii
+    # run the whole coarsened grid as one block, so their per-block threshold is
+    # already global -- only the small (full-res, multi-tile) radii need this.
+    gs = None
+    if grad_stats_map:
+        gs = grad_stats_map.get(int(round(float(radius))))
     return compute_npr_edges_block(
         smoothed, edge_sigma=edge_sigma, threshold_low=threshold_low,
-        threshold_high=threshold_high, pixel_size=pixel_size)
+        threshold_high=threshold_high, pixel_size=pixel_size,
+        grad_stats=gs, _return_grad=_return_grad)
 
 
 class NPREdgesAlgorithm(DaskAlgorithm):
@@ -195,7 +226,8 @@ class NPREdgesAlgorithm(DaskAlgorithm):
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
                 is_geographic=is_geo, edge_sigma=edge_sigma,
-                threshold_low=threshold_low, threshold_high=threshold_high)
+                threshold_low=threshold_low, threshold_high=threshold_high,
+                grad_stats_map=params.get("_npr_grad_stats"))
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
 
         depth = 3

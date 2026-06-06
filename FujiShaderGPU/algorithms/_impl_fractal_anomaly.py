@@ -14,10 +14,17 @@ from cupyx.scipy.ndimage import gaussian_filter, median_filter
 from ._base import DaskAlgorithm, classify_resolution, Constants
 from ._nan_utils import (
     handle_nan_with_gaussian, restore_nan, resolve_block_weights,
-    multiscale_response_fields,
+    multiscale_response_fields, hybrid_multiscale_response_combine,
 )
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
+
+
+def fractal_large_scale_predicate(radius) -> bool:
+    """A fractal radius is "large" when its roughness halo (~2r + feature margin)
+    would exceed MAX_DEPTH, i.e. the single-block path would truncate it.  Such
+    radii are taken from the overview via the hybrid coarse path instead."""
+    return int(2 * float(radius) + 16) > Constants.MAX_DEPTH
 
 
 def compute_roughness_multiscale(block, radii, window_mult=3, detrend=True):
@@ -264,6 +271,30 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             if isinstance(stats, (tuple, list)) and len(stats) >= 4:
                 rp10, rp75 = float(stats[2]), float(stats[3])
         mean_D, std_D = float(stats[0]), float(stats[1])
+
+        # Hybrid coarse path (RVI-style): when the orchestrator supplies the
+        # large-radius roughness fields precomputed from the COG overview, compute
+        # small radii at full resolution (bounded halo) and sample the large radii
+        # from their concrete overview fields inside one depth-0 combine.  This is
+        # both accurate for large --radii (true low-frequency roughness, not a
+        # MAX_DEPTH-truncated halo) and bounded in VRAM on huge streaming rasters
+        # (no per-large-scale Dask field whose GPU intermediates accumulate).
+        large_fields = params.get("_fractal_large_fields")
+        if large_fields:
+            full_shape = params.get("_fractal_full_shape", tuple(int(s) for s in gpu_arr.shape))
+            return hybrid_multiscale_response_combine(
+                gpu_arr, [float(r) for r in radii],
+                small_block_fn=_fractal_roughness_block,
+                combine_fn=_fractal_combine_block,
+                depth_for_scale=lambda rr: int(2 * float(rr) + 16),
+                large_fields=large_fields, full_shape=full_shape,
+                radius_kw="scale", pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
+                combine_kwargs=dict(
+                    radii=radii, weights=weights, normalize=True,
+                    mean_global=mean_D, std_global=std_D,
+                    relief_p10=rp10, relief_p75=rp75, smoothing_sigma=sm_sig,
+                    despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am,
+                    detail_boost=db))
 
         # Single self-contained block per output tile (bounds device memory).  The
         # coarse-overview decomposition into 6 per-scale roughness fields fed a deep

@@ -1081,6 +1081,204 @@ def _compute_rvi_overview_coarse_field(
         return None
 
 
+def _compute_fractal_relief_stats(
+    src_cog: str,
+    params: dict,
+    *,
+    grid: int = 3,
+    max_tile: int = 4096,
+    min_valid_frac: float = 0.02,
+) -> Optional[tuple]:
+    """Global roughness (relief) p10/p75 for fractal_anomaly, from full-resolution
+    stratified tiles.  ``relief_conf`` otherwise uses a per-block roughness
+    percentile, which differs tile-to-tile and produces tile-boundary seams; a
+    single global pair makes it consistent across the whole raster.  Computed at
+    full resolution so the magnitude matches the per-block roughness."""
+    try:
+        from rasterio.windows import Window
+        from rasterio.enums import Resampling
+        from ..algorithms._impl_fractal_anomaly import compute_roughness_multiscale
+        from ..algorithms.dask_registry import ALGORITHMS
+    except Exception as exc:
+        logger.warning("fractal relief-stats helpers unavailable: %s", exc)
+        return None
+    try:
+        defaults = ALGORITHMS["fractal_anomaly"].get_default_params() or {}
+    except Exception:
+        defaults = {}
+    radii = (params or {}).get("radii") or defaults.get("radii") or [4, 8, 16, 32, 64]
+    if len(radii) < 5:
+        radii = [4, 8, 16, 32, 64]
+    max_r = max(float(r) for r in radii)
+    try:
+        margin = int(min(2 * max_r + 16, max_tile // 4))
+        tile = int(min(max_tile, max(2048, 4 * margin)))
+        pooled = []
+        with rasterio.open(src_cog) as src:
+            W, H = src.width, src.height
+            nodata = src.nodata
+
+            def _dn(a):
+                a = a.astype(np.float32, copy=False)
+                if nodata is not None and not np.isnan(float(nodata)):
+                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
+                return a
+
+            cov = max(1, max(W, H) // 512)
+            ov = _dn(src.read(1, out_shape=(max(1, H // cov), max(1, W // cov)),
+                              resampling=Resampling.nearest, out_dtype=np.float32,
+                              masked=True).filled(np.nan))
+            vmask = np.isfinite(ov)
+            if not vmask.any():
+                return None
+            ys, xs = np.where(vmask)
+            by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
+            bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
+            ch_, cw_ = max(1, (by1 - by0) // grid), max(1, (bx1 - bx0) // grid)
+            for gy in range(grid):
+                for gx in range(grid):
+                    ccy = by0 + gy * ch_ + ch_ // 2
+                    ccx = bx0 + gx * cw_ + cw_ // 2
+                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
+                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
+                    tw, th = min(tile, W - wx0), min(tile, H - wy0)
+                    a = _dn(src.read(1, window=Window(wx0, wy0, tw, th),
+                                     out_dtype=np.float32, masked=True).filled(np.nan))
+                    if float(np.isfinite(a).mean()) < min_valid_frac:
+                        continue
+                    g = cp.asarray(a)
+                    sig = compute_roughness_multiscale(g, radii, window_mult=3, detrend=True)
+                    rough = cp.mean(sig, axis=2)
+                    m = int(min(margin, rough.shape[0] // 3, rough.shape[1] // 3))
+                    if m > 0:
+                        rough = rough[m:-m, m:-m]
+                    vals = rough[~cp.isnan(rough)]
+                    if vals.size:
+                        pooled.append(cp.asnumpy(vals))
+                    del g, sig, rough, vals
+                    cp.get_default_memory_pool().free_all_blocks()
+        if not pooled:
+            return None
+        allv = np.concatenate(pooled)
+        p10 = float(np.percentile(allv, 10))
+        p75 = float(np.percentile(allv, 75))
+        if not (np.isfinite(p10) and np.isfinite(p75) and p75 > p10):
+            return None
+        logger.info("fractal_anomaly global relief: p10=%.4g p75=%.4g (from %d tiles)",
+                    p10, p75, len(pooled))
+        return (p10, p75)
+    except Exception as exc:
+        logger.warning("Failed to compute fractal relief stats: %s", exc)
+        return None
+
+
+def _compute_npr_grad_stats(
+    src_cog: str,
+    params: dict,
+    *,
+    grid: int = 3,
+    max_tile: int = 4096,
+    min_valid_frac: float = 0.02,
+    small_radius_max: float = 600.0,
+) -> Optional[dict]:
+    """Per-radius GLOBAL gradient (base, range, mean) for npr_edges, from full-res
+    stratified tiles.  npr's edge threshold is otherwise computed per block, which
+    differs tile-to-tile and seams.  Only the small (full-res, multi-tile) radii
+    need this; large radii run the whole coarsened grid as one block and are
+    already global.  Returns {round(radius): (base, range, mean)}."""
+    try:
+        from rasterio.windows import Window
+        from rasterio.enums import Resampling
+        from ..algorithms._impl_npr_edges import compute_npr_edges_spatial_block
+        from ..algorithms._base import classify_resolution
+    except Exception as exc:
+        logger.warning("npr grad-stats helpers unavailable: %s", exc)
+        return None
+    radii = (params or {}).get("radii") or []
+    small = [float(r) for r in radii if float(r) <= small_radius_max]
+    if not small:
+        return None
+    pixel_size = float(params.get("pixel_size", 1.0))
+    edge_sigma = float(params.get("edge_sigma", 1.0))
+    tl = float(params.get("threshold_low", 0.1))
+    th_ = float(params.get("threshold_high", 0.3))
+    low_res = classify_resolution(pixel_size) in ("low", "very_low", "ultra_low")
+    try:
+        margin = int(min(2 * max(small) + 16, max_tile // 4))
+        tile = int(min(max_tile, max(2048, 4 * margin)))
+        tiles = []
+        with rasterio.open(src_cog) as src:
+            W, H = src.width, src.height
+            nodata = src.nodata
+
+            def _dn(a):
+                a = a.astype(np.float32, copy=False)
+                if nodata is not None and not np.isnan(float(nodata)):
+                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
+                return a
+
+            cov = max(1, max(W, H) // 512)
+            ov = _dn(src.read(1, out_shape=(max(1, H // cov), max(1, W // cov)),
+                              resampling=Resampling.nearest, out_dtype=np.float32,
+                              masked=True).filled(np.nan))
+            vmask = np.isfinite(ov)
+            if not vmask.any():
+                return None
+            ys, xs = np.where(vmask)
+            by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
+            bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
+            ch_, cw_ = max(1, (by1 - by0) // grid), max(1, (bx1 - bx0) // grid)
+            for gy in range(grid):
+                for gx in range(grid):
+                    ccy = by0 + gy * ch_ + ch_ // 2
+                    ccx = bx0 + gx * cw_ + cw_ // 2
+                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
+                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
+                    tw, th2 = min(tile, W - wx0), min(tile, H - wy0)
+                    a = _dn(src.read(1, window=Window(wx0, wy0, tw, th2),
+                                     out_dtype=np.float32, masked=True).filled(np.nan))
+                    if float(np.isfinite(a).mean()) >= min_valid_frac:
+                        tiles.append(cp.asarray(a))
+        if not tiles:
+            return None
+        out = {}
+        for r in small:
+            pool = []
+            for g in tiles:
+                grad = compute_npr_edges_spatial_block(
+                    g, edge_sigma=edge_sigma, threshold_low=tl, threshold_high=th_,
+                    pixel_size=pixel_size, radius=r, _return_grad=True)
+                m = int(min(int(2 * r + 16), grad.shape[0] // 3, grad.shape[1] // 3))
+                if m > 0:
+                    grad = grad[m:-m, m:-m]
+                v = grad[~cp.isnan(grad)]
+                if v.size:
+                    pool.append(cp.asnumpy(v))
+                del grad, v
+            cp.get_default_memory_pool().free_all_blocks()
+            if not pool:
+                continue
+            allv = np.concatenate(pool)
+            mean = float(np.mean(allv))
+            if low_res:
+                base, rng = mean, float(np.std(allv)) * 1.5
+            else:
+                base = float(np.percentile(allv, 50))
+                rng = float(np.percentile(allv, 90)) - base
+            out[int(round(r))] = (base, rng, mean)
+        for g in tiles:
+            del g
+        cp.get_default_memory_pool().free_all_blocks()
+        if not out:
+            return None
+        logger.info("npr_edges global gradient threshold computed for radii %s",
+                    sorted(out.keys()))
+        return out
+    except Exception as exc:
+        logger.warning("Failed to compute npr grad stats: %s", exc)
+        return None
+
+
 # Normalized algorithms whose display range (-1..1 / 0..1) is derived from a
 # robust p99 of the algorithm's own output.  The stat is computed at FULL
 # RESOLUTION (so scale-sensitive algorithms keep correct magnitudes) on several
@@ -1509,6 +1707,90 @@ def run_pipeline(
             if _norm_stats is not None:
                 params["global_stats"] = _norm_stats
 
+        # fractal_anomaly's relief_conf uses a per-block roughness percentile that
+        # varies tile-to-tile (visible tile-boundary seams).  Inject a global
+        # roughness p10/p75 so it is consistent across the whole raster.
+        if (
+            algorithm == "fractal_anomaly"
+            and params.get("relief_p10") is None
+            and params.get("relief_p75") is None
+            and not is_zarr_path(src_cog)
+        ):
+            _relief = _compute_fractal_relief_stats(src_cog, params)
+            if _relief is not None:
+                params["relief_p10"], params["relief_p75"] = _relief
+
+        # npr_edges thresholds edges against a per-block gradient distribution
+        # (tile-boundary seams).  Inject a global per-radius gradient threshold so
+        # the small (full-res) radii are consistent across tiles.
+        if (
+            algorithm == "npr_edges"
+            and "_npr_grad_stats" not in params
+            and not is_zarr_path(src_cog)
+        ):
+            _ngs = _compute_npr_grad_stats(src_cog, params)
+            if _ngs:
+                params["_npr_grad_stats"] = _ngs
+
+        # fractal_anomaly / visual_saliency hybrid coarse path (RVI-style): when the
+        # user gives explicit large --radii, precompute their per-scale response
+        # fields (roughness / smooth) from the COG overview.  The algorithm then
+        # computes small radii at full resolution and samples these large fields with
+        # no per-chunk halo -- accurate large radii (no MAX_DEPTH halo truncation,
+        # which both blurred large scales and, for fractal, drove tile-boundary
+        # seams) and bounded VRAM on huge streaming rasters.
+        _HYBRID_PFX = {
+            "fractal_anomaly": "_fractal",
+            "visual_saliency": "_vs",
+            "scale_space_surprise": "_sss",
+        }
+        if (
+            algorithm in _HYBRID_PFX
+            and params.get("radii")
+            and f"{_HYBRID_PFX[algorithm]}_large_fields" not in params
+            and not is_zarr_path(src_cog)
+        ):
+            try:
+                from ..algorithms._nan_utils import compute_overview_scale_fields
+                _radii = [float(r) for r in (params.get("radii") or [])]
+                _pfx = _HYBRID_PFX[algorithm]
+                if algorithm == "fractal_anomaly":
+                    from ..algorithms._impl_fractal_anomaly import (
+                        fractal_large_scale_predicate as _pred,
+                        _fractal_roughness_block as _bfn,
+                    )
+                    if len(_radii) < 5:
+                        _radii = [4.0, 8.0, 16.0, 32.0, 64.0]
+                elif algorithm == "visual_saliency":
+                    from ..algorithms._impl_visual_saliency import (
+                        vs_large_scale_predicate as _pred,
+                        _vs_smooth_block as _bfn,
+                    )
+                    _radii = [max(0.5, float(s)) for s in _radii]
+                    if len(_radii) < 4:
+                        _radii = [2.0, 4.0, 8.0, 16.0]
+                else:  # scale_space_surprise
+                    from ..algorithms._impl_experimental import (
+                        sss_large_scale_predicate as _pred,
+                        _sss_smooth_block as _bfn,
+                    )
+                    _radii = sorted(s for s in _radii if s > 0)
+                _large = [r for r in _radii if _pred(r)]
+                if _large:
+                    _fields, _decim = compute_overview_scale_fields(
+                        src_cog, large_radii=_large, block_fn=_bfn)
+                    if _fields:
+                        params[f"{_pfx}_large_fields"] = _fields
+                        params[f"{_pfx}_full_shape"] = tuple(int(s) for s in gpu_arr.shape)
+                        logger.info(
+                            "%s hybrid overview path: large_radii=%s, decimation=%.1fx "
+                            "-> per-chunk halo bounded (small radii only)",
+                            algorithm, [int(round(r)) for r in _large], _decim)
+            except Exception as exc:
+                logger.warning(
+                    "%s hybrid overview path unavailable; using single-block path: %s",
+                    algorithm, exc)
+
         # RVI large-radius-from-overview fast path: split radii at a chunk-aware
         # threshold; compute the large-radius contribution from the COG overview
         # (no huge per-chunk halo) and let the algorithm add it to the small-radius
@@ -1555,7 +1837,12 @@ def run_pipeline(
 
         # 6-3) Run the algorithm (within run_pipeline)
         # Redact bulky internal arrays (e.g. the RVI coarse field) from logs/metadata.
-        _log_params = {k: v for k, v in params.items() if not k.startswith("_rvi_coarse_field")}
+        _log_params = {
+            k: v for k, v in params.items()
+            if not (k.startswith("_rvi_coarse_field")
+                    or k in ("_fractal_large_fields", "_vs_large_fields",
+                             "_sss_large_fields"))
+        }
         logger.info(f"Computing {algorithm} with parameters: {_log_params}")
 
         # Apply the algorithm (lazy evaluation)
@@ -1575,6 +1862,9 @@ def run_pipeline(
         for _k in (
             "_rvi_coarse_field", "_rvi_small_radii", "_rvi_small_weights",
             "_rvi_w_large", "_rvi_full_shape", "_rvi_field_offset",
+            "_fractal_large_fields", "_fractal_full_shape",
+            "_vs_large_fields", "_vs_full_shape",
+            "_sss_large_fields", "_sss_full_shape",
         ):
             params.pop(_k, None)
 
