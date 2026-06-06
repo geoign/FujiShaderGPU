@@ -161,22 +161,25 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
     sm = [cp.where(cp.isnan(s), fillv, s).astype(cp.float32) for s in smooths]
     n = len(sm)
     wvec = resolve_block_weights(weights, n)
-    c_indices = [0, 1]
-    deltas = [2, 3]
-    intensity_maps = []
-    intensity_w = []
-    for ci in c_indices:
-        for d in deltas:
+    # Intensity conspicuity: running weighted mean of |center - surround|.  The
+    # maps are accumulated in place (not stacked) so peak per-block VRAM stays low
+    # on large rasters -- a stacked list of all intensity+orientation maps exhausts
+    # the RMM pool.  Equivalent to _weighted_mean_maps over the same maps/weights.
+    I_acc = cp.zeros_like(block, dtype=cp.float32)
+    I_w = 0.0
+    for ci in (0, 1):
+        for d in (2, 3):
             si = ci + d
             if si >= n:
                 continue
-            fm = cp.abs(sm[ci] - sm[si])
-            intensity_maps.append(_compress_saliency_feature(fm))
-            if wvec is not None:
-                intensity_w.append(float(wvec[ci]))
-    I = _weighted_mean_maps(intensity_maps, intensity_w if wvec is not None else None, block)
-    ori_maps = []
-    ori_w = []
+            fm = _compress_saliency_feature(cp.abs(sm[ci] - sm[si]))
+            wj = float(wvec[ci]) if wvec is not None else 1.0
+            I_acc += fm * cp.float32(wj)
+            I_w += wj
+    I = I_acc / cp.float32(I_w) if I_w > 0 else I_acc
+    # Orientation conspicuity: running weighted mean over scales x orientations.
+    O_acc = cp.zeros_like(block, dtype=cp.float32)
+    O_w = 0.0
     orientations = [0.0, cp.pi / 4, cp.pi / 2, 3 * cp.pi / 4]
     step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
     step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
@@ -188,12 +191,12 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
         gy, gx = cp.gradient(sm[j], step_y, step_x)
         mag = cp.sqrt(gx * gx + gy * gy) + 1e-8
         theta = cp.arctan2(gy, gx)
+        wj = float(wvec[j]) if wvec is not None else 1.0
         for o in orientations:
-            resp = mag * cp.maximum(cp.cos(2.0 * (theta - o)), 0.0)
-            ori_maps.append(_compress_saliency_feature(resp))
-            if wvec is not None:
-                ori_w.append(float(wvec[j]))
-    O = _weighted_mean_maps(ori_maps, ori_w if wvec is not None else None, block)
+            resp = _compress_saliency_feature(mag * cp.maximum(cp.cos(2.0 * (theta - o)), 0.0))
+            O_acc += resp * cp.float32(wj)
+            O_w += wj
+    O = O_acc / cp.float32(O_w) if O_w > 0 else O_acc
     sal = 0.5 * (I + O)
     if normalize:
         if norm_min is None or norm_scale is None:
@@ -242,20 +245,20 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
             stats = (0.0, 1.0)
 
-        # Per-scale smooths: small scales full-res, large scales on a coarsened
-        # overview (accurate large --radii, no rechunk-merge OOM).  The combine
-        # then builds intensity (scale diffs) + orientation (gradients).
-        smooths = multiscale_response_fields(
-            gpu_arr, use_scales, block_fn=_vs_smooth_block,
-            depth_for_scale=lambda s: int(s * 5),
-            pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-            pixel_scale_y=pixel_scale_y, is_geographic=is_geo)
-        # Small halo so the orientation gradient is seam-free at chunk borders.
-        return da.map_overlap(
-            _vs_combine_block, gpu_arr, *smooths,
-            depth=2, boundary='reflect', dtype=cp.float32,
+        # Single self-contained block per output tile (bounds device memory).  The
+        # coarse-overview decomposition into many per-scale smooth fields fed a deep
+        # dask graph whose GPU intermediates accumulated to tens of GB on large
+        # streaming rasters (ALOS/Kyoto) and exhausted the RMM pool.  The halo is
+        # capped at MAX_DEPTH (and below the chunk), so very large radii are
+        # approximated (truncated halo) instead of OOM; default/small radii are
+        # unaffected.
+        min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
+        depth = max(1, min(int(max(use_scales) * 5), Constants.MAX_DEPTH, int(min_chunk) - 1))
+        return gpu_arr.map_overlap(
+            compute_visual_saliency_block, depth=depth,
+            boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
-            weights=weights, pixel_size=pixel_size,
+            scales=scales, weights=weights, pixel_size=pixel_size,
             pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
             normalize=True, norm_min=stats[0], norm_scale=stats[1])
 

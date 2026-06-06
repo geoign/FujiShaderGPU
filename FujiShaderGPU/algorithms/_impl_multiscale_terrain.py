@@ -163,7 +163,8 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         psy = params.get('pixel_scale_y', None)
         # Coarse path is only used in the explicit spatial (radii) mode; the
         # default-scales path keeps its original uniform-depth behavior exactly.
-        F = coarsen_factor_for_shape(gpu_arr.shape) if (is_spatial and not is_geo) else 1
+        # Coarsen for large scales on geographic DEMs too (pixel-based, correct).
+        F = coarsen_factor_for_shape(gpu_arr.shape) if is_spatial else 1
         common_depth = min(int(4 * max(scales)), Constants.MAX_DEPTH)
         cache = {}
 

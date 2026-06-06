@@ -51,7 +51,13 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         int(available_gb * tuned["rmm_pool_fraction"]),
         rmm_cap_gb,
     )
-    rmm_max_gb = max(rmm_size, min(int(rmm_size * 1.2), int(device_limit_gb * 0.95)))
+    # Let the pool grow to nearly the full device budget.  Capping it at
+    # rmm_size*1.2 left only ~3GB of headroom above the eager pool, so the
+    # combine-heavy algorithms (visual_saliency / fractal_anomaly) -- whose many
+    # small alloc/free cycles fragment the pool -- ran out of room even at tiny
+    # chunks.  Staying just under device_memory_limit lets dask spill instead of
+    # hard-failing the RMM pool.
+    rmm_max_gb = max(rmm_size + 1, int(device_limit_gb * 0.97))
     spill_dir = os.environ.get('FUJISHADER_SPILL_DIR', tempfile.gettempdir())
     logger.info("Dask spill directory: %s", spill_dir)
     logger.info(

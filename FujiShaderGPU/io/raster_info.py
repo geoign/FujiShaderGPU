@@ -31,7 +31,14 @@ def metric_pixel_scales_from_metadata(
     abs_y = abs(sy)
 
     if crs and getattr(crs, "is_geographic", False):
-        lat_center = 0.5 * (float(bounds.bottom) + float(bounds.top))
+        # bounds may be a rasterio BoundingBox (.bottom/.top) or a plain
+        # (left, bottom, right, top) tuple, which rioxarray's .rio.bounds()
+        # returns; support both so geographic detection works on the dask path.
+        if hasattr(bounds, "bottom"):
+            _bottom, _top = float(bounds.bottom), float(bounds.top)
+        else:
+            _bottom, _top = float(bounds[1]), float(bounds[3])
+        lat_center = 0.5 * (_bottom + _top)
         meters_per_degree_lat = 111_320.0
         meters_per_degree_lon = meters_per_degree_lat * max(
             1e-6, abs(math.cos(math.radians(lat_center)))

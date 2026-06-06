@@ -364,7 +364,12 @@ def multiscale_response_fields(
     downstream ``da.map_blocks/map_overlap(combine, gpu_arr, *fields)`` aligns
     block-wise.
     """
-    F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geographic else 1
+    # Coarsen for large radii regardless of CRS: the coarse path is pixel-based
+    # and scales pixel_size / pixel_scale_x / pixel_scale_y independently by the
+    # factor, so it stays correct (and anisotropy-preserving) for geographic DEMs
+    # too.  Disabling it there forced large radii through a near-chunk halo that
+    # exhausts VRAM.  (is_geographic is kept for API compatibility / callers.)
+    F = coarsen_factor_for_shape(gpu_arr.shape)
     if coarse_cache is None:
         coarse_cache = {}
     # The map_overlap halo must stay below the smallest chunk; a halo >= a chunk

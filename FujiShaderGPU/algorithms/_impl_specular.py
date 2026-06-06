@@ -151,7 +151,9 @@ class SpecularAlgorithm(DaskAlgorithm):
             # the coarse and full-res branches, so it cannot express that.
             is_geo = bool(params.get("is_geographic_dem", False))
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
-            F = coarsen_factor_for_shape(gpu_arr.shape) if not is_geo else 1
+            # Coarsen for large radii on geographic DEMs too (pixel-based; the
+            # roughness kernel and metric scales below are scaled by F as well).
+            F = coarsen_factor_for_shape(gpu_arr.shape)
             cache = {}
             responses = []
             for radius in radii:

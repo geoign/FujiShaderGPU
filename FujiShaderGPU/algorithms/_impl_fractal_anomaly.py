@@ -102,23 +102,38 @@ def _fractal_feature_from_roughness(block, sigmas, *, radii, weights=None, norma
     """Regression -> feature -> despeckle -> normalize half of fractal_anomaly,
     given a precomputed per-scale roughness stack ``sigmas`` (H, W, N)."""
     nan_mask = cp.isnan(block)
-    fit_scales = cp.asarray(radii, dtype=cp.float32)
-    log_scales = cp.log(fit_scales)
-    log_sigmas = cp.log(cp.maximum(sigmas, 1e-5))
-    scale_w = resolve_block_weights(weights, len(radii))
-    if scale_w is None:
-        scale_w = cp.sqrt(fit_scales)
-        scale_w = scale_w / cp.sum(scale_w)
-    w3 = scale_w.reshape(1, 1, -1)
-    mean_log_scale = cp.sum(log_scales * scale_w)
-    mean_log_sigma = cp.sum(log_sigmas * w3, axis=2)
-    log_scales_bc = log_scales.reshape(1, 1, -1)
-    cov = cp.sum((log_scales_bc - mean_log_scale) * (log_sigmas - mean_log_sigma[:, :, None]) * w3, axis=2)
-    var_log_scale = cp.sum(((log_scales - mean_log_scale) ** 2) * scale_w)
+    n_sc = int(sigmas.shape[2])
+    # Per-scale log-roughness accumulated in place.  The vectorized form built
+    # several H x W x N intermediates (y_fit, (log_sigmas - y_fit)**2, ...) which
+    # exhaust the RMM pool on large chunks; this computes the identical weighted
+    # log-log regression with only H x W accumulators (log_sigma_i recomputed per
+    # pass -- cheap on GPU).
+    def _lsig(i):
+        return cp.log(cp.maximum(sigmas[:, :, i], 1e-5))
+    _ls = [float(np.log(max(float(r), 1e-9))) for r in list(radii)[:n_sc]]
+    _sw_gpu = resolve_block_weights(weights, n_sc)
+    if _sw_gpu is None:
+        _swa = np.sqrt(np.asarray([float(r) for r in list(radii)[:n_sc]], dtype=np.float64))
+        _sw = (_swa / _swa.sum()).tolist()
+    else:
+        _sw = [float(x) for x in cp.asnumpy(_sw_gpu)]
+    mean_log_scale = float(sum(_ls[i] * _sw[i] for i in range(n_sc)))
+    var_log_scale = float(sum(((_ls[i] - mean_log_scale) ** 2) * _sw[i] for i in range(n_sc)))
+    mean_log_sigma = cp.zeros(sigmas.shape[:2], dtype=cp.float32)
+    for i in range(n_sc):
+        mean_log_sigma = mean_log_sigma + _lsig(i) * cp.float32(_sw[i])
+    cov = cp.zeros(sigmas.shape[:2], dtype=cp.float32)
+    ss_tot = cp.zeros(sigmas.shape[:2], dtype=cp.float32)
+    for i in range(n_sc):
+        _d = _lsig(i) - mean_log_sigma
+        cov = cov + cp.float32(_ls[i] - mean_log_scale) * _d * cp.float32(_sw[i])
+        ss_tot = ss_tot + (_d * _d) * cp.float32(_sw[i])
     beta = cov / (var_log_scale + 1e-10)
-    y_fit = mean_log_sigma[:, :, None] + beta[:, :, None] * (log_scales_bc - mean_log_scale)
-    ss_res = cp.sum(((log_sigmas - y_fit) ** 2) * w3, axis=2)
-    ss_tot = cp.sum(((log_sigmas - mean_log_sigma[:, :, None]) ** 2) * w3, axis=2)
+    ss_res = cp.zeros(sigmas.shape[:2], dtype=cp.float32)
+    for i in range(n_sc):
+        _yfit = mean_log_sigma + beta * cp.float32(_ls[i] - mean_log_scale)
+        _diff = _lsig(i) - _yfit
+        ss_res = ss_res + (_diff * _diff) * cp.float32(_sw[i])
     r2 = cp.clip(1.0 - ss_res / (ss_tot + 1e-10), 0.0, 1.0)
     rmse = cp.sqrt(cp.maximum(ss_res, 0.0))
     beta_dev = cp.clip(beta - 1.2, -4.0, 4.0)
@@ -137,11 +152,11 @@ def _fractal_feature_from_roughness(block, sigmas, *, radii, weights=None, norma
     relief_conf = cp.clip((roughness - r_p10) / max(r_p75 - r_p10, 1e-6), 0.0, 1.0)
     raw_feature = 0.75 * beta_dev + 0.45 * rmse_comp
     fine_i = 0
-    coarse_i = min(2, log_sigmas.shape[2] - 1)
-    fine_ratio = log_sigmas[:, :, fine_i] - log_sigmas[:, :, coarse_i]
-    max_i = log_sigmas.shape[2] - 1
+    coarse_i = min(2, n_sc - 1)
+    fine_ratio = _lsig(fine_i) - _lsig(coarse_i)
+    max_i = n_sc - 1
     macro_i = max(max_i - 2, 0)
-    macro_ratio = log_sigmas[:, :, max_i] - log_sigmas[:, :, macro_i]
+    macro_ratio = _lsig(max_i) - _lsig(macro_i)
     raw_feature = raw_feature + 0.35 * macro_ratio * relief_conf
     raw_feature = raw_feature + float(detail_boost) * 0.18 * fine_ratio * relief_conf
     smooth = max(0.0, float(smoothing_sigma))
@@ -250,25 +265,17 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
                 rp10, rp75 = float(stats[2]), float(stats[3])
         mean_D, std_D = float(stats[0]), float(stats[1])
 
-        # Per-scale roughness: small radii full-res, large radii on a coarsened
-        # overview (accurate large --radii, no rechunk-merge OOM).  The combine
-        # then runs the log-log regression + despeckle on the roughness stack.
-        roughness = multiscale_response_fields(
-            gpu_arr, radii, block_fn=_fractal_roughness_block,
-            depth_for_scale=lambda r: int(2 * r) + 16,
-            pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo)
-        # The combine only needs a small halo for the feature smoothing + size-3
-        # median, but the per-block relief percentile (relief_conf) matches the
-        # original's full-resolution block when it sees the same neighborhood, so
-        # use the original halo bounded by MAX_DEPTH and the chunk size (a halo
-        # >= a chunk would rechunk and misalign the inputs).
+        # Single self-contained block per output tile (bounds device memory).  The
+        # coarse-overview decomposition into 6 per-scale roughness fields fed a deep
+        # dask graph whose GPU intermediates accumulated to tens of GB on large
+        # streaming rasters (ALOS/Kyoto).  The halo is capped at MAX_DEPTH (and
+        # below the chunk), so very large radii are approximated (truncated halo)
+        # instead of OOM; default/small radii are unaffected.
         min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
-        combine_depth = max(int(4 * max(0.0, sm_sig)) + 4,
-                            min(2 * max_r + 16, Constants.MAX_DEPTH))
-        combine_depth = max(2, min(combine_depth, int(min_chunk) - 1))
-        return da.map_overlap(
-            _fractal_combine_block, gpu_arr, *roughness,
-            depth=combine_depth, boundary='reflect', dtype=cp.float32,
+        depth = max(1, min(2 * max_r + 16, Constants.MAX_DEPTH, int(min_chunk) - 1))
+        return gpu_arr.map_overlap(
+            compute_fractal_dimension_block, depth=depth,
+            boundary='reflect', dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32),
             radii=radii, weights=weights, normalize=True,
             mean_global=mean_D, std_global=std_D,

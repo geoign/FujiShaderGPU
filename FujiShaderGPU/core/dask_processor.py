@@ -494,9 +494,14 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
     if available_ram_gb > 20:  # when more than 20GB is free
         logger.info(f"Enabling chunk prefetching (available DRAM: {available_ram_gb:.1f}GB)")
         
-        # Set Dask scheduler hints
+        # Set Dask scheduler hints.  NOTE: keep blockwise fusion ON (the dask
+        # default).  Disabling it (optimization.fuse.active=False) leaves every
+        # intermediate as a separate task whose GPU result lingers until all
+        # consumers finish; for deep graphs (e.g. visual_saliency / fractal_anomaly
+        # combine 6 per-scale fields) this makes device memory grow monotonically
+        # to tens of GB and exhaust the RMM pool.  Fusion frees per-block
+        # intermediates immediately, bounding peak VRAM.
         prefetch_config = {
-            "optimization.fuse.active": False,  # disable chunk fusion
             "distributed.worker.memory.pause": 0.90,  # allow up to 90% memory usage
             "distributed.worker.memory.spill": 0.95,  # spill at 95%
         }
@@ -1184,7 +1189,8 @@ def _compute_norm_stats_tiled(
             cov = max(1, max(W, H) // 512)
             ov = _denodata(src.read(
                 1, out_shape=(max(1, H // cov), max(1, W // cov)),
-                resampling=Resampling.nearest, masked=True).filled(np.nan))
+                resampling=Resampling.nearest, out_dtype=np.float32,
+                masked=True).filled(np.nan))
             vmask = np.isfinite(ov)
             if not vmask.any():
                 return None
@@ -1315,6 +1321,18 @@ def run_pipeline(
 
     # Get the memory fraction (from algo_params, else default)
     memory_fraction = algo_params.pop('memory_fraction', None)
+    # visual_saliency / fractal_anomaly build many per-scale fields plus heavy
+    # combine intermediates; on large rasters their peak device memory exceeds the
+    # conservative default and fragments the RMM pool.  The GPU is single-process
+    # here, so give these two a larger share of it (the rest keep the default).
+    if algorithm in ("visual_saliency", "fractal_anomaly"):
+        _mf = 0.5 if memory_fraction is None else float(memory_fraction)
+        if _mf < 0.78:
+            memory_fraction = 0.78
+            logger.info(
+                "Combine-heavy algorithm '%s': raising GPU memory fraction %.2f -> 0.78",
+                algorithm, _mf,
+            )
     # NoData override: replace the given value with float NaN after load (not passed to the algorithm)
     nodata_override = algo_params.pop('nodata_override', None)
     # Output encoding: float32 (default) / int16 / uint8. Not passed to the algorithm.
@@ -1350,6 +1368,26 @@ def run_pipeline(
             chunk = compute_dask_chunk(
                 _vram_gb, data_gb=total_gb, algorithm=algorithm,
             )
+
+            # ALGORITHM_COMPLEXITY (which drives the chunk size) is calibrated for
+            # the LOCAL single-pass.  A multi-radius spatial run computes one
+            # response per radius and holds them together for the weighted combine,
+            # so the peak per-block VRAM is several times higher -- heavy blocks
+            # (hillshade surface normals, atmospheric trig, etc.) then overflow the
+            # RMM pool.  Shrink the chunk by ~1/sqrt(n_radii) so the per-block
+            # footprint stays inside the pool regardless of the per-algorithm
+            # complexity estimate.
+            _n_radii = len(radii) if radii else 0
+            if _n_radii > 1:
+                _shrink = (2.0 / (1.0 + min(_n_radii, 6))) ** 0.5
+                _shrunk = max(2048, (int(chunk * _shrink) // 256) * 256)
+                if _shrunk < chunk:
+                    logger.info(
+                        "Multi-radius run (%d radii): shrinking chunk %d -> %d "
+                        "to keep per-block VRAM within the RMM pool.",
+                        _n_radii, chunk, _shrunk,
+                    )
+                    chunk = _shrunk
 
             logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
         
