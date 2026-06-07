@@ -93,21 +93,33 @@ Examples:
     parser.add_argument(
         "--nodata",
         type=str,
-        default=None,
-        help="Explicit NoData value (e.g. -9999, 0, nan); replaced with NaN before filling",
+        default="auto",
+        help=(
+            "NoData handling (default: auto). 'auto' infers NoData: (1) the "
+            "declared metadata NoData, then any undeclared (2) sentinel/extreme "
+            "value dominating the grid (0, -9999, int min/max, ...) or (3) value "
+            "dominating the border; (4) none if nothing matches. A number forces "
+            "that value; 'nan'; 'none' disables inference (treat all as valid)."
+        ),
     )
     parser.add_argument(
         "--no-detect-nodata",
         dest="detect_nodata",
         action="store_false",
-        help="Disable auto-detection of undeclared NoData from a constant border (default: enabled)",
+        help="Disable the auto inference even with --nodata auto (alias for --nodata none)",
     )
     parser.set_defaults(detect_nodata=True)
     parser.add_argument(
         "--nodata-border-fraction",
         type=float,
         default=0.5,
-        help="Auto-detection: minimum fraction of the outer ring the value must occupy (default: 0.5)",
+        help="Auto rule 3: minimum fraction of the outer ring the value must occupy (default: 0.5)",
+    )
+    parser.add_argument(
+        "--nodata-sentinel-fraction",
+        type=float,
+        default=0.05,
+        help="Auto rule 2: minimum fraction of the whole grid a sentinel/extreme must occupy (default: 0.05)",
     )
     parser.add_argument(
         "--force",
@@ -123,18 +135,29 @@ Examples:
     return parser
 
 
-def _parse_nodata(raw_value):
-    """Parse a --nodata string into a float (or None). 'nan' is accepted but is a
-    no-op for filling (already NaN); finite values are converted to NaN."""
-    if raw_value is None:
-        return None
-    text = str(raw_value).strip().lower()
+def _interpret_nodata(raw_value, detect_default: bool):
+    """Map the ``--nodata`` string to ``(nodata_override, detect_nodata)``.
+
+    - ``auto`` (default): infer (rules 1-4); ``detect_nodata`` stays on.
+    - ``none`` / ``off``: no inference, no override (treat all as valid).
+    - ``nan``: treat NaN as NoData (already the float sentinel); no inference.
+    - a number: force that value as NoData; no inference.
+    ``detect_default`` is ``False`` when ``--no-detect-nodata`` was passed, which
+    forces inference off regardless.
+    """
+    text = "auto" if raw_value is None else str(raw_value).strip().lower()
+    if text in {"auto", ""}:
+        return None, bool(detect_default)
+    if text in {"none", "off"}:
+        return None, False
     if text in {"nan", "+nan", "-nan"}:
-        return float("nan")
+        return float("nan"), False
     try:
-        return float(raw_value)
+        return float(raw_value), False
     except ValueError as exc:
-        raise ValueError(f"Invalid --nodata value: {raw_value}") from exc
+        raise ValueError(
+            f"Invalid --nodata value: {raw_value!r} (use a number, 'auto', 'none', or 'nan')"
+        ) from exc
 
 
 def main(argv=None) -> None:
@@ -144,7 +167,13 @@ def main(argv=None) -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logger = logging.getLogger(__name__)
-    logger.info("=== DEM preprocessing (COG-ification + fill: %s) ===", args.fill_mode)
+    nodata_override, detect_nodata = _interpret_nodata(args.nodata, args.detect_nodata)
+    logger.info(
+        "=== DEM preprocessing (COG-ification + fill: %s | nodata: %s) ===",
+        args.fill_mode,
+        "auto" if (detect_nodata and nodata_override is None) else
+        ("none" if (not detect_nodata and nodata_override is None) else nodata_override),
+    )
     try:
         preprocess_dem_to_cog(
             args.input,
@@ -156,9 +185,10 @@ def main(argv=None) -> None:
             zstd_level=args.zstd_level,
             num_threads=args.num_threads,
             overwrite=args.force,
-            nodata_override=_parse_nodata(args.nodata),
-            detect_nodata=args.detect_nodata,
+            nodata_override=nodata_override,
+            detect_nodata=detect_nodata,
             nodata_border_fraction=args.nodata_border_fraction,
+            nodata_sentinel_fraction=args.nodata_sentinel_fraction,
             max_workers=args.workers,
         )
     except Exception as exc:

@@ -132,6 +132,54 @@ def _detect_border_nodata(
     return cand
 
 
+# Common undeclared NoData fills (float-cast).  Integer type min/max and the
+# float32 extremes cover sentinels left behind when an integer or padded raster
+# was converted to float without carrying its NoData tag.
+_NODATA_SENTINELS = (
+    0.0, -9999.0, -99999.0, 9999.0,
+    -32768.0, 32767.0, -32767.0, 65535.0,
+    -2147483648.0, 2147483647.0, -2147483647.0,
+    -128.0, 127.0, 255.0,
+)
+
+
+def _detect_sentinel_nodata(
+    sample: np.ndarray,
+    valid: np.ndarray,
+    *,
+    min_fraction: float = 0.05,
+) -> Optional[float]:
+    """Guess an *undeclared* NoData value from a dominant sentinel/extreme value.
+
+    Rule 2 of ``--nodata auto``: a single finite value occupying at least
+    ``min_fraction`` of the whole grid is treated as NoData when it is either a
+    known fill sentinel (0, -9999, integer type min/max, float32 extremes) **or**
+    the extreme (min or max) of the data range.  Real terrain elevations are
+    continuous and rarely pile a large fraction onto one exact value, so a
+    dominant spike at an extreme/sentinel is almost always a forgotten NoData fill
+    (e.g. a float DEM padded with 0 outside its footprint -- the case the border
+    rule misses when the fill is spread through the interior, not just the frame).
+
+    ``sample`` must be a NEAREST-resampled grid so the exact value survives;
+    ``valid`` excludes cells already masked by the declared NoData.  Returns the
+    value, or ``None``.
+    """
+    finite = sample[valid & np.isfinite(sample)]
+    if finite.size < 64:
+        return None
+    vals, counts = np.unique(finite, return_counts=True)
+    i = int(np.argmax(counts))
+    cand = float(vals[i])
+    if counts[i] / float(finite.size) < float(min_fraction):
+        return None
+    known = any(abs(cand - s) <= 1e-6 * max(1.0, abs(s)) for s in _NODATA_SENTINELS)
+    very_extreme = abs(cand) >= 1e30
+    is_range_extreme = (cand == float(vals[0]) or cand == float(vals[-1]))
+    if known or very_extreme or is_range_extreme:
+        return cand
+    return None
+
+
 def _coarse_shape(width: int, height: int, coarse_max: int) -> tuple[int, int]:
     scale = max(width / coarse_max, height / coarse_max, 1.0)
     cw = max(1, int(round(width / scale)))
@@ -326,6 +374,7 @@ def preprocess_dem_to_cog(
     nodata_override: Optional[float] = None,
     detect_nodata: bool = True,
     nodata_border_fraction: float = 0.5,
+    nodata_sentinel_fraction: float = 0.05,
     max_workers: Optional[int] = None,
 ) -> None:
     """Convert ``input_path`` (any GDAL raster) into a FujiShaderGPU-ready COG.
@@ -395,18 +444,27 @@ def preprocess_dem_to_cog(
             )
             nn = np.ma.getdata(nn_ma).astype(np.float32, copy=False)
             nn_valid = (~np.ma.getmaskarray(nn_ma)) & np.isfinite(nn)
-            detected = _detect_border_nodata(
-                nn, nn_valid, min_border_fraction=nodata_border_fraction,
-            )
-            if detected is not None:
-                already = any(np.isclose(detected, v) for v in extra_nodata)
-                declared = src_nodata is not None and np.isclose(detected, float(src_nodata))
+            # Rule 2: a dominant sentinel/extreme across the whole grid; Rule 3: a
+            # dominant constant border.  Union both (a DEM can have an undeclared
+            # interior fill *and* a frame).
+            for _detected, _why in (
+                (_detect_sentinel_nodata(
+                    nn, nn_valid, min_fraction=nodata_sentinel_fraction),
+                 "dominant sentinel/extreme value"),
+                (_detect_border_nodata(
+                    nn, nn_valid, min_border_fraction=nodata_border_fraction),
+                 "constant border"),
+            ):
+                if _detected is None:
+                    continue
+                already = any(np.isclose(_detected, v) for v in extra_nodata)
+                declared = src_nodata is not None and np.isclose(_detected, float(src_nodata))
                 if not already and not declared:
-                    extra_nodata.append(float(detected))
+                    extra_nodata.append(float(_detected))
                     logger.warning(
-                        "Auto-detected undeclared NoData from constant border: %s -> NaN "
-                        "(disable with --no-detect-nodata / detect_nodata=False)",
-                        float(detected),
+                        "Auto-detected undeclared NoData (%s): %s -> NaN "
+                        "(disable with --nodata none)",
+                        _why, float(_detected),
                     )
 
         # Fold the sentinels into the coarse mask so the fill surface, edge
