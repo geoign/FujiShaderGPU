@@ -1081,95 +1081,9 @@ def _compute_rvi_overview_coarse_field(
         return None
 
 
-def _compute_fractal_relief_stats(
-    src_cog: str,
-    params: dict,
-    *,
-    grid: int = 3,
-    max_tile: int = 4096,
-    min_valid_frac: float = 0.02,
-) -> Optional[tuple]:
-    """Global roughness (relief) p10/p75 for fractal_anomaly, from full-resolution
-    stratified tiles.  ``relief_conf`` otherwise uses a per-block roughness
-    percentile, which differs tile-to-tile and produces tile-boundary seams; a
-    single global pair makes it consistent across the whole raster.  Computed at
-    full resolution so the magnitude matches the per-block roughness."""
-    try:
-        from rasterio.windows import Window
-        from rasterio.enums import Resampling
-        from ..algorithms._impl_fractal_anomaly import compute_roughness_multiscale
-        from ..algorithms.dask_registry import ALGORITHMS
-    except Exception as exc:
-        logger.warning("fractal relief-stats helpers unavailable: %s", exc)
-        return None
-    try:
-        defaults = ALGORITHMS["fractal_anomaly"].get_default_params() or {}
-    except Exception:
-        defaults = {}
-    radii = (params or {}).get("radii") or defaults.get("radii") or [4, 8, 16, 32, 64]
-    if len(radii) < 5:
-        radii = [4, 8, 16, 32, 64]
-    max_r = max(float(r) for r in radii)
-    try:
-        margin = int(min(2 * max_r + 16, max_tile // 4))
-        tile = int(min(max_tile, max(2048, 4 * margin)))
-        pooled = []
-        with rasterio.open(src_cog) as src:
-            W, H = src.width, src.height
-            nodata = src.nodata
-
-            def _dn(a):
-                a = a.astype(np.float32, copy=False)
-                if nodata is not None and not np.isnan(float(nodata)):
-                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
-                return a
-
-            cov = max(1, max(W, H) // 512)
-            ov = _dn(src.read(1, out_shape=(max(1, H // cov), max(1, W // cov)),
-                              resampling=Resampling.nearest, out_dtype=np.float32,
-                              masked=True).filled(np.nan))
-            vmask = np.isfinite(ov)
-            if not vmask.any():
-                return None
-            ys, xs = np.where(vmask)
-            by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
-            bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
-            ch_, cw_ = max(1, (by1 - by0) // grid), max(1, (bx1 - bx0) // grid)
-            for gy in range(grid):
-                for gx in range(grid):
-                    ccy = by0 + gy * ch_ + ch_ // 2
-                    ccx = bx0 + gx * cw_ + cw_ // 2
-                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
-                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
-                    tw, th = min(tile, W - wx0), min(tile, H - wy0)
-                    a = _dn(src.read(1, window=Window(wx0, wy0, tw, th),
-                                     out_dtype=np.float32, masked=True).filled(np.nan))
-                    if float(np.isfinite(a).mean()) < min_valid_frac:
-                        continue
-                    g = cp.asarray(a)
-                    sig = compute_roughness_multiscale(g, radii, window_mult=3, detrend=True)
-                    rough = cp.mean(sig, axis=2)
-                    m = int(min(margin, rough.shape[0] // 3, rough.shape[1] // 3))
-                    if m > 0:
-                        rough = rough[m:-m, m:-m]
-                    vals = rough[~cp.isnan(rough)]
-                    if vals.size:
-                        pooled.append(cp.asnumpy(vals))
-                    del g, sig, rough, vals
-                    cp.get_default_memory_pool().free_all_blocks()
-        if not pooled:
-            return None
-        allv = np.concatenate(pooled)
-        p10 = float(np.percentile(allv, 10))
-        p75 = float(np.percentile(allv, 75))
-        if not (np.isfinite(p10) and np.isfinite(p75) and p75 > p10):
-            return None
-        logger.info("fractal_anomaly global relief: p10=%.4g p75=%.4g (from %d tiles)",
-                    p10, p75, len(pooled))
-        return (p10, p75)
-    except Exception as exc:
-        logger.warning("Failed to compute fractal relief stats: %s", exc)
-        return None
+# Shared with the tile backend: the implementation lives in the backend-neutral
+# algorithms/_impl_fractal_anomaly.py so both pipelines use one copy.
+from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
 
 
 # Shared with the tile backend: the implementation lives in the backend-neutral

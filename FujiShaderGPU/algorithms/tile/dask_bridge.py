@@ -428,6 +428,7 @@ def _process_direct(algo, class_name, dem_gpu, params):
         "HillshadeAlgorithm", "SlopeAlgorithm", "SpecularAlgorithm",
         "AtmosphericScatteringAlgorithm", "CurvatureAlgorithm",
         "AmbientOcclusionAlgorithm", "OpennessAlgorithm",
+        "FractalAnomalyAlgorithm",
     }:
         raise _FallbackToDask()
     if class_name == "HillshadeAlgorithm":

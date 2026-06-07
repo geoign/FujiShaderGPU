@@ -245,8 +245,7 @@ def _required_padding_for_algorithm(
     # radii then come from the overview and need no per-tile halo.
     _overview_active = (
         _mode == "spatial" and bool(algo_params.get("radii"))
-        and not _is_geo
-        and algorithm not in ("rvi", "fractal_anomaly")
+        and not _is_geo and algorithm != "rvi"
     )
     # large_radius_threshold for the spatial-switch algorithms (matches
     # _nan_utils.large_radius_threshold's floor; the tile is one chunk).
@@ -307,12 +306,25 @@ def _required_padding_for_algorithm(
             except Exception:
                 radii = [4, 8, 16, 32, 64]
         try:
-            max_radius = max(int(round(float(r))) for r in radii if float(r) > 0)
+            radii_f = [float(r) for r in radii if float(r) > 0]
+            if _overview_active:
+                # Large radii come from the overview hybrid; halo only covers the
+                # small (full-res) radii, split by the same predicate the compute
+                # uses.  This is what stops the 5184px effective tile / 1-worker
+                # blow-up on big rasters.
+                try:
+                    from ..algorithms._impl_fractal_anomaly import fractal_large_scale_predicate as _frpred
+                    small = [r for r in radii_f if not _frpred(r)] or [min(radii_f)]
+                except Exception:
+                    small = [r for r in radii_f if int(round(r)) <= _thr_switch] or [min(radii_f)]
+                max_radius = int(round(max(small)))
+            else:
+                max_radius = max(int(round(r)) for r in radii_f)
         except Exception:
             max_radius = 64
         # Aligned with the fractal map_overlap depth (2r + 16): roughness uses a
         # Gaussian of sigma = r/2 whose 4-sigma kernel needs ~2r of halo; +16
-        # covers feature smoothing and the size-3 median.  (Was 3r = ~1.5x.)
+        # covers feature smoothing and the size-3 median.
         required = max(required, int(max_radius * 2 + 16))
 
     spatial_algorithms = {
@@ -1990,7 +2002,7 @@ def process_dem_tiles(
             # Dask path, so the float32 output and its uint8/int16 range agree.
             _FULLRES_STAT_ALGOS = {
                 "multiscale_terrain", "visual_saliency", "scale_space_surprise",
-                "ambient_occlusion", "openness",
+                "ambient_occlusion", "openness", "fractal_anomaly",
             }
             if (
                 algorithm in _FULLRES_STAT_ALGOS
@@ -2050,7 +2062,7 @@ def process_dem_tiles(
                         "Visual saliency global normalization stats fixed for all tiles: "
                         f"min={global_vs_stats[0]:.6f}, p80_scale={global_vs_stats[1]:.6f}"
                     )
-            elif algorithm == "fractal_anomaly":
+            elif algorithm == "fractal_anomaly" and "global_stats" not in algo_params:
                 global_fractal_stats = _compute_global_fractal_stats(
                     input_cog_path=input_cog_path,
                     nodata=nodata,
@@ -2133,11 +2145,11 @@ def process_dem_tiles(
             # global origin is injected in process_single_tile (_tile_origin).
             # Projected DEMs only: a single global field is incompatible with the
             # per-tile latitude metre scaling used on geographic DEMs.  RVI has its
-            # own split above; fractal_anomaly keeps its seam-free direct path.
+            # own split above (bespoke direct path).
             if (
                 mode == "spatial"
                 and algo_params.get("radii")
-                and algorithm not in ("rvi", "fractal_anomaly")
+                and algorithm != "rvi"
                 and not bool(algo_params.get("is_geographic_dem", False))
             ):
                 try:
@@ -2152,7 +2164,10 @@ def process_dem_tiles(
                             int(_ov_dem.shape[1]), int(_ov_dem.shape[0]), float(_ov_decim),
                         )
                         # Hybrid algorithms also need per-large-scale overview fields.
-                        _HYBRID_PFX = {"visual_saliency": "_vs", "scale_space_surprise": "_sss"}
+                        _HYBRID_PFX = {
+                            "visual_saliency": "_vs", "scale_space_surprise": "_sss",
+                            "fractal_anomaly": "_fractal",
+                        }
                         if algorithm in _HYBRID_PFX:
                             from ..algorithms._nan_utils import compute_overview_scale_fields
                             _radii = [float(r) for r in (algo_params.get("radii") or [])]
@@ -2165,6 +2180,13 @@ def process_dem_tiles(
                                 _radii = [max(0.5, float(s)) for s in _radii]
                                 if len(_radii) < 4:
                                     _radii = [2.0, 4.0, 8.0, 16.0]
+                            elif algorithm == "fractal_anomaly":
+                                from ..algorithms._impl_fractal_anomaly import (
+                                    fractal_large_scale_predicate as _pred,
+                                    _fractal_roughness_block as _bfn,
+                                )
+                                if len(_radii) < 5:
+                                    _radii = [4.0, 8.0, 16.0, 32.0, 64.0]
                             else:  # scale_space_surprise
                                 from ..algorithms._impl_experimental import (
                                     sss_large_scale_predicate as _pred,
@@ -2186,6 +2208,14 @@ def process_dem_tiles(
                             _ngs = _compute_npr_grad_stats(input_cog_path, algo_params)
                             if _ngs:
                                 algo_params["_npr_grad_stats"] = _ngs
+                        # fractal_anomaly: global roughness p10/p75 (relief_conf is
+                        # otherwise a per-block percentile -> tile seams), full-res
+                        # like the Dask backend so the magnitude matches.
+                        if algorithm == "fractal_anomaly" and algo_params.get("relief_p10") is None:
+                            from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
+                            _rel = _compute_fractal_relief_stats(input_cog_path, algo_params)
+                            if _rel:
+                                algo_params["relief_p10"], algo_params["relief_p75"] = _rel
                 except Exception as exc:
                     logger.warning("Unified overview coarse source (tile) unavailable: %s", exc)
 
