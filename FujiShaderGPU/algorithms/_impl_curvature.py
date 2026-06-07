@@ -85,7 +85,7 @@ class CurvatureAlgorithm(DaskAlgorithm):
                 pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
                 is_geographic=is_geo,
                 coarse_dem=params.get("_overview_coarse_dem"),
-                coarse_decimation=params.get("_overview_decimation"),
+                coarse_decimation=params.get("_overview_decimation"), tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                 curvature_type=ct)
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
         return gpu_arr.map_overlap(

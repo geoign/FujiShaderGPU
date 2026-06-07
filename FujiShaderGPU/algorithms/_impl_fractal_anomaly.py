@@ -288,6 +288,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
                 combine_fn=_fractal_combine_block,
                 depth_for_scale=lambda rr: int(2 * float(rr) + 16),
                 large_fields=large_fields, full_shape=full_shape,
+                tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                 radius_kw="scale", pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
                 combine_kwargs=dict(
                     radii=radii, weights=weights, normalize=True,

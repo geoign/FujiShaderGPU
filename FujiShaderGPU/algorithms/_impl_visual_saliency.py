@@ -271,6 +271,7 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
                 combine_fn=_vs_combine_block,
                 depth_for_scale=lambda s: int(float(s) * 5),
                 large_fields=large_fields, full_shape=full_shape,
+                tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                 radius_kw="scale", pixel_size=pixel_size,
                 pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
                 combine_kwargs=dict(

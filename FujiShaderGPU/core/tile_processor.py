@@ -213,8 +213,17 @@ def _required_padding_for_algorithm(
     sigma: float,
     pixel_size: float,
     target_distances: Optional[List[float]],
+    tile_size: int = 1024,
 ) -> int:
-    """Minimum halo (pixels) required to avoid tile seam artifacts per algorithm."""
+    """Minimum halo (pixels) required to avoid tile seam artifacts per algorithm.
+
+    When the unified overview path is active (a projected spatial run with explicit
+    radii, see process_dem_tiles), large radii are taken from a single global
+    overview, so the per-tile halo only has to cover the SMALL radii (those below
+    the overview split threshold).  This both removes the seams the old `scales`-
+    default sizing caused for radii-driven runs and shrinks the halo for the
+    already-correct spatial algorithms.  Otherwise the halo covers the full radii.
+    """
     # Conservative default from sigma-driven filters.
     try:
         base = int(math.ceil(max(float(sigma), 0.0) * 5.0))
@@ -223,15 +232,35 @@ def _required_padding_for_algorithm(
 
     required = max(32, base)
 
-    if algorithm == "visual_saliency":
-        scales = algo_params.get("scales", [2, 4, 8, 16])
+    _MAX_DEPTH = 150  # keep in sync with algorithms._base.Constants.MAX_DEPTH
+    _mode = str(algo_params.get("mode", "local")).lower()
+    _is_geo = bool(algo_params.get("is_geographic_dem", False))
+    # Overview path engaged for these runs (mirrors the injection gate); large
+    # radii then come from the overview and need no per-tile halo.
+    _overview_active = (
+        _mode == "spatial" and bool(algo_params.get("radii"))
+        and not _is_geo and algorithm not in ("rvi", "fractal_anomaly")
+    )
+    # large_radius_threshold for the spatial-switch algorithms (matches
+    # _nan_utils.large_radius_threshold's floor; the tile is one chunk).
+    _thr_switch = max(256, int(tile_size) // 16)
+
+    def _unified_radii(default):
+        rs = algo_params.get("radii")
+        if not rs:
+            return [float(s) for s in default]
         try:
-            max_scale = max(float(s) for s in scales)
+            return [float(r) for r in rs if float(r) > 0] or [float(s) for s in default]
         except Exception:
-            max_scale = 16.0
-        # Saliency uses Gaussian center-surround at sigma up to max_scale.
-        # gaussian_filter truncates at 4 sigma, so 5*sigma halo is exact (the
-        # previous 8*sigma read ~1.6x more data per tile for no accuracy gain).
+            return [float(s) for s in default]
+
+    if algorithm == "visual_saliency":
+        scales = _unified_radii([2, 4, 8, 16])
+        # Saliency uses Gaussian center-surround at sigma up to max_scale (5*sigma
+        # halo).  With the overview active only the small scales (5*scale<=MAX_DEPTH)
+        # use the halo; larger scales come from the overview fields.
+        small = [s for s in scales if int(s * 5) <= _MAX_DEPTH] or [min(scales)]
+        max_scale = max(small) if _overview_active else max(scales)
         required = max(required, int(math.ceil(max_scale * 5.0)))
     elif algorithm == "rvi":
         radii, _ = _normalize_rvi_radii_and_weights(
@@ -248,22 +277,19 @@ def _required_padding_for_algorithm(
             # halo read.  Matches the Dask map_overlap depth (max_radius + 16).
             required = max(required, int(max(radii) + 16))
     elif algorithm == "multiscale_terrain":
-        scales = algo_params.get("scales", [1, 10, 50, 100])
-        try:
-            max_scale = max(float(s) for s in scales)
-        except Exception:
-            max_scale = 100.0
+        scales = _unified_radii([1, 10, 50, 100])
+        # Detail = block - gaussian(sigma=scale); 4*scale halo.  Overview active:
+        # only small scales (4*scale<=MAX_DEPTH) use the halo.
+        small = [s for s in scales if int(4 * s) <= _MAX_DEPTH] or [min(scales)]
+        max_scale = max(small) if _overview_active else max(scales)
         required = max(required, int(min(max_scale * 4.0, 512)))
     elif algorithm == "scale_space_surprise":
-        scales = algo_params.get("scales", [1.0, 2.0, 4.0, 8.0, 16.0])
-        try:
-            max_scale = max(float(s) for s in scales if float(s) > 0)
-        except Exception:
-            max_scale = 16.0
+        scales = _unified_radii([1.0, 2.0, 4.0, 8.0, 16.0])
         # The surprise kernel blurs at sigma up to max_scale; gaussian_filter
-        # truncates at 4 sigma, so 4*max_scale of halo is needed for a seam-free
-        # tile core.  (Was 3*max_scale, which left a slight boundary mismatch.)
-        # Matches the shared algorithm depth: int(max(scales)*4)+1.
+        # truncates at 4 sigma, so 4*max_scale + 1 of halo is needed for a seam-free
+        # tile core.  Overview active: only small scales use the halo.
+        small = [s for s in scales if int(math.ceil(s * 4.0)) + 1 <= _MAX_DEPTH] or [min(scales)]
+        max_scale = max(small) if _overview_active else max(scales)
         required = max(required, int(math.ceil(max_scale * 4.0)) + 1)
     elif algorithm == "fractal_anomaly":
         radii = algo_params.get("radii")
@@ -282,7 +308,6 @@ def _required_padding_for_algorithm(
         # covers feature smoothing and the size-3 median.  (Was 3r = ~1.5x.)
         required = max(required, int(max_radius * 2 + 16))
 
-    mode = str(algo_params.get("mode", "local")).lower()
     spatial_algorithms = {
         "hillshade",
         "slope",
@@ -292,8 +317,9 @@ def _required_padding_for_algorithm(
         "ambient_occlusion",
         "openness",
         "multi_light_uncertainty",
+        "npr_edges",
     }
-    if mode == "spatial" and algorithm in spatial_algorithms:
+    if _mode == "spatial" and algorithm in spatial_algorithms:
         radii = algo_params.get("radii")
         if not radii:
             try:
@@ -302,7 +328,14 @@ def _required_padding_for_algorithm(
             except Exception:
                 radii = [2, 4, 16, 64]
         try:
-            max_radius = max(int(round(float(r))) for r in radii if float(r) > 0)
+            radii_f = [float(r) for r in radii if float(r) > 0]
+            if _overview_active:
+                # Large radii (> threshold) come from the overview; size the halo
+                # from the largest SMALL radius only.
+                small = [r for r in radii_f if int(round(r)) <= _thr_switch] or [min(radii_f)]
+                max_radius = int(round(max(small)))
+            else:
+                max_radius = max(int(round(r)) for r in radii_f)
         except Exception:
             max_radius = 32
         if algorithm in {"ambient_occlusion", "openness"}:
@@ -1378,6 +1411,16 @@ def process_single_tile(
             # origin so the shared coarse field is sampled at the correct position.
             if "_rvi_coarse_field" in tile_algo_params:
                 tile_algo_params["_rvi_field_offset"] = (int(win_y_off), int(win_x_off))
+            # Unified overview path (all other spatial algorithms): this tile's
+            # padded-window global origin lets the shared coarse-sampling helpers
+            # (_nan_utils) read the one global overview field at the correct
+            # position, so large radii are seam-free across tiles.  _tile_full_shape
+            # is injected globally (= raster H,W) alongside the overview field.
+            if any(k in tile_algo_params for k in (
+                "_overview_coarse_dem", "_vs_large_fields",
+                "_sss_large_fields", "_fractal_large_fields",
+            )):
+                tile_algo_params["_tile_origin"] = (int(win_y_off), int(win_x_off))
             if src_crs is not None and getattr(src_crs, "is_geographic", False):
                 try:
                     # Use core tile center latitude for local meter conversion.
@@ -1696,12 +1739,24 @@ def process_dem_tiles(
                 exc,
             )
 
+    # Detect geographic CRS before sizing padding: the unified overview path (and
+    # its reduced small-radius halo) is projected-only, so padding must know this
+    # up front (the full is_geographic_dem flag is set later, during stats setup).
+    if "is_geographic_dem" not in algo_params:
+        try:
+            with rasterio.open(input_cog_path) as _crs_src:
+                algo_params["is_geographic_dem"] = bool(
+                    getattr(_crs_src.crs, "is_geographic", False))
+        except Exception:
+            algo_params["is_geographic_dem"] = False
+
     required_padding = _required_padding_for_algorithm(
         algorithm=algorithm,
         algo_params=algo_params,
         sigma=sigma,
         pixel_size=float(pixel_size),
         target_distances=target_distances,
+        tile_size=int(tile_size),
     )
     if algorithm == "fractal_anomaly":
         logger.info(
@@ -2034,6 +2089,71 @@ def process_dem_tiles(
             else:
                 algo_params["_apply_global_stats_post"] = False
             algo_params["_output_norm_range"] = output_norm_range
+
+            # ----------------------------------------------------------------
+            # Unified overview coarse source for the tile backend (mirrors the
+            # Dask orchestrator in core/dask_processor.py).  Read ONE decimated
+            # overview of the DEM and share it across every spatial algorithm's
+            # large-radius path, so large radii come from a single global field
+            # (seam-free, bounded halo) instead of a per-tile coarsen.  The per-tile
+            # global origin is injected in process_single_tile (_tile_origin).
+            # Projected DEMs only: a single global field is incompatible with the
+            # per-tile latitude metre scaling used on geographic DEMs.  RVI has its
+            # own split above; fractal_anomaly keeps its seam-free direct path.
+            if (
+                mode == "spatial"
+                and algo_params.get("radii")
+                and algorithm not in ("rvi", "fractal_anomaly")
+                and not bool(algo_params.get("is_geographic_dem", False))
+            ):
+                try:
+                    from ..algorithms._nan_utils import read_overview_coarse_dem
+                    _ov_dem, _ov_decim = read_overview_coarse_dem(input_cog_path)
+                    if _ov_dem is not None:
+                        algo_params["_overview_coarse_dem"] = _ov_dem
+                        algo_params["_overview_decimation"] = _ov_decim
+                        algo_params["_tile_full_shape"] = (int(height), int(width))
+                        logger.info(
+                            "Unified overview coarse source (tile): %dx%d (decimation=%.1fx)",
+                            int(_ov_dem.shape[1]), int(_ov_dem.shape[0]), float(_ov_decim),
+                        )
+                        # Hybrid algorithms also need per-large-scale overview fields.
+                        _HYBRID_PFX = {"visual_saliency": "_vs", "scale_space_surprise": "_sss"}
+                        if algorithm in _HYBRID_PFX:
+                            from ..algorithms._nan_utils import compute_overview_scale_fields
+                            _radii = [float(r) for r in (algo_params.get("radii") or [])]
+                            _pfx = _HYBRID_PFX[algorithm]
+                            if algorithm == "visual_saliency":
+                                from ..algorithms._impl_visual_saliency import (
+                                    vs_large_scale_predicate as _pred,
+                                    _vs_smooth_block as _bfn,
+                                )
+                                _radii = [max(0.5, float(s)) for s in _radii]
+                                if len(_radii) < 4:
+                                    _radii = [2.0, 4.0, 8.0, 16.0]
+                            else:  # scale_space_surprise
+                                from ..algorithms._impl_experimental import (
+                                    sss_large_scale_predicate as _pred,
+                                    _sss_smooth_block as _bfn,
+                                )
+                                _radii = sorted(s for s in _radii if s > 0)
+                            _large = [r for r in _radii if _pred(r)]
+                            if _large:
+                                _fields, _ = compute_overview_scale_fields(
+                                    input_cog_path, large_radii=_large, block_fn=_bfn,
+                                    coarse_dem=_ov_dem, decimation=_ov_decim,
+                                )
+                                if _fields:
+                                    algo_params[f"{_pfx}_large_fields"] = _fields
+                                    algo_params[f"{_pfx}_full_shape"] = (int(height), int(width))
+                        # npr_edges: global per-radius gradient threshold (seam-free Canny).
+                        if algorithm == "npr_edges":
+                            from ..algorithms._impl_npr_edges import _compute_npr_grad_stats
+                            _ngs = _compute_npr_grad_stats(input_cog_path, algo_params)
+                            if _ngs:
+                                algo_params["_npr_grad_stats"] = _ngs
+                except Exception as exc:
+                    logger.warning("Unified overview coarse source (tile) unavailable: %s", exc)
 
             n_tiles_x = math.ceil(width / tile_size)
             n_tiles_y = math.ceil(height / tile_size)

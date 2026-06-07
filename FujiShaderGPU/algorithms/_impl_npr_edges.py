@@ -5,7 +5,10 @@ NPR Edges (non-photorealistic rendering outlines) algorithm implementation.
 Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
+import logging
+from typing import Optional
 import cupy as cp
+import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter, convolve, binary_dilation
 
@@ -16,6 +19,8 @@ from ._nan_utils import (
     large_radius_threshold, multiscale_response_fields,
     _smooth_for_radius,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
@@ -227,7 +232,7 @@ class NPREdgesAlgorithm(DaskAlgorithm):
                 pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
                 is_geographic=is_geo, edge_sigma=edge_sigma,
                 coarse_dem=params.get("_overview_coarse_dem"),
-                coarse_decimation=params.get("_overview_decimation"),
+                coarse_decimation=params.get("_overview_decimation"), tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                 threshold_low=threshold_low, threshold_high=threshold_high,
                 grad_stats_map=params.get("_npr_grad_stats"))
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
@@ -258,8 +263,118 @@ class NPREdgesAlgorithm(DaskAlgorithm):
         }
 
 
+def _compute_npr_grad_stats(
+    src_cog: str,
+    params: dict,
+    *,
+    grid: int = 3,
+    max_tile: int = 4096,
+    min_valid_frac: float = 0.02,
+    small_radius_max: float = 600.0,
+) -> Optional[dict]:
+    """Per-radius GLOBAL gradient (base, range, mean) for npr_edges, from full-res
+    stratified tiles.  npr's edge threshold is otherwise computed per block, which
+    differs tile-to-tile and seams.  Only the small (full-res, multi-tile) radii
+    need this; large radii run the whole coarsened grid as one block and are
+    already global.  Returns {round(radius): (base, range, mean)}.
+
+    Backend-neutral (rasterio + cupy only) so both the Dask and tile pipelines
+    share one implementation."""
+    try:
+        import rasterio
+        from rasterio.windows import Window
+        from rasterio.enums import Resampling
+    except Exception as exc:
+        logger.warning("npr grad-stats helpers unavailable: %s", exc)
+        return None
+    radii = (params or {}).get("radii") or []
+    small = [float(r) for r in radii if float(r) <= small_radius_max]
+    if not small:
+        return None
+    pixel_size = float(params.get("pixel_size", 1.0))
+    edge_sigma = float(params.get("edge_sigma", 1.0))
+    tl = float(params.get("threshold_low", 0.1))
+    th_ = float(params.get("threshold_high", 0.3))
+    low_res = classify_resolution(pixel_size) in ("low", "very_low", "ultra_low")
+    try:
+        margin = int(min(2 * max(small) + 16, max_tile // 4))
+        tile = int(min(max_tile, max(2048, 4 * margin)))
+        tiles = []
+        with rasterio.open(src_cog) as src:
+            W, H = src.width, src.height
+            nodata = src.nodata
+
+            def _dn(a):
+                a = a.astype(np.float32, copy=False)
+                if nodata is not None and not np.isnan(float(nodata)):
+                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
+                return a
+
+            cov = max(1, max(W, H) // 512)
+            ov = _dn(src.read(1, out_shape=(max(1, H // cov), max(1, W // cov)),
+                              resampling=Resampling.nearest, out_dtype=np.float32,
+                              masked=True).filled(np.nan))
+            vmask = np.isfinite(ov)
+            if not vmask.any():
+                return None
+            ys, xs = np.where(vmask)
+            by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
+            bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
+            ch_, cw_ = max(1, (by1 - by0) // grid), max(1, (bx1 - bx0) // grid)
+            for gy in range(grid):
+                for gx in range(grid):
+                    ccy = by0 + gy * ch_ + ch_ // 2
+                    ccx = bx0 + gx * cw_ + cw_ // 2
+                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
+                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
+                    tw, th2 = min(tile, W - wx0), min(tile, H - wy0)
+                    a = _dn(src.read(1, window=Window(wx0, wy0, tw, th2),
+                                     out_dtype=np.float32, masked=True).filled(np.nan))
+                    if float(np.isfinite(a).mean()) >= min_valid_frac:
+                        tiles.append(cp.asarray(a))
+        if not tiles:
+            return None
+        out = {}
+        for r in small:
+            pool = []
+            for g in tiles:
+                grad = compute_npr_edges_spatial_block(
+                    g, edge_sigma=edge_sigma, threshold_low=tl, threshold_high=th_,
+                    pixel_size=pixel_size, radius=r, _return_grad=True)
+                m = int(min(int(2 * r + 16), grad.shape[0] // 3, grad.shape[1] // 3))
+                if m > 0:
+                    grad = grad[m:-m, m:-m]
+                v = grad[~cp.isnan(grad)]
+                if v.size:
+                    pool.append(cp.asnumpy(v))
+                del grad, v
+            cp.get_default_memory_pool().free_all_blocks()
+            if not pool:
+                continue
+            allv = np.concatenate(pool)
+            mean = float(np.mean(allv))
+            if low_res:
+                base, rng = mean, float(np.std(allv)) * 1.5
+            else:
+                base = float(np.percentile(allv, 50))
+                rng = float(np.percentile(allv, 90)) - base
+            out[int(round(r))] = (base, rng, mean)
+        for g in tiles:
+            del g
+        cp.get_default_memory_pool().free_all_blocks()
+        if not out:
+            return None
+        logger.info("npr_edges global gradient threshold computed for radii %s",
+                    sorted(out.keys()))
+        return out
+    except Exception as exc:
+        logger.warning("Failed to compute npr grad stats: %s", exc)
+        return None
+
+
 __all__ = [
     "compute_npr_edges_block",
     "compute_npr_edges_spatial_block",
     "NPREdgesAlgorithm",
+    "_compute_npr_grad_stats",
 ]

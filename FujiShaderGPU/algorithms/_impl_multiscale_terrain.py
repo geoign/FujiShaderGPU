@@ -165,6 +165,11 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         # default-scales path keeps its original uniform-depth behavior exactly.
         # Coarsen for large scales on geographic DEMs too (pixel-based, correct).
         F = coarsen_factor_for_shape(gpu_arr.shape) if is_spatial else 1
+        # Tile backend (single small tile -> F==1): use the injected global overview
+        # for large scales so they are seam-free; Dask (no _tile_origin) keeps F>1.
+        _coarse_ok_tile = (
+            params.get("_overview_coarse_dem") is not None
+            and params.get("_tile_origin") is not None)
         common_depth = min(int(4 * max(scales)), Constants.MAX_DEPTH)
         cache = {}
 
@@ -174,7 +179,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
             # across chunks.  When that exceeds MAX_DEPTH, compute the (low-freq)
             # smooth on a coarsened copy and subtract it from the full-res block,
             # keeping fine detail, seams, and VRAM all under control.
-            if F > 1 and int(4 * scale) > Constants.MAX_DEPTH:
+            if int(4 * scale) > Constants.MAX_DEPTH and (F > 1 or _coarse_ok_tile):
                 smooth_up = coarse_large_radius_response(
                     gpu_arr, block_fn=_smooth_only_block, radius_kw='scale',
                     radius=float(scale), factor=F,
@@ -182,7 +187,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                     pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
                     coarse_cache=cache,
                     coarse_dem=params.get("_overview_coarse_dem"),
-                    coarse_decimation=params.get("_overview_decimation"),
+                    coarse_decimation=params.get("_overview_decimation"), tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                 )
                 results.append(gpu_arr - smooth_up)
             else:

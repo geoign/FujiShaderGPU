@@ -231,12 +231,18 @@ def _bilinear_sample_coarse(
     return map_coordinates(coarse, coords, order=1, mode="nearest").astype(cp.float32)
 
 
-def _upsample_coarse_response_block(block, *, coarse, full_h, full_w, block_info=None):
+def _upsample_coarse_response_block(block, *, coarse, full_h, full_w,
+                                    tile_origin=None, tile_full_shape=None,
+                                    block_info=None):
     """Bilinearly sample a small coarse response at this block's global coords.
 
-    The coarse response is derived from the *same* array (Dask: the full raster;
-    tile: the per-tile padded window), so sampling at block-local coordinates is
-    correct and seam-free -- no global offset is needed.
+    On the Dask backend the coarse response spans the same full raster as the
+    block, so the block's ``array-location`` is its true global position.  On the
+    tile backend the dask array is a single tile, so its location is block-local
+    ``(0..win)``: pass ``tile_origin`` (the tile window's global pixel offset) and
+    ``tile_full_shape`` (the full raster shape) to shift the sampling onto the
+    global overview -- this is what keeps the large-radius field seam-free across
+    tiles.  Both ``None`` (Dask) preserves the original behaviour exactly.
     """
     if block_info is not None and block_info.get(0) is not None:
         loc = block_info[0]["array-location"]
@@ -245,6 +251,11 @@ def _upsample_coarse_response_block(block, *, coarse, full_h, full_w, block_info
     else:  # pragma: no cover - non-dask fallback
         r0, c0 = 0, 0
         r1, c1 = block.shape[0], block.shape[1]
+    if tile_origin is not None:
+        r0 += int(tile_origin[0]); r1 += int(tile_origin[0])
+        c0 += int(tile_origin[1]); c1 += int(tile_origin[1])
+    if tile_full_shape is not None:
+        full_h, full_w = int(tile_full_shape[0]), int(tile_full_shape[1])
     return _bilinear_sample_coarse(coarse, r0, r1, c0, c1, full_h, full_w)
 
 
@@ -276,6 +287,8 @@ def coarse_large_radius_response(
     coarse_cache: Optional[dict] = None,
     coarse_dem: Optional[cp.ndarray] = None,
     coarse_decimation: Optional[float] = None,
+    tile_origin=None,
+    tile_full_shape=None,
     **block_kwargs,
 ) -> da.Array:
     """One large-radius spatial response computed on a coarsened DEM, upsampled.
@@ -313,6 +326,8 @@ def coarse_large_radius_response(
             coarse=coarse_resp,
             full_h=H,
             full_w=W,
+            tile_origin=tile_origin,
+            tile_full_shape=tile_full_shape,
         )
         return da.where(da.isnan(gpu_arr), cp.float32(cp.nan), upsampled)
 
@@ -355,6 +370,8 @@ def coarse_large_radius_response(
         coarse=coarse_resp,
         full_h=H,
         full_w=W,
+        tile_origin=tile_origin,
+        tile_full_shape=tile_full_shape,
     )
     # The coarse field was filled (cliff-free) where the DEM is NoData; restore
     # NaN at the true NoData footprint so the large-radius response does not leak
@@ -377,6 +394,8 @@ def multiscale_response_fields(
     coarse_cache: Optional[dict] = None,
     coarse_dem: Optional[cp.ndarray] = None,
     coarse_decimation: Optional[float] = None,
+    tile_origin=None,
+    tile_full_shape=None,
     **block_kwargs,
 ) -> List[da.Array]:
     """Per-scale response fields as dask arrays, large scales via the coarse path.
@@ -403,6 +422,13 @@ def multiscale_response_fields(
     # too.  Disabling it there forced large radii through a near-chunk halo that
     # exhausts VRAM.  (is_geographic is kept for API compatibility / callers.)
     F = coarsen_factor_for_shape(gpu_arr.shape)
+    # Tile backend: gpu_arr is a single (small) tile so coarsen_factor is 1, which
+    # would force every large radius through a tile-local halo (seams).  When the
+    # orchestrator injected a global overview (coarse_dem) and the tile origin, take
+    # the coarse path for large radii regardless of F -- coarse_large_radius_response
+    # short-circuits onto that concrete overview anyway.  Dask (tile_origin None) is
+    # unchanged: the gate stays F > 1.
+    _coarse_ok_tile = (coarse_dem is not None and tile_origin is not None)
     if coarse_cache is None:
         coarse_cache = {}
     # The map_overlap halo must stay below the smallest chunk; a halo >= a chunk
@@ -418,7 +444,7 @@ def multiscale_response_fields(
         sv = float(s)
         d = int(depth_for_scale(sv))
         large = is_large(sv) if is_large is not None else (d > Constants.MAX_DEPTH)
-        if F > 1 and large:
+        if large and (F > 1 or _coarse_ok_tile):
             fields.append(coarse_large_radius_response(
                 gpu_arr, block_fn=block_fn, radius_kw=radius_kw, radius=sv,
                 factor=F,
@@ -426,6 +452,7 @@ def multiscale_response_fields(
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
                 pixel_scale_y=pixel_scale_y, coarse_cache=coarse_cache,
                 coarse_dem=coarse_dem, coarse_decimation=coarse_decimation,
+                tile_origin=tile_origin, tile_full_shape=tile_full_shape,
                 **block_kwargs))
         else:
             fields.append(gpu_arr.map_overlap(
@@ -612,7 +639,8 @@ def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
 
 def _hybrid_combine_wrapper(dem, *small_blocks, _scales_order, _small_scales,
                             _large_scales, _large_list, _full_h, _full_w,
-                            _combine_fn, _combine_kwargs, block_info=None):
+                            _combine_fn, _combine_kwargs,
+                            _tile_origin=None, _tile_full_shape=None, block_info=None):
     """Assemble the full ordered per-scale field list for one output block and run
     the algorithm's pointwise combine.
 
@@ -622,7 +650,11 @@ def _hybrid_combine_wrapper(dem, *small_blocks, _scales_order, _small_scales,
     only under ``map_blocks`` (depth 0), where ``array-location`` is the true
     global core position (under ``map_overlap`` it is the padded-coordinate
     position, so this combine MUST stay depth-0; the per-scale fields already
-    carry their own halos)."""
+    carry their own halos).
+
+    On the tile backend ``array-location`` is block-local (single-tile array), so
+    ``_tile_origin`` / ``_tile_full_shape`` shift the large-field sampling onto the
+    tile's true global position; both ``None`` (Dask) is the original behaviour."""
     if block_info is not None and block_info.get(0) is not None:
         loc = block_info[0]["array-location"]
         r0, r1 = int(loc[0][0]), int(loc[0][1])
@@ -630,6 +662,11 @@ def _hybrid_combine_wrapper(dem, *small_blocks, _scales_order, _small_scales,
     else:  # pragma: no cover - non-dask fallback
         r0, c0 = 0, 0
         r1, c1 = int(dem.shape[0]), int(dem.shape[1])
+    if _tile_origin is not None:
+        r0 += int(_tile_origin[0]); r1 += int(_tile_origin[0])
+        c0 += int(_tile_origin[1]); c1 += int(_tile_origin[1])
+    if _tile_full_shape is not None:
+        _full_h, _full_w = int(_tile_full_shape[0]), int(_tile_full_shape[1])
     small_map = {int(round(float(s))): b for s, b in zip(_small_scales, small_blocks)}
     large_map = {int(round(float(s))): cf for s, cf in zip(_large_scales, _large_list)}
     fields = []
@@ -657,6 +694,8 @@ def hybrid_multiscale_response_combine(
     pixel_scale_x: Optional[float] = None,
     pixel_scale_y: Optional[float] = None,
     combine_kwargs: Optional[dict] = None,
+    tile_origin=None,
+    tile_full_shape=None,
     **block_kwargs,
 ) -> da.Array:
     """RVI-style hybrid multiscale combine (bounded VRAM + accurate large scales).
@@ -699,7 +738,8 @@ def hybrid_multiscale_response_combine(
         _scales_order=scales_f, _small_scales=small_scales,
         _large_scales=large_scales, _large_list=large_list,
         _full_h=full_h, _full_w=full_w,
-        _combine_fn=combine_fn, _combine_kwargs=combine_kwargs)
+        _combine_fn=combine_fn, _combine_kwargs=combine_kwargs,
+        _tile_origin=tile_origin, _tile_full_shape=tile_full_shape)
 
 
 def read_overview_coarse_dem(src_cog: str, *, sample_max: int = 2048):

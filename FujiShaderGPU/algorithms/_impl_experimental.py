@@ -186,6 +186,7 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
                 combine_fn=_sss_combine_block,
                 depth_for_scale=lambda s: int(max(1, round(float(s) * 4))) + 1,
                 large_fields=large_fields, full_shape=full_shape,
+                tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                 radius_kw="scale", pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
                 combine_kwargs=dict(
                     pair_w=pair_w, norm_min=float(stats[0]), norm_scale=float(stats[1]),
@@ -195,7 +196,7 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
             depth_for_scale=lambda s: int(max(1, round(s * 4))) + 1,
             pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo,
             coarse_dem=params.get("_overview_coarse_dem"),
-            coarse_decimation=params.get("_overview_decimation"))
+            coarse_decimation=params.get("_overview_decimation"), tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"))
         return da.map_blocks(
             _sss_combine_block, gpu_arr, *smooths,
             dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
@@ -263,7 +264,7 @@ class MultiLightUncertaintyAlgorithm(DaskAlgorithm):
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy, is_geographic=is_geo,
                 coarse_dem=params.get("_overview_coarse_dem"),
-                coarse_decimation=params.get("_overview_decimation"),
+                coarse_decimation=params.get("_overview_decimation"), tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                 azimuths=azimuths, altitude=altitude, z_factor=z_factor,
                 uncertainty_weight=uw)
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)

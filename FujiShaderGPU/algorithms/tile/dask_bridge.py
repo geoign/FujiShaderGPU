@@ -419,6 +419,17 @@ def _direct_fractal_anomaly(block, params, algo):
 
 def _process_direct(algo, class_name, dem_gpu, params):
     p = _merged_params(algo, params)
+    # Spatial-mode multi-radius runs take the shared Dask overview path (large
+    # radii sampled from one global overview, tile-origin aware) so the tile
+    # backend is seam-free and matches the Linux backend.  RVI and fractal keep
+    # their own overview-based direct paths; `local` mode keeps the fast direct
+    # paths below (single radius -> no large halo, no seams).
+    if str(p.get("mode", "local")).lower() == "spatial" and class_name in {
+        "HillshadeAlgorithm", "SlopeAlgorithm", "SpecularAlgorithm",
+        "AtmosphericScatteringAlgorithm", "CurvatureAlgorithm",
+        "AmbientOcclusionAlgorithm", "OpennessAlgorithm",
+    }:
+        raise _FallbackToDask()
     if class_name == "HillshadeAlgorithm":
         return _direct_hillshade(dem_gpu, p)
     if class_name == "SlopeAlgorithm":
@@ -437,8 +448,8 @@ def _process_direct(algo, class_name, dem_gpu, params):
         return _direct_rvi(dem_gpu, p, algo)
     if class_name == "NPREdgesAlgorithm":
         return _direct_npr_edges(dem_gpu, p)
-    if class_name == "VisualSaliencyAlgorithm":
-        return _direct_visual_saliency(dem_gpu, p)
+    # VisualSaliencyAlgorithm intentionally has no direct path: it is always
+    # multiscale, so it uses the Dask hybrid overview path (tile-origin aware).
     if class_name == "MultiscaleDaskAlgorithm":
         return _direct_multiscale_terrain(dem_gpu, p)
     if class_name == "FractalAnomalyAlgorithm":

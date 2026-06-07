@@ -162,9 +162,10 @@ class SpecularAlgorithm(DaskAlgorithm):
             _coarse_fac = float(_ov_decim) if (_ov_dem is not None and _ov_decim) else float(F)
             cache = {}
             responses = []
+            _coarse_ok_tile = (_ov_dem is not None and params.get("_tile_origin") is not None)
             for radius in radii:
                 depth = max(int(rs), int(float(radius) * 2 + 1))
-                if F > 1 and int(round(float(radius))) > thr:
+                if int(round(float(radius))) > thr and (F > 1 or _coarse_ok_tile):
                     # Scale the roughness kernel into the coarse grid as well.
                     rs_coarse = max(3.0, float(rs) / _coarse_fac)
                     responses.append(coarse_large_radius_response(
@@ -174,6 +175,7 @@ class SpecularAlgorithm(DaskAlgorithm):
                         pixel_size=ps, pixel_scale_x=psx, pixel_scale_y=psy,
                         coarse_cache=cache,
                         coarse_dem=_ov_dem, coarse_decimation=_ov_decim,
+                        tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                         roughness_scale=rs_coarse, shininess=sh,
                         roughness_norm_scale=rns, geographic_mode=geo,
                         light_azimuth=laz, light_altitude=lal,
