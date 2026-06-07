@@ -68,6 +68,11 @@ GLOBAL_STATS_NATIVE_ALGOS = {
     "multiscale_terrain",
     "visual_saliency",
     "fractal_anomaly",
+    # ambient_occlusion / openness apply their own display stretch internally
+    # (apply_display_stretch_dask in .process()), so the tile pipeline must NOT
+    # normalize them again (double-normalization blew out / crushed the output).
+    "ambient_occlusion",
+    "openness",
 }
 NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges"}
 SIGNED_NORMALIZATION_ALGOS = {"rvi", "fractal_anomaly"}
@@ -241,7 +246,7 @@ def _required_padding_for_algorithm(
     _overview_active = (
         _mode == "spatial" and bool(algo_params.get("radii"))
         and not _is_geo
-        and algorithm not in ("rvi", "fractal_anomaly", "ambient_occlusion", "openness")
+        and algorithm not in ("rvi", "fractal_anomaly")
     )
     # large_radius_threshold for the spatial-switch algorithms (matches
     # _nan_utils.large_radius_threshold's floor; the tile is one chunk).
@@ -1983,10 +1988,9 @@ def process_dem_tiles(
             # highlights).  For algorithms with a full-res stat spec, compute the
             # stat from stratified FULL-RESOLUTION tiles instead -- identical to the
             # Dask path, so the float32 output and its uint8/int16 range agree.
-            # ambient_occlusion / openness keep their direct path + generic p80
-            # stretch (better native contrast), so they are not in this set.
             _FULLRES_STAT_ALGOS = {
                 "multiscale_terrain", "visual_saliency", "scale_space_surprise",
+                "ambient_occlusion", "openness",
             }
             if (
                 algorithm in _FULLRES_STAT_ALGOS
@@ -2133,7 +2137,7 @@ def process_dem_tiles(
             if (
                 mode == "spatial"
                 and algo_params.get("radii")
-                and algorithm not in ("rvi", "fractal_anomaly", "ambient_occlusion", "openness")
+                and algorithm not in ("rvi", "fractal_anomaly")
                 and not bool(algo_params.get("is_geographic_dem", False))
             ):
                 try:

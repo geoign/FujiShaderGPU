@@ -424,13 +424,10 @@ def _process_direct(algo, class_name, dem_gpu, params):
     # backend is seam-free and matches the Linux backend.  RVI and fractal keep
     # their own overview-based direct paths; `local` mode keeps the fast direct
     # paths below (single radius -> no large halo, no seams).
-    # ambient_occlusion / openness are intentionally NOT routed here: their direct
-    # per-radius path is seam-free on its own and its native contrast (generic p80
-    # stretch) reads better than the overview/full-res-p99 path, so they keep the
-    # direct path below.
     if str(p.get("mode", "local")).lower() == "spatial" and class_name in {
         "HillshadeAlgorithm", "SlopeAlgorithm", "SpecularAlgorithm",
         "AtmosphericScatteringAlgorithm", "CurvatureAlgorithm",
+        "AmbientOcclusionAlgorithm", "OpennessAlgorithm",
     }:
         raise _FallbackToDask()
     if class_name == "HillshadeAlgorithm":
