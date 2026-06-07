@@ -25,6 +25,7 @@ from ..io.output_encoding import (
     quantize_array,
 )
 from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
+from ..algorithms._norm_stats import _NORM_STAT_SPECS, _compute_norm_stats_tiled
 from ..utils.paths import safe_abspath
 import os
 import math
@@ -239,7 +240,8 @@ def _required_padding_for_algorithm(
     # radii then come from the overview and need no per-tile halo.
     _overview_active = (
         _mode == "spatial" and bool(algo_params.get("radii"))
-        and not _is_geo and algorithm not in ("rvi", "fractal_anomaly")
+        and not _is_geo
+        and algorithm not in ("rvi", "fractal_anomaly", "ambient_occlusion", "openness")
     )
     # large_radius_threshold for the spatial-switch algorithms (matches
     # _nan_utils.large_radius_threshold's floor; the tile is one chunk).
@@ -1972,6 +1974,34 @@ def process_dem_tiles(
                 global_stats_required = False
             output_norm_range = _normalization_target_range(algorithm)
 
+            # Full-resolution normalization stats (matches the Dask backend).  The
+            # per-algorithm overview-sampled stats below estimate the scale from a
+            # single DECIMATED sample, which under-estimates it for radii/scale-
+            # driven algorithms (high-frequency detail is lost to decimation and
+            # large radii are meaningless on the small grid).  That over-amplifies
+            # the output and blows out the integer encoding (binarization / clipped
+            # highlights).  For algorithms with a full-res stat spec, compute the
+            # stat from stratified FULL-RESOLUTION tiles instead -- identical to the
+            # Dask path, so the float32 output and its uint8/int16 range agree.
+            # ambient_occlusion / openness keep their direct path + generic p80
+            # stretch (better native contrast), so they are not in this set.
+            _FULLRES_STAT_ALGOS = {
+                "multiscale_terrain", "visual_saliency", "scale_space_surprise",
+            }
+            if (
+                algorithm in _FULLRES_STAT_ALGOS
+                and algorithm in _NORM_STAT_SPECS
+                and "global_stats" not in algo_params
+                and not bool(algo_params.get("is_geographic_dem", False))
+            ):
+                try:
+                    _fr_stats = _compute_norm_stats_tiled(input_cog_path, algorithm, algo_params)
+                except Exception as exc:
+                    logger.warning("Full-res norm stats failed for %s: %s", algorithm, exc)
+                    _fr_stats = None
+                if _fr_stats is not None:
+                    algo_params["global_stats"] = tuple(_fr_stats)
+
             if algorithm == "rvi":
                 global_rvi_stats = _compute_global_rvi_stats(
                     input_cog_path=input_cog_path,
@@ -1988,7 +2018,7 @@ def process_dem_tiles(
                         f"RVI global normalization stats fixed for all tiles: "
                         f"abs_p80={global_rvi_stats[0]:.6f}"
                     )
-            elif algorithm == "multiscale_terrain":
+            elif algorithm == "multiscale_terrain" and "global_stats" not in algo_params:
                 global_ms_stats = _compute_global_multiscale_terrain_stats(
                     input_cog_path=input_cog_path,
                     nodata=nodata,
@@ -2002,7 +2032,7 @@ def process_dem_tiles(
                         "Multiscale global normalization stats fixed for all tiles: "
                         f"min={global_ms_stats[0]:.6f}, p80_scale={global_ms_stats[1]:.6f}"
                     )
-            elif algorithm == "visual_saliency":
+            elif algorithm == "visual_saliency" and "global_stats" not in algo_params:
                 global_vs_stats = _compute_global_visual_saliency_stats(
                     input_cog_path=input_cog_path,
                     nodata=nodata,
@@ -2034,7 +2064,7 @@ def process_dem_tiles(
                         "Fractal global normalization stats fixed for all tiles: "
                         f"center={global_fractal_stats[0]:.6f}, p80_scale={global_fractal_stats[1]:.6f}"
                     )
-            elif algorithm == "scale_space_surprise":
+            elif algorithm == "scale_space_surprise" and "global_stats" not in algo_params:
                 global_sss_stats = _compute_global_scale_space_surprise_stats(
                     input_cog_path=input_cog_path,
                     nodata=nodata,
@@ -2103,7 +2133,7 @@ def process_dem_tiles(
             if (
                 mode == "spatial"
                 and algo_params.get("radii")
-                and algorithm not in ("rvi", "fractal_anomaly")
+                and algorithm not in ("rvi", "fractal_anomaly", "ambient_occlusion", "openness")
                 and not bool(algo_params.get("is_geographic_dem", False))
             ):
                 try:

@@ -1,0 +1,180 @@
+"""Full-resolution, full-extent output normalization statistics.
+
+Backend-neutral (rasterio + cupy + the algorithms' own block/stat functions) so
+both the Dask pipeline and the Windows tile pipeline share one implementation.
+
+Normalized algorithms map a robust statistic of their *full-resolution* output to
+display magnitude ~1.0.  Computing that statistic from a decimated overview
+under-estimates the scale (high-frequency detail is lost to decimation, and large
+radii/kernels become nonsensical on the small grid), which over-amplifies the
+output and blows out the integer (uint8/int16) encoding.  This module instead
+runs each algorithm's raw block function (normalize off) on several
+FULL-RESOLUTION windows stratified across the valid-data extent and pools the
+interior pixels, so the magnitude is correct and singular outliers fall into the
+unclipped tail rather than setting the scale.
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional
+
+import numpy as np
+import cupy as cp
+
+logger = logging.getLogger(__name__)
+
+# algorithm -> (impl module, raw block function, stat function).  The block runs
+# with normalize=False and the main-pass parameters; the stat function returns the
+# algorithm's native (offset, ..., scale) tuple consumed as ``global_stats``.
+_NORM_STAT_SPECS = {
+    "rvi": ("_impl_rvi", "compute_rvi_efficient_block", "rvi_stat_func"),
+    "fractal_anomaly": ("_impl_fractal_anomaly",
+                        "compute_fractal_dimension_block", "fractal_stat_func"),
+    "scale_space_surprise": ("_impl_experimental",
+                            "compute_scale_space_surprise_block",
+                            "scale_space_surprise_stat_func"),
+    "visual_saliency": ("_impl_visual_saliency",
+                        "compute_visual_saliency_block", "visual_saliency_stat_func"),
+    "multiscale_terrain": ("_impl_multiscale_terrain",
+                          "compute_multiscale_combined_raw", "multiscale_stat_func"),
+    # Bounded [0,1] maps concentrated in a narrow high band: data-driven
+    # [p1, p99] -> [0, 1] contrast stretch so the integer codes are not wasted.
+    "ambient_occlusion": ("_impl_ambient_occlusion",
+                         "compute_ambient_occlusion_block",
+                         "robust_unsigned_stretch_stat_func"),
+    "openness": ("_impl_openness", "compute_openness_vectorized",
+                "robust_unsigned_stretch_stat_func"),
+}
+
+
+def _norm_stat_max_scale(merged: dict) -> float:
+    """Largest pixel-scale among the algorithm's radii/scales/kernel parameters."""
+    vals = []
+    for key in ("radii", "scales"):
+        v = merged.get(key)
+        if isinstance(v, (list, tuple)) and v:
+            vals.append(max(float(x) for x in v))
+    ks = merged.get("kernel_size")
+    if ks:
+        vals.append(float(ks))
+    return max(vals) if vals else 16.0
+
+
+def _compute_norm_stats_tiled(
+    src_cog: str,
+    algorithm: str,
+    params: dict,
+    *,
+    grid: int = 3,
+    max_tile: int = 4096,
+    min_valid_frac: float = 0.02,
+) -> Optional[tuple]:
+    """Robust full-resolution, full-extent normalization stats via stratified tiles.
+
+    Reads several full-resolution windows tiled across the valid-data bounding box
+    (located from a coarse overview, so off-center footprints are handled), runs
+    the algorithm's raw block function on each with the main-pass parameters, pools
+    the interior valid pixels, and returns the algorithm's robust ``(offset,
+    p99-scale)`` statistics over the pool.  Full resolution keeps scale-sensitive
+    magnitudes correct; pooling the whole extent dilutes singular outliers into the
+    p99 tail.  Returns ``None`` on failure (caller falls back to window sampling).
+    """
+    spec = _NORM_STAT_SPECS.get(algorithm)
+    if spec is None:
+        return None
+    try:
+        import inspect
+        import rasterio
+        from rasterio.windows import Window
+        from rasterio.enums import Resampling
+        from .dask_registry import ALGORITHMS
+        mod = __import__(f"FujiShaderGPU.algorithms.{spec[0]}", fromlist=[spec[1]])
+        block_func = getattr(mod, spec[1])
+        stat_func = getattr(mod, spec[2])
+        try:
+            defaults = ALGORITHMS[algorithm].get_default_params() or {}
+        except Exception:
+            defaults = {}
+        merged = {**defaults, **(params or {})}
+    except Exception as exc:
+        logger.warning("Tiled norm-stats helpers unavailable for %s: %s", algorithm, exc)
+        return None
+
+    try:
+        accepted = set(inspect.signature(block_func).parameters)
+        # Drop None-valued params so the block function falls back to its own
+        # defaults (e.g. fractal_anomaly's radii default None -> would not iterate).
+        kw = {k: merged[k] for k in list(merged) if k in accepted and merged[k] is not None}
+        if "normalize" in accepted:
+            kw["normalize"] = False
+        max_scale = _norm_stat_max_scale(merged)
+        margin = int(min(max_scale, max_tile // 4))
+        tile = int(min(max_tile, max(2048, 4 * margin)))
+
+        pooled = []
+        with rasterio.open(src_cog) as src:
+            W, H = src.width, src.height
+            nodata = src.nodata
+
+            def _denodata(a):
+                a = a.astype(np.float32, copy=False)
+                if nodata is not None and not np.isnan(float(nodata)):
+                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
+                return a
+
+            # Coarse overview -> valid-data bounding box.
+            cov = max(1, max(W, H) // 512)
+            ov = _denodata(src.read(
+                1, out_shape=(max(1, H // cov), max(1, W // cov)),
+                resampling=Resampling.nearest, out_dtype=np.float32,
+                masked=True).filled(np.nan))
+            vmask = np.isfinite(ov)
+            if not vmask.any():
+                return None
+            ys, xs = np.where(vmask)
+            by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
+            bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
+
+            cell_h = max(1, (by1 - by0) // grid)
+            cell_w = max(1, (bx1 - bx0) // grid)
+            for gy in range(grid):
+                for gx in range(grid):
+                    ccy = by0 + gy * cell_h + cell_h // 2
+                    ccx = bx0 + gx * cell_w + cell_w // 2
+                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
+                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
+                    tw, th = min(tile, W - wx0), min(tile, H - wy0)
+                    a = _denodata(src.read(
+                        1, window=Window(wx0, wy0, tw, th),
+                        out_dtype=np.float32, masked=True).filled(np.nan))
+                    if float(np.isfinite(a).mean()) < min_valid_frac:
+                        continue
+                    g = cp.asarray(a)
+                    raw = block_func(g, **kw)
+                    m = int(min(margin, raw.shape[0] // 3, raw.shape[1] // 3))
+                    if m > 0:
+                        raw = raw[m:-m, m:-m]
+                    vals = raw[~cp.isnan(raw)]
+                    if vals.size:
+                        pooled.append(cp.asnumpy(vals))
+                    del g, raw, vals
+                    cp.get_default_memory_pool().free_all_blocks()
+
+        if not pooled:
+            return None
+        pooled_gpu = cp.asarray(np.concatenate(pooled))
+        stats = stat_func(pooled_gpu)
+        if not stats or not np.isfinite(float(stats[-1])) or float(stats[-1]) <= 1e-9:
+            return None
+        logger.info(
+            "%s global stats from %d full-res tiles (tile=%d, margin=%d, %d px): %s",
+            algorithm, len(pooled), tile, margin, int(pooled_gpu.size),
+            tuple(round(float(s), 6) for s in stats),
+        )
+        return stats
+    except Exception as exc:
+        logger.warning("Failed tiled norm stats for %s: %s", algorithm, exc)
+        return None
+
+
+__all__ = ["_NORM_STAT_SPECS", "_norm_stat_max_scale", "_compute_norm_stats_tiled"]
