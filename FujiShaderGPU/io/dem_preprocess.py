@@ -43,7 +43,7 @@ from osgeo import gdal
 from ..utils.cpu import container_cpu_count
 from ..utils.memory import container_memory_available_gb
 from ..utils.nodata_handler import _edge_connected_mask
-from ..utils.paths import resolve_tmp_dir
+from ..utils.paths import resolve_tmp_dir, safe_abspath, safe_unlink
 
 logger = logging.getLogger(__name__)
 
@@ -494,7 +494,7 @@ def preprocess_dem_to_cog(
         # Honor FUJISHADER_TMP_DIR / CPL_TMPDIR / TMPDIR (a large persistent
         # volume on RunPod/Colab) before defaulting next to the output, so the
         # full-resolution staging file(s) do not land on a small disk.
-        tmp_parent, tmp_origin = resolve_tmp_dir(out_path.resolve().parent)
+        tmp_parent, tmp_origin = resolve_tmp_dir(safe_abspath(out_path).parent)
         if tmp_origin:
             logger.info("Staging temporary file(s) in %s (from $%s)", tmp_parent, tmp_origin)
         band_rows = _band_height(width)
@@ -698,7 +698,7 @@ def _stream_fill_serial(
             num_threads=num_threads,
         )
     finally:
-        tmp_tiff.unlink(missing_ok=True)
+        safe_unlink(tmp_tiff)
 
 
 def _process_strip(task: tuple) -> str:
@@ -824,6 +824,6 @@ def _stream_fill_parallel(
         )
     finally:
         for p in strip_paths:
-            p.unlink(missing_ok=True)
+            safe_unlink(p)
         if vrt_path is not None:
-            vrt_path.unlink(missing_ok=True)
+            safe_unlink(vrt_path)

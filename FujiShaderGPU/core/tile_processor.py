@@ -25,6 +25,7 @@ from ..io.output_encoding import (
     quantize_array,
 )
 from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
+from ..utils.paths import safe_abspath
 import os
 import math
 import glob
@@ -1252,13 +1253,13 @@ def _resolve_writable_tmp_dir(
     else:
         # Default value should live next to output to avoid CWD permission issues.
         if requested_tmp_dir == "tiles_tmp":
-            output_dir = Path(output_cog_path).resolve().parent
-            input_dir = Path(input_cog_path).resolve().parent
+            output_dir = safe_abspath(output_cog_path).parent
+            input_dir = safe_abspath(input_cog_path).parent
             candidates.append(output_dir / requested)
             if input_dir != output_dir:
                 candidates.append(input_dir / requested)
         # Respect user-specified relative path under current working directory.
-        candidates.append((Path.cwd() / requested).resolve())
+        candidates.append(safe_abspath(Path.cwd() / requested))
 
     # Last resort: system temp area.
     candidates.append(Path(tempfile.gettempdir()) / "FujiShaderGPU_tiles_tmp")
