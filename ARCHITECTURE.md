@@ -70,8 +70,8 @@ slow full-resolution reads).
   - `_impl_npr_edges.py` — NPR Edges
   - `_impl_ambient_occlusion.py` — Ambient Occlusion (stylized SSAO heuristic, not a physically based hemisphere integral / sky-view factor)
   - `_impl_openness.py` — Topographic Openness (Yokoyama et al. 2002; directional mean of per-azimuth horizon angles, positive/negative)
-  - `_impl_fractal_anomaly.py` — Fractal Anomaly
-  - `_impl_experimental.py` — Scale-Space Surprise + Multi-Light Uncertainty
+  - `_impl_fractal_anomaly.py` — Fractal Anomaly (FujiShaderGPU-original composite; core = standard fractal-surface roughness-vs-scale log-log regression / Hurst exponent, anomaly feature is bespoke)
+  - `_impl_experimental.py` — Scale-Space Surprise (FujiShaderGPU-original Σ|DoG| cross-scale measure on standard Gaussian scale-space; NOT Bayesian Surprise) + Multi-Light Uncertainty
   - Some `_impl_*` modules also host **backend-neutral global-stat helpers** that
     both pipelines import (so they are not duplicated, and the Windows tile path does
     not import the Dask-only `core/dask_processor.py`): `_compute_npr_grad_stats`

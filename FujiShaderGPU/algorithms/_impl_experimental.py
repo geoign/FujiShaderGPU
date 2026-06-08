@@ -103,7 +103,17 @@ def _sss_combine_block(block, *smooths, pair_w=None, norm_min=0.0, norm_scale=1.
 def compute_scale_space_surprise_block(block, *, scales=None, radii=None, enhancement=2.0,
                                       normalize=True, norm_min=None, norm_scale=None,
                                       weights=None):
-    """Scale-Space Surprise Map: emphasize the amount of feature change across scales."""
+    """Scale-Space Surprise Map -- a FujiShaderGPU-original visualization measure.
+
+    Emphasizes the amount of feature change across scale-space: each scale is a
+    Gaussian smooth (Lindeberg scale-space) and the result sums the absolute
+    difference between consecutive scales, i.e. ``Sum |DoG(sigma_i, sigma_{i+1})|``
+    (a Difference-of-Gaussians stack), then percentile-normalizes and applies a
+    gamma-style enhancement.  The Gaussian scale-space and DoG primitives are
+    standard, but this specific measure and the name are original.  NOTE: despite
+    the name, this is NOT Bayesian "Surprise" (Itti & Baldi 2009, a KL divergence
+    between prior and posterior beliefs) -- "surprise" here just denotes the
+    cross-scale change magnitude."""
     if radii:  # unified --radii feeds the scale-space scales
         scales = [float(r) for r in radii]
     if not scales:
@@ -141,6 +151,11 @@ def scale_space_surprise_stat_func(data):
 
 
 class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
+    """Scale-Space Surprise -- FujiShaderGPU-original cross-scale change measure.
+
+    Built on standard Gaussian scale-space / Difference-of-Gaussians primitives,
+    but the measure and name are original; it is NOT Bayesian Surprise (Itti &
+    Baldi 2009).  See ``compute_scale_space_surprise_block`` for details."""
     def process(self, gpu_arr, **params):
         radii = params.get('radii')
         scales = [float(r) for r in radii] if radii else params.get('scales', [1.0, 2.0, 4.0, 8.0, 16.0])

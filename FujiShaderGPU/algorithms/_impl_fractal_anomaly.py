@@ -228,7 +228,18 @@ def fractal_stat_func(data):
 
 
 class FractalAnomalyAlgorithm(DaskAlgorithm):
-    """Fractal anomaly detection algorithm."""
+    """Fractal anomaly detection -- a FujiShaderGPU-original composite indicator.
+
+    There is no single published "fractal anomaly" algorithm.  The *core* is the
+    established fractal-surface method: detrended local roughness sigma(L) is
+    measured at several scales and a log-log regression of log(sigma) vs log(scale)
+    gives the slope beta, an estimate of the roughness-scaling (Hurst) exponent
+    (self-affine terrain follows sigma(L) ~ L^H; surface fractal dimension
+    D = 3 - H).  The *anomaly* feature built on top -- deviation of beta from a
+    reference exponent, the regression RMSE (departure from a clean power law),
+    relief-weighted macro/fine scale ratios, despeckle and blending -- is a
+    bespoke FujiShaderGPU construction (its coefficients are heuristic, tuned for
+    terrain visualization), not a standard geomorphometric product."""
     def process(self, gpu_arr, **params):
         radii = params.get('radii', None)
         ps = params.get('pixel_size', 1.0)
