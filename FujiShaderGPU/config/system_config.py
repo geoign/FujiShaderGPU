@@ -22,7 +22,6 @@ gdal.DontUseExceptions()
 
 
 def get_gpu_config(
-    gpu_type: str = "auto",
     sigma: float = 10.0,
     multiscale_mode: bool = True,
     pixel_size: float = 0.5,
@@ -32,11 +31,10 @@ def get_gpu_config(
     """GPU type and system specs aware runtime config."""
     sys_config = detect_optimal_system_config()
 
-    if gpu_type == "auto":
-        gpu_name = sys_config.get("gpu_name", "").upper()
-        vram_gb = float(sys_config.get("vram_gb", 0.0))
-        gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
-        logger.info("GPU auto-detected: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
+    gpu_name = sys_config.get("gpu_name", "").upper()
+    vram_gb = float(sys_config.get("vram_gb", 0.0))
+    gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
+    logger.info("GPU auto-detected: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
 
     # Dynamic parameter computation from VRAM
     vram_gb = float(sys_config.get("vram_gb", 8.0))

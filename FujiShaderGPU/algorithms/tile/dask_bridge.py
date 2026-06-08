@@ -350,28 +350,6 @@ def _direct_npr_edges(block, params):
     )
 
 
-def _direct_visual_saliency(block, params):
-    from .._impl_visual_saliency import compute_visual_saliency_block, visual_saliency_stat_func
-
-    # Pass radii/weights through so the unified --radii/--weights take effect
-    # (the block resolves radii->scales internally), matching the Dask path.
-    radii = params.get("radii", None)
-    weights = params.get("weights", None)
-    common = dict(
-        scales=params.get("scales", [2, 4, 8, 16]), radii=radii, weights=weights,
-        pixel_size=params.get("pixel_size", 1.0),
-        pixel_scale_x=params.get("pixel_scale_x", None),
-        pixel_scale_y=params.get("pixel_scale_y", None),
-    )
-    stats = params.get("global_stats", None)
-    if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
-        raw = compute_visual_saliency_block(block, normalize=False, **common)
-        stats = visual_saliency_stat_func(raw)
-    return compute_visual_saliency_block(
-        block, normalize=True, norm_min=stats[0], norm_scale=stats[1], **common,
-    )
-
-
 def _direct_multiscale_terrain(block, params):
     # The previous direct reimplementation ignored the unified --radii (read only
     # "scales") and upper-clipped the normalized tail at OVERFLOW_LIMIT, whereas

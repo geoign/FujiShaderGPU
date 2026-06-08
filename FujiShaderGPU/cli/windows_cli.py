@@ -39,9 +39,6 @@ Examples:
   # Spatial RVI (manual radii)
   fujishadergpu input.tif output.tif --algorithm rvi --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
 
-  # Specify the GPU type
-  fujishadergpu input.tif output.tif --gpu-type rtx4070
-
   # COG generation only (from existing tiles)
   fujishadergpu dummy.tif output.tif --cog-only --tmp-dir existing_tiles
 
@@ -82,7 +79,6 @@ Note: Windows and Linux share the same algorithm names and options.
             "padding": args.padding,
             "max_workers": args.max_workers,
             "nodata_threshold": args.nodata_threshold,
-            "gpu_type": args.gpu_type,
             "multiscale_mode": not args.single_scale,
             "auto_scale_analysis": not args.no_auto_scale,
             "cog_only": args.cog_only,
@@ -122,7 +118,6 @@ Note: Windows and Linux share the same algorithm names and options.
                 nodata_override=parse_nodata_override(args.nodata),
                 output_dtype=getattr(args, "output_dtype", "float32"),
                 output_range=parse_output_range(getattr(args, "output_range", None)),
-                gpu_type=params["gpu_type"],
                 multiscale_mode=params["multiscale_mode"],
                 pixel_size=params["pixel_size"],
                 auto_scale_analysis=params["auto_scale_analysis"],

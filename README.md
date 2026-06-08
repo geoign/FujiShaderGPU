@@ -169,6 +169,7 @@ Current Dask algorithms:
 - `specular`
 - `atmospheric_scattering`
 - `multiscale_terrain`
+- `blur`
 - `curvature`
 - `visual_saliency`
 - `npr_edges`
@@ -186,6 +187,7 @@ Windows/macOS tile path uses the same canonical algorithm names as Dask:
 - `specular`
 - `atmospheric_scattering`
 - `multiscale_terrain`
+- `blur`
 - `curvature`
 - `visual_saliency`
 - `npr_edges`

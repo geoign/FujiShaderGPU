@@ -55,6 +55,7 @@ from ..io.output_encoding import (
     output_nodata_for_dtype,
     resolve_output_range,
     quantize_params,
+    apply_scale_offset,
 )
 from ..config.auto_tune import compute_dask_chunk
 from ..utils.cpu import container_cpu_count
@@ -953,84 +954,6 @@ def validate_inputs(src_cog: str):
         raise FileNotFoundError(f"Input file not found: {src_cog}")
 
 
-def _compute_rvi_global_stats_from_overview(
-    src_cog: str,
-    *,
-    radii: List[int],
-    weights: Optional[List[float]],
-    pixel_size: float,
-    sample_max: int = 2048,
-) -> Optional[tuple]:
-    """Estimate the RVI normalization scale from a decimated overview read.
-
-    Striding the full-resolution Dask array forces every chunk (the entire
-    dataset) to be read and copied to the GPU before any write progress is
-    visible, which stalls on very large rasters.  A decimated rasterio read uses
-    the COG overview pyramid and returns a representative full-extent sample at a
-    tiny fraction of the cost -- mirroring the tile backend's strategy.
-    """
-    try:
-        from ..algorithms._impl_rvi import compute_rvi_efficient_block
-        from ..algorithms._normalization import rvi_stat_func
-        from rasterio.enums import Resampling
-    except Exception as exc:
-        logger.warning("RVI overview stats helpers unavailable: %s", exc)
-        return None
-
-    if not radii:
-        return None
-
-    try:
-        with rasterio.open(src_cog) as src:
-            scale = max(src.width / sample_max, src.height / sample_max, 1.0)
-            sample_w = max(128, int(src.width / scale))
-            sample_h = max(128, int(src.height / scale))
-            sample_ma = src.read(
-                1,
-                out_shape=(sample_h, sample_w),
-                resampling=Resampling.nearest,
-                out_dtype=np.float32,
-                masked=True,
-            )
-            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
-            nodata = src.nodata
-
-        if nodata is not None and not np.isnan(float(nodata)):
-            sample = np.where(
-                np.isclose(sample, float(nodata), rtol=0.0, atol=1e-6),
-                np.nan,
-                sample,
-            ).astype(np.float32, copy=False)
-
-        sample_pixel_size = float(pixel_size) * float(scale)
-        scaled_radii = [max(1, int(round(float(r) / scale))) for r in radii]
-
-        sample_gpu = cp.asarray(sample, dtype=cp.float32)
-        rvi_sample = compute_rvi_efficient_block(
-            sample_gpu,
-            radii=scaled_radii,
-            weights=weights,
-            pixel_size=sample_pixel_size,
-        )
-        stats = rvi_stat_func(rvi_sample)
-        if not stats or not np.isfinite(float(stats[0])) or float(stats[0]) <= 1e-9:
-            return None
-        logger.info(
-            "RVI global stats from overview: decimation=%.1fx, radii=%s -> %s, abs_p80=%.6f",
-            scale,
-            list(radii),
-            scaled_radii,
-            float(stats[0]),
-        )
-        return stats
-    except Exception as exc:
-        logger.warning(
-            "Failed to compute RVI overview stats; falling back to window sampling: %s",
-            exc,
-        )
-        return None
-
-
 def _compute_rvi_overview_coarse_field(
     src_cog: str,
     *,
@@ -1116,22 +1039,6 @@ def _estimate_output_range(result_gpu: da.Array,
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("Output range estimation failed (%s); using [0, 1]", exc)
         return (0.0, 1.0)
-
-
-def _apply_scale_offset(path: Path, scale: float, offset: float) -> None:
-    """Best-effort: record GDAL band scale/offset so DN -> physical is recoverable."""
-    try:
-        ds = gdal.Open(str(path), gdal.GA_Update)
-        if ds is None:
-            return
-        try:
-            band = ds.GetRasterBand(1)
-            band.SetScale(float(scale))
-            band.SetOffset(float(offset))
-        finally:
-            ds = None
-    except Exception as exc:  # pragma: no cover - metadata is non-critical
-        logger.warning("Could not write scale/offset metadata: %s", exc)
 
 
 def run_pipeline(
@@ -1712,7 +1619,7 @@ def run_pipeline(
             write_cog_da_chunked(result_da, dst_path, show_progress=show_progress)
             # Record DN->physical recovery (integer outputs only); non-critical.
             if out_scale_offset is not None:
-                _apply_scale_offset(dst_path, out_scale_offset[0], out_scale_offset[1])
+                apply_scale_offset(str(dst_path), out_scale_offset[0], out_scale_offset[1])
         logger.info("Pipeline completed successfully!")
         gc.collect()
         

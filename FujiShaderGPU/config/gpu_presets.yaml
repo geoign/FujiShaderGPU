@@ -1,17 +1,7 @@
-system_presets:
-  # CPU/system-memory-based settings
-  gdal:
-    high_memory:  # 64GB or more
-      cache_mb: 16384
-      dataset_pool: 3000
-    medium_memory:  # 32-64GB
-      cache_mb: 8192
-      dataset_pool: 2000
-    low_memory:  # under 32GB
-      cache_mb: 4096
-      dataset_pool: 1000
-
-# GPU preset definitions
+# GPU preset definitions.
+# Only ``vram_gb`` / ``vram_gb_range`` are read (by gpu_config_manager for GPU-type
+# naming); the per-entry chunk_size/rmm values are kept as human reference anchors.
+# The authoritative performance parameters are computed in config/auto_tune.py.
 gpu_presets:
   # Entry level
   rtx4070_laptop:
@@ -58,18 +48,3 @@ gpu_presets:
     chunk_size: 16384
     rmm_pool_size_gb: 60
     rmm_pool_fraction: 0.75
-
-# Algorithm complexity
-algorithm_complexity:
-  rvi: 1.2
-  hillshade: 0.8
-  slope: 0.8
-  specular: 1.5
-  atmospheric_scattering: 0.9
-  multiscale_terrain: 1.5
-  curvature: 1.0
-  visual_saliency: 1.4
-  npr_edges: 1.1
-  ambient_occlusion: 2.0
-  openness: 1.8
-  fractal_anomaly: 1.6

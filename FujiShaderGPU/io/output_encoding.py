@@ -65,10 +65,6 @@ SUPPORTED_OUTPUT_DTYPES = ("float32", "int16", "uint8")
 _INT_MAXPOS: Dict[str, int] = {"int16": 32767, "uint8": 255}
 
 
-def is_integer_output(dtype) -> bool:
-    return str(dtype).lower() in _INT_MAXPOS
-
-
 def output_nodata_for_dtype(dtype) -> float:
     """NoData sentinel for an output dtype: NaN for float, 0 for integers."""
     dt = np.dtype(dtype)
@@ -167,7 +163,10 @@ def quantize_array(arr, qp: Dict[str, float], dtype: str):
 def apply_scale_offset(path: str, scale: float, offset: float) -> bool:
     """Best-effort GDAL band scale/offset write (DN -> physical recovery).
 
-    Returns True on success.  Non-critical: failures are swallowed by callers.
+    Records ``value = scale*DN + offset`` on band 1 so a viewer can recover the
+    physical value from the integer codes.  Returns True on success; failures are
+    non-critical and swallowed by callers.  Shared by both backends so integer
+    outputs carry identical scale/offset metadata.
     """
     try:
         from osgeo import gdal
@@ -183,3 +182,5 @@ def apply_scale_offset(path: str, scale: float, offset: float) -> bool:
         return True
     finally:
         ds = None
+
+

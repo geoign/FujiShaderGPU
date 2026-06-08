@@ -23,6 +23,7 @@ from ..io.output_encoding import (
     resolve_output_range,
     quantize_params,
     quantize_array,
+    apply_scale_offset,
 )
 from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 from ..algorithms._norm_stats import _NORM_STAT_SPECS, _compute_norm_stats_tiled
@@ -479,17 +480,6 @@ def _warn_if_compute_cost_high(
         )
 
 
-def _percentile_minmax_np(data: np.ndarray, pmin: float = 1.0, pmax: float = 99.0) -> Optional[Tuple[float, float]]:
-    valid = data[np.isfinite(data)]
-    if valid.size == 0:
-        return None
-    mn = float(np.percentile(valid, pmin))
-    mx = float(np.percentile(valid, pmax))
-    if not (np.isfinite(mn) and np.isfinite(mx)) or mx <= mn:
-        return None
-    return (mn, mx)
-
-
 def _unsigned_p80_stats_np(data: np.ndarray) -> Optional[Tuple[float, float]]:
     valid = data[np.isfinite(data)]
     if valid.size == 0:
@@ -608,35 +598,6 @@ def _compute_geotiff_tile_profile(
         tile_profile["tiled"] = False
 
     return tile_profile
-
-
-def _compute_global_hillshade_z_factor(input_cog_path: str, pixel_size: float) -> float:
-    """Estimate a stable z-factor from a global overview sample to reduce tile seams."""
-    with rasterio.open(input_cog_path, "r") as src:
-        sample_max = 2048
-        scale = max(src.width / sample_max, src.height / sample_max, 1.0)
-        sample_w = max(64, int(src.width / scale))
-        sample_h = max(64, int(src.height / scale))
-        sample = src.read(
-            1,
-            out_shape=(sample_h, sample_w),
-            resampling=Resampling.average,
-            out_dtype=np.float32,
-        )
-        nodata = src.nodata
-
-    if nodata is not None:
-        valid = sample[~_build_nodata_mask(sample, nodata)]
-    else:
-        valid = sample.reshape(-1)
-
-    if valid.size == 0:
-        return 1.0
-
-    p95 = float(np.percentile(valid, 95))
-    p5 = float(np.percentile(valid, 5))
-    dem_range = max(p95 - p5, 1.0)
-    return float(pixel_size * 5.0 / dem_range)
 
 
 def _compute_global_rvi_stats(
@@ -1181,11 +1142,7 @@ def _format_algorithm_output(
 ) -> Tuple[np.ndarray, Optional[float]]:
     """Normalize dtype/band format per algorithm (all outputs float32)."""
     if algorithm == "hillshade":
-        color_mode = str(algo_params.get("color_mode", "grayscale")).lower()
-        arr = result_core
-        if color_mode == "grayscale" and arr.ndim == 3:
-            arr = arr[:, :, 0]
-        arr = np.clip(arr, 0.0, 1.0).astype(np.float32, copy=False)
+        arr = np.clip(result_core, 0.0, 1.0).astype(np.float32, copy=False)
         # Keep hillshade as single-band float output with NaN nodata.
         if arr.ndim == 3:
             arr = arr[:, :, 0]
@@ -1573,7 +1530,6 @@ def process_dem_tiles(
     sigma: float = 10.0,
     max_workers: Optional[int] = None,
     nodata_threshold: float = 1.0,
-    gpu_type: str = "auto",
     multiscale_mode: bool = True,
     pixel_size: Optional[float] = None,
     auto_scale_analysis: bool = True,
@@ -1589,11 +1545,10 @@ def process_dem_tiles(
     # COG-generation-only case
     if cog_only:
         resume_cog_generation(
-            tmp_tile_dir, 
-            output_cog_path, 
-            gpu_type, 
-            sigma, 
-            multiscale_mode, 
+            tmp_tile_dir,
+            output_cog_path,
+            sigma,
+            multiscale_mode,
             pixel_size or 0.5,
             cog_backend,
             gdal_bin_dir,
@@ -1635,7 +1590,6 @@ def process_dem_tiles(
 
     if algorithm == "hillshade":
         # Stable defaults for tile-consistent hillshade output.
-        algo_params.setdefault("color_mode", "grayscale")
         algo_params.setdefault("contrast_enhance", False)
         algo_params.setdefault("z_factor", 1.0)
     
@@ -1649,11 +1603,10 @@ def process_dem_tiles(
 
     # Get GPU configuration
     gpu_config = get_gpu_config(
-        gpu_type,
-        sigma,
-        multiscale_mode,
-        pixel_size,
-        target_distances,
+        sigma=sigma,
+        multiscale_mode=multiscale_mode,
+        pixel_size=pixel_size,
+        target_distances=target_distances,
         algorithm=algorithm,
     )
     user_padding_provided = padding is not None
@@ -2337,13 +2290,15 @@ def process_dem_tiles(
         
         # COG quality validation
         _validate_cog_for_qgis(output_cog_path)
-        # Float output: apply float-oriented display hints (e.g. RVI -1/1).
-        # Quantized integer output is a plain DN raster (uint8 0..255 / int16
-        # raw codes) with NoData=0 and NO scale/offset metadata -- embedding
-        # scale/offset makes QGIS auto-unscale the band to a confusing float
-        # range, so we deliberately leave it off for the display product.
         if quantize_scale_offset is None:
+            # Float output: apply float-oriented display hints (e.g. RVI -1/1).
             _apply_output_display_hints(output_cog_path, algorithm)
+        else:
+            # Integer output: record GDAL scale/offset (DN -> physical recovery),
+            # matching the Dask backend so both write identical metadata.
+            apply_scale_offset(
+                output_cog_path, quantize_scale_offset[0], quantize_scale_offset[1]
+            )
 
     except Exception as e:
         if os.path.exists(tmp_tile_dir):
@@ -2358,7 +2313,6 @@ def process_dem_tiles(
 def resume_cog_generation(
     tmp_tile_dir: str,
     output_cog_path: str,
-    gpu_type: str = "auto",
     sigma: float = 10.0,
     multiscale_mode: bool = True,
     pixel_size: float = 0.5,
@@ -2394,10 +2348,13 @@ def resume_cog_generation(
     # Get GPU configuration (considering the original processing settings)
     try:
         target_distances, weights = _get_default_scales()
-        gpu_config = get_gpu_config(gpu_type, sigma, multiscale_mode, pixel_size, target_distances)
+        gpu_config = get_gpu_config(
+            sigma=sigma, multiscale_mode=multiscale_mode,
+            pixel_size=pixel_size, target_distances=target_distances,
+        )
     except Exception as e:
         logger.warning(f"GPU configuration warning: {e}; using default settings")
-        gpu_config = get_gpu_config(gpu_type)
+        gpu_config = get_gpu_config()
     
     # Run COG generation
     try:

@@ -48,20 +48,3 @@ def test_rvi_norm_func_is_linear_without_clip():
     result = rvi_norm_func(data, (2.0,), cp.isnan(data))
 
     assert cp.asnumpy(result).tolist() == pytest.approx([-2.0, -0.5, 0.0, 0.5, 2.0])
-
-
-def test_rvi_result_stats_sample_existing_result_not_second_rvi():
-    da = pytest.importorskip("dask.array")
-    from FujiShaderGPU.algorithms._impl_rvi import compute_rvi_result_stats
-
-    arr = cp.concatenate(
-        [
-            cp.full((800,), 0.01, dtype=cp.float32),
-            cp.full((200,), 0.5, dtype=cp.float32),
-        ]
-    ).reshape(20, 50)
-    rvi = da.from_array(arr, chunks=(10, 25))
-
-    scale = float(compute_rvi_result_stats(rvi)[0])
-
-    assert scale == pytest.approx(0.5, rel=1e-2)

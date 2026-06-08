@@ -123,10 +123,8 @@ TILE_ARGS: List[ArgSpec] = [
     (("--padding",), dict(type=int, help="Tile-boundary padding (auto-computed when omitted)")),
     (("--max-workers",), dict(type=int, help="Number of parallel workers (auto-detected when omitted)")),
     (("--nodata-threshold",), dict(type=float, default=1.0, help="NoData skip threshold (default: 1.0)")),
-    (("--gpu-type",), dict(choices=["rtx4070", "t4", "l4", "a100", "auto"], default="auto", help="GPU type (default: auto)")),
     (("--single-scale",), dict(action="store_true", help="Force single-scale mode")),
     (("--no-auto-scale",), dict(action="store_true", help="Disable automatic scale analysis")),
-    (("--color-mode",), dict(choices=["warm", "cool", "grayscale"], default="warm", help="Color mode (default: warm, used by Hillshade)")),
     (("--cog-only",), dict(action="store_true", help="Only generate a COG from existing tiles")),
     (("--cog-backend",), dict(choices=["internal", "external", "auto"], default="internal", help="COG generation backend (default: internal)")),
     (("--gdal-bin-dir",), dict(type=str, default=None, help="External GDAL bin directory (e.g. C:\\Program Files\\GDAL)")),
@@ -212,8 +210,8 @@ def build_algo_params(args: argparse.Namespace) -> dict:
     Spatial radii/weights are emitted for *every* algorithm (including RVI): the
     Dask backend routes them through ``run_pipeline``'s ``radii`` parameter and the
     tile backend reads them straight from the algorithm params, so one rule serves
-    both.  Platform-divergent extras (``verbose`` on Dask, ``color_mode`` on tile)
-    are included only when present, via ``hasattr``.
+    both.  Platform-divergent extras (e.g. ``verbose`` on Dask) are included only
+    when present, via ``hasattr``.
     """
     algorithm = args.algorithm
     p: dict = {}
@@ -234,8 +232,6 @@ def build_algo_params(args: argparse.Namespace) -> dict:
         p["altitude"] = args.altitude
         p["z_factor"] = args.z_factor
         p["multiscale"] = args.multiscale
-        if hasattr(args, "color_mode"):
-            p["color_mode"] = args.color_mode
 
     elif algorithm == "slope":
         p["unit"] = args.unit

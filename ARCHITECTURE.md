@@ -64,6 +64,7 @@ slow full-resolution reads).
   - `_impl_specular.py` — Specular
   - `_impl_atmospheric_scattering.py` — Atmospheric Scattering
   - `_impl_multiscale_terrain.py` — Multiscale Terrain
+  - `_impl_blur.py` — Blur (raw Gaussian-smoothed elevation)
   - `_impl_curvature.py` — Curvature
   - `_impl_visual_saliency.py` — Visual Saliency
   - `_impl_npr_edges.py` — NPR Edges
@@ -171,6 +172,7 @@ Registered in `algorithms/dask_registry.py` (and `dask_shared.py` ALGORITHMS):
 - `specular`
 - `atmospheric_scattering`
 - `multiscale_terrain`
+- `blur`
 - `curvature`
 - `visual_saliency`
 - `npr_edges`
@@ -269,8 +271,6 @@ Otherwise output is written through COG flow.
   - Fractal anomaly output range and normalization.
 - `test_local_spatial_modes.py`
   - Local/spatial mode switching and radii derivation.
-- `test_nodata_handler.py`
-  - NoData virtual-fill preprocessing.
 - `test_output_nodata_policy.py`
   - Output nodata masking behavior.
 - `test_dem_preprocess.py`
@@ -394,18 +394,22 @@ auto_tune()
   ├── dask_cluster.py::make_cluster()        → memory_fraction, rmm_pool_size
   ├── dask_processor.py::run_pipeline()      → dask_chunk (VRAM + data_gb aware)
   ├── tile_processor.py::process_dem_tiles() → worker throttle (VRAM + span aware)
-  ├── linux_cli.py                           → RMM environment variables
-  └── gpu_config_manager.py                  → algorithm_complexity delegation
+  └── linux_cli.py                           → RMM environment variables
 ```
 
-### 12.7 Environment Variable Overrides
+`gpu_config_manager.py` no longer participates in parameter computation; it only
+classifies the detected GPU into a named bucket for the run-description label.
 
-Users can still override computed values via environment variables:
+### 12.7 Manual Overrides
 
-- `FUJISHADER_CHUNK_SIZE` — override chunk_size
-- `FUJISHADER_RMM_POOL_GB` — override RMM pool size
+Computed values can be overridden from the CLI:
 
-These are checked in `gpu_config_manager.py::get_preset()` and take precedence over auto_tune.
+- `--chunk` (Dask) — override the Dask chunk width.
+- `--tile-size` (tile) — override the tile size.
+- `--memory-fraction` (Dask) — override the device-memory fraction.
+
+There is no longer an environment-variable override path; the CLI flags above are
+the single, explicit override surface.
 
 ## 13. Input Preprocessing (`prepare` command)
 
@@ -576,9 +580,8 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
   and under-estimates the scale, which over-amplifies the output and blows out the
   integer encoding); pooling the whole extent is robust to off-center / sparse data
   and dilutes singular outliers into the unclipped `>1` tail. **Both backends import
-  the same `_compute_norm_stats_tiled`**, so the displayed contrast matches. (RVI also
-  keeps an overview-derived stat helper, `_compute_rvi_global_stats_from_overview` in
-  `core/dask_processor.py`.) The normalized float is **unclipped**, so the tail runs a
+  the same `_compute_norm_stats_tiled`**, so the displayed contrast matches. The
+  normalized float is **unclipped**, so the tail runs a
   little past `±1`.
 - **No double normalization.** Algorithms that apply their own display stretch inside
   `.process()` (`apply_display_stretch_dask` in `ambient_occlusion` / `openness`, and

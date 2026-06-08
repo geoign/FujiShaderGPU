@@ -142,24 +142,6 @@ from ._impl_experimental import (
     MultiLightUncertaintyAlgorithm,
 )
 
-# ---------------------------------------------------------------------------
-# Algorithm registry
-# ---------------------------------------------------------------------------
-
-ALGORITHMS = {
-    'rvi': RVIAlgorithm(),
-    'hillshade': HillshadeAlgorithm(),
-    'slope': SlopeAlgorithm(),
-    'specular': SpecularAlgorithm(),
-    'atmospheric_scattering': AtmosphericScatteringAlgorithm(),
-    'multiscale_terrain': MultiscaleDaskAlgorithm(),
-    'blur': BlurAlgorithm(),
-    'curvature': CurvatureAlgorithm(),
-    'visual_saliency': VisualSaliencyAlgorithm(),
-    'npr_edges': NPREdgesAlgorithm(),
-    'ambient_occlusion': AmbientOcclusionAlgorithm(),
-    'openness': OpennessAlgorithm(),
-    'fractal_anomaly': FractalAnomalyAlgorithm(),
-    'scale_space_surprise': ScaleSpaceSurpriseAlgorithm(),
-    'multi_light_uncertainty': MultiLightUncertaintyAlgorithm(),
-}
+# NOTE: the canonical algorithm registry lives in ``dask_registry.ALGORITHMS``
+# (built from the per-algorithm ``dask/*.py`` modules).  This module is only the
+# implementation re-export hub.

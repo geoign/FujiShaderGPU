@@ -10,17 +10,12 @@ from typing import Tuple
 import GPUtil
 import cupy as cp
 
-from ..config.auto_tune import auto_tune, compute_chunk_size
+from ..config.auto_tune import auto_tune
 from dask import config as dask_config
 from dask_cuda import LocalCUDACluster
 from distributed import Client
 
 logger = logging.getLogger(__name__)
-
-
-def get_optimal_chunk_size(gpu_memory_gb: float = 40) -> int:
-    """Auto-tuned chunk size from VRAM (anchor-interpolated)."""
-    return compute_chunk_size(max(gpu_memory_gb, 4.0))
 
 
 def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Client]:

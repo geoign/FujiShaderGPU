@@ -9,7 +9,6 @@ import logging
 from typing import List, Optional
 import cupy as cp
 import numpy as np
-import dask
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
@@ -22,7 +21,6 @@ from ._nan_utils import (
 )
 from ._global_stats import (
     apply_global_normalization,
-    determine_optimal_downsample_factor,
 )
 from ._normalization import rvi_stat_func, rvi_norm_func
 
@@ -215,38 +213,6 @@ def multiscale_rvi(gpu_arr: da.Array, *,
     )
 
     return result
-
-
-def compute_rvi_result_stats(rvi: da.Array) -> tuple:
-    """Estimate global normalization stats directly from the computed RVI field."""
-    downsample_factor = determine_optimal_downsample_factor(
-        rvi.shape,
-        algorithm_name="rvi",
-        target_pixels=4_000_000,
-        min_factor=1,
-        max_factor=256,
-    )
-    downsample_factor = int(max(1, downsample_factor))
-
-    offsets = [(0, 0)]
-    if downsample_factor > 1:
-        half = downsample_factor // 2
-        offsets.extend([(0, half), (half, 0), (half, half)])
-
-    samples = [
-        rvi[oy::downsample_factor, ox::downsample_factor].ravel()
-        for oy, ox in offsets
-    ]
-    # Do not concatenate as Dask arrays here.  On dask-cuda this may trigger a
-    # P2P rechunk shuffle, whose CPU shard-size inspection is not compatible
-    # with CuPy device buffers on non-HMM systems.  Compute the strided samples
-    # from the shared graph, then concatenate the returned CuPy arrays on GPU.
-    computed_samples = dask.compute(*samples)
-    valid_samples = [s for s in computed_samples if getattr(s, "size", 0) > 0]
-    if not valid_samples:
-        return (1.0,)
-    sample = cp.concatenate(valid_samples) if len(valid_samples) > 1 else valid_samples[0]
-    return rvi_stat_func(sample)
 
 
 def compute_rvi_input_sample_stats(
