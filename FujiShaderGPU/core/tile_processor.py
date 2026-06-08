@@ -1425,6 +1425,18 @@ def process_single_tile(
                     tile_algo_params["pixel_scale_x"] = float(px_m_x / px_m_mean)
                     tile_algo_params["pixel_scale_y"] = float(px_m_y / px_m_mean)
                     tile_algo_params["elevation_scale"] = float(1.0 / px_m_mean)
+                    # specular's roughness is computed on elevation*elevation_scale,
+                    # which varies by tile latitude on geographic DEMs; the global
+                    # roughness_norm_scale (p95) was measured at the raster-mean
+                    # elevation_scale, so rescale it to THIS tile's scale -- else the
+                    # roughness magnitude shifts per tile against a fixed denominator
+                    # and reintroduces tile-boundary seams.
+                    if algorithm == "specular" and algo_params.get("roughness_norm_scale"):
+                        _g_es = float(algo_params.get("elevation_scale", 1.0)) or 1.0
+                        tile_algo_params["roughness_norm_scale"] = (
+                            float(algo_params["roughness_norm_scale"])
+                            * float(tile_algo_params["elevation_scale"]) / _g_es
+                        )
                 except Exception:
                     # Fallback to globally prepared params if local conversion fails.
                     pass

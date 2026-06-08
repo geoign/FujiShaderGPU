@@ -45,6 +45,7 @@ except ImportError:
 from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS, MULTISCALE_REQUIRED_ALGOS
 from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
 from ..algorithms._impl_npr_edges import _compute_npr_grad_stats
+from ..algorithms._impl_specular import _compute_specular_roughness_scale
 from ..algorithms._norm_stats import (
     _NORM_STAT_SPECS,
     _compute_norm_stats_tiled,
@@ -1239,6 +1240,19 @@ def run_pipeline(
             _ngs = _compute_npr_grad_stats(src_cog, params)
             if _ngs:
                 params["_npr_grad_stats"] = _ngs
+
+        # specular normalizes roughness by a per-block p95 (tile-boundary seams,
+        # pronounced on large / geographic DEMs where roughness varies across the
+        # extent).  Inject a single global roughness p95 so every tile uses the
+        # same denominator -- the same fix the tile backend already applies.
+        if (
+            algorithm == "specular"
+            and params.get("roughness_norm_scale") is None
+            and not is_zarr_path(src_cog)
+        ):
+            _rns = _compute_specular_roughness_scale(src_cog, params)
+            if _rns is not None:
+                params["roughness_norm_scale"] = _rns
 
         # Unified coarse source: read ONE decimated overview of the DEM and share it
         # across every algorithm's large-radius path (the coarse-overview combine is
