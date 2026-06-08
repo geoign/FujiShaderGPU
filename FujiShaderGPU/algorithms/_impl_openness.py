@@ -17,7 +17,6 @@ from ._nan_utils import (
     large_radius_threshold, multiscale_response_fields,
 )
 from ._global_stats import apply_display_stretch_dask
-from ._normalization import robust_unsigned_stretch_stat_func
 
 
 def compute_openness_vectorized(block: cp.ndarray, *,

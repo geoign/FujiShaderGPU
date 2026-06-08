@@ -6,7 +6,6 @@ Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import cupy as cp
-import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter
 
 from ._base import Constants, DaskAlgorithm
@@ -149,7 +148,6 @@ class SpecularAlgorithm(DaskAlgorithm):
             # (roughness_scale -> rs/F) and uses a roughness-dependent halo
             # (max(rs, 2r+1)); the generic helper passes identical block kwargs to
             # the coarse and full-res branches, so it cannot express that.
-            is_geo = bool(params.get("is_geographic_dem", False))
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
             # Coarsen for large radii on geographic DEMs too (pixel-based; the
             # roughness kernel and metric scales below are scaled by F as well).

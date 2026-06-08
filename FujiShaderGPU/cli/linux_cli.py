@@ -63,14 +63,6 @@ writes them out as Cloud-Optimized GeoTIFF."""
         add_arguments(parser, DASK_ARGS)
 
     def _validate_platform_args(self, args: argparse.Namespace):
-        # Combine the auto-radii enable/disable flags.
-        if hasattr(args, "auto_radii") and hasattr(args, "no_auto_radii"):
-            args.auto_radii = args.auto_radii and not args.no_auto_radii
-
-        # Combine the global-stats enable/disable flags.
-        if hasattr(args, "use_global_stats") and hasattr(args, "no_global_stats"):
-            args.use_global_stats = args.use_global_stats and not args.no_global_stats
-
         # RVI needs either explicit radii or auto-determination.
         if args.algorithm == "rvi":
             if not getattr(args, "radii_list", None) and not getattr(args, "auto_radii", True):
@@ -97,8 +89,8 @@ writes them out as Cloud-Optimized GeoTIFF."""
                 pixel_size_x_m = pixel_size_x_deg * meters_per_degree_lon
                 pixel_size_y_m = pixel_size_y_deg * meters_per_degree_lat
                 args.pixel_size = (pixel_size_x_m + pixel_size_y_m) / 2
-                self.logger.info(f"Geographic CRS detected: center latitude {center_lat:.2f}°")
-                self.logger.info(f"Pixel size: {pixel_size_x_deg:.6f}° x {pixel_size_y_deg:.6f}°")
+                self.logger.info(f"Geographic CRS detected: center latitude {center_lat:.2f} deg")
+                self.logger.info(f"Pixel size: {pixel_size_x_deg:.6f} deg x {pixel_size_y_deg:.6f} deg")
                 self.logger.info(f"In meters: {args.pixel_size:.2f}m")
             else:
                 # Projected CRS (already metric).

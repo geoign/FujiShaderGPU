@@ -81,8 +81,9 @@ ALGORITHM_ARGS: List[ArgSpec] = [
     (("--blur-radius",), dict(type=float, default=16.0, help="Blur Gaussian sigma in pixels (default: 16.0; --radii first value overrides it)")),
     # Visual saliency
     (("--vs-scales",), dict(type=str, help="Visual saliency scales, comma-separated (e.g. 2,4,8,16)")),
-    (("--use-global-stats",), dict(action="store_true", default=True, help="Use global statistics (default: True)")),
-    (("--no-global-stats",), dict(action="store_true", help="Disable global statistics")),
+    (("--global-stats",), dict(
+        action=argparse.BooleanOptionalAction, default=True, dest="use_global_stats",
+        help="Use global statistics for algorithms that support them (default: enabled)")),
     (("--downsample-factor",), dict(type=int, default=20, help="Downsample factor (default: 20)")),
     # NPR edges
     (("--edge-sigma",), dict(type=float, default=1.0, help="Edge-detection blur strength (default: 1.0)")),
@@ -112,8 +113,9 @@ DASK_ARGS: List[ArgSpec] = [
         type=float, default=None,
         help="GPU device-memory fraction. Default: auto (VRAM-aware, ~0.60-0.85 via auto_tune). Pass an explicit value to override.")),
     (("--verbose",), dict(action="store_true", help="Enable verbose logging")),
-    (("--auto-radii",), dict(action="store_true", default=True, help="Auto-determine radii via terrain analysis (RVI only, default: True)")),
-    (("--no-auto-radii",), dict(action="store_true", help="Disable automatic radii determination (RVI only)")),
+    (("--auto-radii",), dict(
+        action=argparse.BooleanOptionalAction, default=True,
+        help="Auto-determine radii via terrain analysis (RVI only, default: enabled)")),
 ]
 
 TILE_ARGS: List[ArgSpec] = [
@@ -274,7 +276,7 @@ def build_algo_params(args: argparse.Namespace) -> dict:
     elif algorithm == "visual_saliency":
         if getattr(args, "vs_scales_list", None):
             p["scales"] = args.vs_scales_list
-        p["use_global_stats"] = bool(getattr(args, "use_global_stats", True)) and not bool(getattr(args, "no_global_stats", False))
+        p["use_global_stats"] = bool(getattr(args, "use_global_stats", True))
         p["downsample_factor"] = args.downsample_factor
 
     elif algorithm == "npr_edges":

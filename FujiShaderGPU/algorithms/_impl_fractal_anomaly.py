@@ -6,16 +6,15 @@ Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import logging
-from typing import List, Optional, Tuple
+from typing import Optional
 import cupy as cp
 import numpy as np
-import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, median_filter
 
 from ._base import DaskAlgorithm, classify_resolution, Constants
 from ._nan_utils import (
     handle_nan_with_gaussian, restore_nan, resolve_block_weights,
-    multiscale_response_fields, hybrid_multiscale_response_combine,
+    hybrid_multiscale_response_combine,
 )
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
@@ -240,7 +239,6 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         rp10 = params.get('relief_p10', None)
         rp75 = params.get('relief_p75', None)
         weights = params.get('weights', None)
-        is_geo = bool(params.get('is_geographic_dem', False))
         psx = params.get('pixel_scale_x', None)
         psy = params.get('pixel_scale_y', None)
         if radii is None:

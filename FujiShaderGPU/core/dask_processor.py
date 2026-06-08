@@ -43,6 +43,12 @@ except ImportError:
     logging.warning("dask registry module not found. No algorithms available.")
 
 from ..algorithms.common.auto_params import determine_optimal_radii
+from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
+from ..algorithms._impl_npr_edges import _compute_npr_grad_stats
+from ..algorithms._norm_stats import (
+    _NORM_STAT_SPECS,
+    _compute_norm_stats_tiled,
+)
 from ..io.raster_info import metric_pixel_scales_from_metadata
 from ..io.output_encoding import (
     SUPPORTED_OUTPUT_DTYPES,
@@ -201,8 +207,7 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
 # 3. Automatic parameter determination via terrain analysis
 ###############################################################################
 
-def analyze_terrain_characteristics(dem_arr: da.Array, sample_ratio: float = 0.01,
-                                    src_path: "str | None" = None) -> dict:
+def analyze_terrain_characteristics(dem_arr: da.Array, src_path: "str | None" = None) -> dict:
     """Analyze terrain characteristics holistically.
 
     Samples a coarse, FULL-EXTENT view of the DEM rather than a fixed center
@@ -467,8 +472,6 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
 
 def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """Chunked write implementation for large datasets."""
-    major, minor = check_gdal_version()
-    use_cog_driver = major > 3 or (major == 3 and minor >= 8)
     dtype_str = str(data.dtype)
     cog_options = get_cog_options(dtype_str)
     
@@ -1081,26 +1084,6 @@ def _compute_rvi_overview_coarse_field(
         return None
 
 
-# Shared with the tile backend: the implementation lives in the backend-neutral
-# algorithms/_impl_fractal_anomaly.py so both pipelines use one copy.
-from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
-
-
-# Shared with the tile backend: the implementation lives in the backend-neutral
-# algorithms/_impl_npr_edges.py so both pipelines use one copy.
-from ..algorithms._impl_npr_edges import _compute_npr_grad_stats
-
-
-# Shared with the tile backend: the full-resolution normalization-stats logic
-# lives in the backend-neutral algorithms/_norm_stats.py so both pipelines use one
-# copy.
-from ..algorithms._norm_stats import (
-    _NORM_STAT_SPECS,
-    _norm_stat_max_scale,
-    _compute_norm_stats_tiled,
-)
-
-
 def _quantize_block_cp(block, *, a_coef: float, b_coef: float,
                        dn_min: int, dn_max: int, cp_dtype):
     """Linearly encode a float32 CuPy block to integer codes (NaN/NoData -> 0).
@@ -1316,7 +1299,7 @@ def run_pipeline(
                 
                 # Terrain analysis
                 terrain_stats = analyze_terrain_characteristics(
-                    gpu_arr, sample_ratio=0.01, src_path=src_cog)
+                    gpu_arr, src_path=src_cog)
                 terrain_stats['pixel_size'] = pixel_size
                 
                 # Determine optimal radii

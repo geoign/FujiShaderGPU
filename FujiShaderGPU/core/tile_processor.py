@@ -2,7 +2,7 @@
 FujiShaderGPU/core/tile_processor.py
 Core implementation of tile-based terrain analysis (for Windows/macOS).
 """
-from concurrent.futures import ThreadPoolExecutor, as_completed, FIRST_COMPLETED, wait
+from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from importlib import import_module
 from ..core.gpu_memory import gpu_memory_pool
 from ..config.system_config import get_gpu_config

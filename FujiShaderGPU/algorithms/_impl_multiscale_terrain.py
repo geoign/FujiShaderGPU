@@ -157,7 +157,6 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         if params.get('verbose', False):
             logger.info("Multiscale Terrain global stats: min=%.3f, p80_scale=%.3f", norm_min, norm_scale)
 
-        is_geo = bool(params.get('is_geographic_dem', False))
         pixel_size = float(params.get('pixel_size', 1.0))
         psx = params.get('pixel_scale_x', None)
         psy = params.get('pixel_scale_y', None)

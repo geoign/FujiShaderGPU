@@ -5,7 +5,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-import cupy as cp
 import numpy as np
 import yaml
 

@@ -58,10 +58,6 @@ Note: Windows and Linux share the same algorithm names and options.
         add_arguments(parser, TILE_ARGS)
 
     def _validate_platform_args(self, args: argparse.Namespace):
-        # Combine the global-stats enable/disable flags (shared with Linux).
-        if hasattr(args, "use_global_stats") and hasattr(args, "no_global_stats"):
-            args.use_global_stats = args.use_global_stats and not args.no_global_stats
-
         # COG-only mode reads existing tiles instead of an input raster.
         if getattr(args, "cog_only", False):
             if not os.path.exists(args.tmp_dir):

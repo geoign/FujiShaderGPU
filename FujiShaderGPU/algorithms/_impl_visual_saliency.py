@@ -6,16 +6,13 @@ Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import logging
-from typing import List, Tuple
 import cupy as cp
 import numpy as np
-import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
 from ._base import DaskAlgorithm, Constants
 from ._nan_utils import (
-    restore_nan, resolve_block_weights, multiscale_response_fields,
-    hybrid_multiscale_response_combine,
+    restore_nan, resolve_block_weights, hybrid_multiscale_response_combine,
 )
 from ._global_stats import compute_global_stats
 from ._normalization import NORMAL_PERCENTILE
@@ -119,7 +116,7 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
             intensity_maps.append(_compress_saliency_feature(fm))
             if wvec is not None:
                 intensity_w.append(float(wvec[ci]))
-    I = _weighted_mean_maps(intensity_maps, intensity_w if wvec is not None else None, work)
+    intensity = _weighted_mean_maps(intensity_maps, intensity_w if wvec is not None else None, work)
     ori_maps = []
     ori_w = []
     orientations = [0.0, cp.pi / 4, cp.pi / 2, 3 * cp.pi / 4]
@@ -139,8 +136,8 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
             ori_maps.append(_compress_saliency_feature(resp))
             if wvec is not None:
                 ori_w.append(float(wvec[j]))
-    O = _weighted_mean_maps(ori_maps, ori_w if wvec is not None else None, work)
-    sal = 0.5 * (I + O)
+    orientation = _weighted_mean_maps(ori_maps, ori_w if wvec is not None else None, work)
+    sal = 0.5 * (intensity + orientation)
     if normalize:
         if norm_min is None or norm_scale is None:
             norm_min, norm_scale = visual_saliency_stat_func(sal)
@@ -186,7 +183,7 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
             wj = float(wvec[ci]) if wvec is not None else 1.0
             I_acc += fm * cp.float32(wj)
             I_w += wj
-    I = I_acc / cp.float32(I_w) if I_w > 0 else I_acc
+    intensity = I_acc / cp.float32(I_w) if I_w > 0 else I_acc
     # Orientation conspicuity: running weighted mean over scales x orientations.
     O_acc = cp.zeros_like(block, dtype=cp.float32)
     O_w = 0.0
@@ -206,8 +203,8 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
             resp = _compress_saliency_feature(mag * cp.maximum(cp.cos(2.0 * (theta - o)), 0.0))
             O_acc += resp * cp.float32(wj)
             O_w += wj
-    O = O_acc / cp.float32(O_w) if O_w > 0 else O_acc
-    sal = 0.5 * (I + O)
+    orientation = O_acc / cp.float32(O_w) if O_w > 0 else O_acc
+    sal = 0.5 * (intensity + orientation)
     if normalize:
         if norm_min is None or norm_scale is None:
             norm_min, norm_scale = visual_saliency_stat_func(sal)
@@ -230,7 +227,6 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
-        is_geo = bool(params.get('is_geographic_dem', False))
         # Conspicuity scales (>=4, matching compute_visual_saliency_block).
         use_scales = [max(0.5, float(s)) for s in scales]
         if len(use_scales) < 4:

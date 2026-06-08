@@ -8,7 +8,6 @@ Module split out from dask_shared.py (Phase 1).
 from __future__ import annotations
 from typing import Dict, Any, Tuple
 import cupy as cp
-import numpy as np
 import dask.array as da
 
 from ._nan_utils import restore_nan

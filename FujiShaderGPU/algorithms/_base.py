@@ -5,7 +5,6 @@ Shared constants, base classes, and resolution-classification helpers.
 Module split out from dask_shared.py (Phase 1).
 """
 from __future__ import annotations
-from typing import List, Optional, Dict, Any, Tuple
 from abc import ABC, abstractmethod
 import dask.array as da
 

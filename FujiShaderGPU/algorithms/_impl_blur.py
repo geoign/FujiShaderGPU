@@ -15,7 +15,6 @@ overview-accelerated large-radius behaviour without forking that plumbing.
 """
 from __future__ import annotations
 import logging
-from typing import Optional
 
 import cupy as cp
 import dask.array as da

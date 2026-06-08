@@ -123,9 +123,11 @@ def split_radii_by_threshold(radii, weights, threshold):
     small_r, small_w, large_r, large_w = [], [], [], []
     for r, w in zip(radii, weights):
         if int(r) > int(threshold):
-            large_r.append(int(r)); large_w.append(float(w))
+            large_r.append(int(r))
+            large_w.append(float(w))
         else:
-            small_r.append(int(r)); small_w.append(float(w))
+            small_r.append(int(r))
+            small_w.append(float(w))
     return small_r, small_w, large_r, large_w
 
 
@@ -176,8 +178,10 @@ def _rvi_add_large_block(
     else:  # pragma: no cover - direct (non-dask) call fallback
         r0, c0 = 0, 0
         r1, c1 = block.shape[0], block.shape[1]
-    r0 += int(off_r); r1 += int(off_r)
-    c0 += int(off_c); c1 += int(off_c)
+    r0 += int(off_r)
+    r1 += int(off_r)
+    c0 += int(off_c)
+    c1 += int(off_c)
 
     up = _bilinear_sample_coarse(coarse_field, r0, r1, c0, c1, full_h, full_w)
     return (cp.float32(w_large) * block - up).astype(cp.float32)

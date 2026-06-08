@@ -23,7 +23,6 @@ def compute_hillshade_block(block, *, azimuth=Constants.DEFAULT_AZIMUTH,
                            pixel_scale_y=None, geographic_mode=False):
     """Hillshade computation for a single block."""
     nan_mask = cp.isnan(block)
-    azimuth_rad = cp.radians(azimuth)
     altitude_rad = cp.radians(altitude)
     dy, dx, nan_mask = handle_nan_for_gradient(
         block, scale=z_factor, pixel_size=pixel_size,

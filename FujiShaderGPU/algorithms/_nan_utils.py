@@ -252,8 +252,10 @@ def _upsample_coarse_response_block(block, *, coarse, full_h, full_w,
         r0, c0 = 0, 0
         r1, c1 = block.shape[0], block.shape[1]
     if tile_origin is not None:
-        r0 += int(tile_origin[0]); r1 += int(tile_origin[0])
-        c0 += int(tile_origin[1]); c1 += int(tile_origin[1])
+        r0 += int(tile_origin[0])
+        r1 += int(tile_origin[0])
+        c0 += int(tile_origin[1])
+        c1 += int(tile_origin[1])
     if tile_full_shape is not None:
         full_h, full_w = int(tile_full_shape[0]), int(tile_full_shape[1])
     return _bilinear_sample_coarse(coarse, r0, r1, c0, c1, full_h, full_w)
@@ -682,8 +684,10 @@ def _hybrid_combine_wrapper(dem, *small_blocks, _scales_order, _small_scales,
         r0, c0 = 0, 0
         r1, c1 = int(dem.shape[0]), int(dem.shape[1])
     if _tile_origin is not None:
-        r0 += int(_tile_origin[0]); r1 += int(_tile_origin[0])
-        c0 += int(_tile_origin[1]); c1 += int(_tile_origin[1])
+        r0 += int(_tile_origin[0])
+        r1 += int(_tile_origin[0])
+        c0 += int(_tile_origin[1])
+        c1 += int(_tile_origin[1])
     if _tile_full_shape is not None:
         _full_h, _full_w = int(_tile_full_shape[0]), int(_tile_full_shape[1])
     small_map = {int(round(float(s))): b for s, b in zip(_small_scales, small_blocks)}

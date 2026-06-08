@@ -5,9 +5,7 @@ Atmospheric Scattering algorithm implementation.
 Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
-from typing import Optional
 import cupy as cp
-import dask.array as da
 
 from ._base import Constants, DaskAlgorithm
 from ._nan_utils import (

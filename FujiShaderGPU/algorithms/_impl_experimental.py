@@ -8,10 +8,13 @@ Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import logging
-from typing import List
 import cupy as cp
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
+from .common.kernels import (
+    scale_space_surprise as kernel_scale_space_surprise,
+    multi_light_uncertainty as kernel_multi_light_uncertainty,
+)
 
 from ._base import DaskAlgorithm, Constants
 from ._global_stats import compute_global_stats
@@ -29,10 +32,6 @@ def sss_large_scale_predicate(scale) -> bool:
     coarse path instead of a MAX_DEPTH-truncated halo (the truncation drove the
     tile-boundary seams)."""
     return int(max(1, round(float(scale) * 4)) + 1) > Constants.MAX_DEPTH
-from .common.kernels import (
-    scale_space_surprise as kernel_scale_space_surprise,
-    multi_light_uncertainty as kernel_multi_light_uncertainty,
-)
 
 logger = logging.getLogger(__name__)
 

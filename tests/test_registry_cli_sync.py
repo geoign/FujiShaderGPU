@@ -65,8 +65,10 @@ def test_build_algo_params_parity_across_platforms():
     ]
     lin, win = LinuxCLI(), WindowsCLI()
     for argv in cases:
-        la = lin.parser.parse_args(argv); parse_list_fields(la, lin.parser)
-        wa = win.parser.parse_args(argv); parse_list_fields(wa, win.parser)
+        la = lin.parser.parse_args(argv)
+        parse_list_fields(la, lin.parser)
+        wa = win.parser.parse_args(argv)
+        parse_list_fields(wa, win.parser)
         pl = {k: v for k, v in build_algo_params(la).items() if k != "verbose"}
         pw = {k: v for k, v in build_algo_params(wa).items() if k != "color_mode"}
         assert pl == pw, f"param mismatch for {argv}: {pl} != {pw}"

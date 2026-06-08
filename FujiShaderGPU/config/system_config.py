@@ -38,8 +38,6 @@ def get_gpu_config(
         gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
         logger.info("GPU auto-detected: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
 
-    preset = _gpu_config_manager.get_preset(gpu_type)
-
     # Dynamic parameter computation from VRAM
     vram_gb = float(sys_config.get("vram_gb", 8.0))
     cpu_count = int(sys_config.get("cpu_count", 4))
