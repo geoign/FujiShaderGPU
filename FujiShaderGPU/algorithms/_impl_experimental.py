@@ -142,12 +142,29 @@ def compute_scale_space_surprise_block(block, *, scales=None, radii=None, enhanc
 
 
 def scale_space_surprise_stat_func(data):
-    """Global unsigned scale: p80 maps to +1."""
+    """Robust display range ``(offset, scale)`` = ``(p2, p99 - p2)`` over the
+    non-negative surprise, mapping ``[p2, p99] -> [0, 1]``.
+
+    Pinning the black point at 0 (the old behaviour) left high-relief terrain --
+    where even the calmest areas carry a non-trivial cross-scale change -- with a
+    surprise floor well above 0, so after the gamma enhancement (``base**(1/
+    enhancement)``, which brightens) the whole map collapsed toward the bright /
+    white end (washed out; pronounced on Kilauea/be_44121a6, marginal on GEBCO).
+    Using a data-driven low percentile as the black point spreads the bulk across
+    the code range -- the same robust [p_low, p99] contrast stretch applied to
+    ambient_occlusion / openness.  The bright tail past p99 still runs into the
+    integer headroom.
+    """
     valid_data = data[~cp.isnan(data)]
     if valid_data.size == 0:
         return (0.0, 1.0)
-    scale = float(cp.percentile(cp.maximum(valid_data, 0.0), NORMAL_PERCENTILE))
-    return (0.0, scale if scale > 1e-9 else 1.0)
+    nn = cp.maximum(valid_data, 0.0)
+    lo = float(cp.percentile(nn, 2.0))
+    hi = float(cp.percentile(nn, NORMAL_PERCENTILE))
+    scale = hi - lo
+    if scale <= 1e-9:
+        return (0.0, hi if hi > 1e-9 else 1.0)
+    return (lo, scale)
 
 
 class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):

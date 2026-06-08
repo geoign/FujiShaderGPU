@@ -1189,6 +1189,28 @@ def run_pipeline(
                     algorithm, _dem_short_side, _auto_r,
                 )
 
+        # fractal_anomaly's relief_conf uses a per-block roughness percentile that
+        # varies tile-to-tile (visible tile-boundary seams).  Inject a global
+        # roughness p10/p75 so it is consistent across the whole raster.
+        # NOTE: this MUST run before the norm-stats pre-pass below.  The pre-pass
+        # runs the algorithm's raw block (with these params) to estimate the
+        # display center/scale; if relief_p10/p75 are absent there, the pre-pass
+        # falls back to a per-tile relief_conf while the main pass uses the global
+        # one, so the additive relief terms shift the feature distribution between
+        # the two passes.  The pre-pass center (median) then mismatches the main
+        # pass, biasing the output toward the bright end (worse on high-relief
+        # DEMs where the global relief_conf saturates high).  Computing relief
+        # first makes both passes consistent.
+        if (
+            algorithm == "fractal_anomaly"
+            and params.get("relief_p10") is None
+            and params.get("relief_p75") is None
+            and not is_zarr_path(src_cog)
+        ):
+            _relief = _compute_fractal_relief_stats(src_cog, params)
+            if _relief is not None:
+                params["relief_p10"], params["relief_p75"] = _relief
+
         # Normalized algorithms (TopoUSM Fast/fractal_anomaly/scale_space_surprise/
         # visual_saliency/multiscale_terrain): derive the display range
         # (-1..1 / 0..1) from a robust p99 of the algorithm's own FULL-RESOLUTION
@@ -1205,19 +1227,6 @@ def run_pipeline(
             _norm_stats = _compute_norm_stats_tiled(src_cog, algorithm, params)
             if _norm_stats is not None:
                 params["global_stats"] = _norm_stats
-
-        # fractal_anomaly's relief_conf uses a per-block roughness percentile that
-        # varies tile-to-tile (visible tile-boundary seams).  Inject a global
-        # roughness p10/p75 so it is consistent across the whole raster.
-        if (
-            algorithm == "fractal_anomaly"
-            and params.get("relief_p10") is None
-            and params.get("relief_p75") is None
-            and not is_zarr_path(src_cog)
-        ):
-            _relief = _compute_fractal_relief_stats(src_cog, params)
-            if _relief is not None:
-                params["relief_p10"], params["relief_p75"] = _relief
 
         # npr_edges thresholds edges against a per-block gradient distribution
         # (tile-boundary seams).  Inject a global per-radius gradient threshold so
