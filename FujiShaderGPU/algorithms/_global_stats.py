@@ -197,9 +197,35 @@ def apply_display_stretch_dask(result: da.Array, stats) -> da.Array:
     )
 
 
+def robust_unsigned_stretch_stat_func(values: cp.ndarray) -> Tuple[float, float]:
+    """Robust ``(lo, scale)`` = ``(p1, p99 - p1)`` for a bounded unsigned map.
+
+    Consumed as ``global_stats`` by ``apply_display_stretch_dask`` (which maps
+    ``[lo, lo+scale]`` i.e. ``[p1, p99]`` to ``[0, 1]``).  Physically bounded maps
+    such as ambient_occlusion and openness concentrate in a narrow high band, so
+    without this stretch the integer-encoded output is washed-out white (most codes
+    near 255).  Stretching the robust [p1, p99] band fills the code range and
+    restores contrast, while the bright tail past p99 runs into the unclipped
+    headroom.  Returns ``(0.0, 0.0)`` (a no-op stretch) for an empty/degenerate
+    sample, so behaviour is unchanged when stats cannot be estimated.
+    """
+    if values is None:
+        return (0.0, 0.0)
+    v = values[cp.isfinite(values)]
+    if v.size == 0:
+        return (0.0, 0.0)
+    lo = float(cp.percentile(v, 1.0))
+    hi = float(cp.percentile(v, 99.0))
+    scale = hi - lo
+    if not (scale > 1e-12):
+        return (lo, 0.0)
+    return (lo, scale)
+
+
 __all__ = [
     "determine_optimal_downsample_factor",
     "compute_global_stats",
     "apply_global_normalization",
     "apply_display_stretch_dask",
+    "robust_unsigned_stretch_stat_func",
 ]

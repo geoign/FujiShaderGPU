@@ -17,7 +17,7 @@ from ._nan_utils import (
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
     large_radius_threshold, multiscale_response_fields,
 )
-from ._global_stats import apply_display_stretch_dask
+from ._global_stats import apply_display_stretch_dask, robust_unsigned_stretch_stat_func
 
 
 def compute_ambient_occlusion_block(block: cp.ndarray, *,
