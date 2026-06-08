@@ -1,362 +1,154 @@
 # FujiShaderGPU
 
-FujiShaderGPU is a GPU-accelerated terrain visualization/analysis toolkit for large DEM datasets.
+GPU-accelerated terrain visualization for **very large DEMs** (digital elevation
+models). Turn a height raster into a hillshade, ridge–valley map, slope, openness,
+and more — written straight to a Cloud-Optimized GeoTIFF (COG) you can open in QGIS.
 
-- Linux: Dask-CUDA distributed pipeline
-- Windows/macOS: tile-based local GPU pipeline
-- Output: COG and Zarr
+- **Windows / macOS** — tile-based local GPU pipeline
+- **Linux** — Dask-CUDA distributed pipeline (built for huge multi-GB rasters)
 
-See architecture details in `ARCHITECTURE.md`.
+The algorithms and command-line options are the **same on every platform**; only the
+backend differs.
 
-## Installation
+> 🚀 New here? Jump straight to [Quick start](#quick-start).
 
-Base install:
+## Requirements
 
-```bash
-pip install -e .
-```
+- An NVIDIA GPU with **CUDA 12.x**
+- **Python 3.10+**
+- **GDAL** (installed separately — see below)
 
-Linux Dask-CUDA runtime:
+## Install
 
-```bash
-pip install -e ".[linux]"
-```
-
-Windows/macOS tile runtime:
+Pick the line for your platform:
 
 ```bash
-pip install -e ".[windows]"
+pip install -e ".[windows]"   # Windows / macOS (tile pipeline)
+pip install -e ".[linux]"     # Linux (Dask-CUDA pipeline)
 ```
 
-The `windows` extra includes `dask[array]` because some tile-path algorithms are executed through the shared Dask bridge.
+GDAL's Python binding must match your native GDAL, so install it yourself:
 
-Development tools:
+```bash
+GDAL_VERSION=$(gdal-config --version)
+pip install --no-build-isolation "GDAL==$GDAL_VERSION"
+```
+
+## Quick start
+
+FujiShaderGPU runs best on a COG that already has overviews. Two steps:
+
+```bash
+# 1) Prepare your DEM once (any raster -> pipeline-ready COG, fills NoData holes)
+fujishadergpu-prepare raw_dem.tif dem.tif
+
+# 2) Run an algorithm (default is RVI, the ridge–valley index)
+fujishadergpu dem.tif shaded.tif --algorithm hillshade
+```
+
+That's it — `shaded.tif` is a COG you can drop into QGIS.
+
+> Step 1 is optional but recommended: skipping it still works, but runs slower and may
+> show artifacts at the data edge. Run `prepare` once and reuse the output.
+
+## Algorithms
+
+Choose one with `--algorithm <name>` (default: `rvi`):
+
+```text
+rvi   hillshade   slope   specular   atmospheric_scattering   multiscale_terrain
+blur   curvature   visual_saliency   npr_edges   ambient_occlusion   openness
+fractal_anomaly   scale_space_surprise   multi_light_uncertainty
+```
+
+> 📖 What each algorithm does — and how to tune it — is documented on its own page
+> (separate algorithm guide).
+
+## Common options
+
+| Option | What it does | Default |
+| --- | --- | --- |
+| `--algorithm NAME` | Which terrain analysis to run | `rvi` |
+| `--mode local\|spatial` | Single-neighborhood vs. multi-scale radius integration | `local` |
+| `--radii 4,16,64` | Scales (pixels) for spatial mode | auto by pixel size |
+| `--weights 0.5,0.3,0.2` | Per-radius weights | equal |
+| `--output-dtype float32\|int16\|uint8` | Smaller files for viewing (`int16`≈½, `uint8`≈¼) | `float32` |
+| `--nodata VALUE` | Treat this value as NoData (e.g. `-9999`, `nan`) | declared |
+| `--pixel-size METERS` | Override pixel size | auto-detected |
+| `--force` | Overwrite the output if it exists | off |
+
+Run `fujishadergpu --help` for the complete list.
+
+## More examples
+
+```bash
+# Hillshade
+fujishadergpu dem.tif out.tif --algorithm hillshade
+
+# Spatial (multi-scale) slope with explicit radii + weights
+fujishadergpu dem.tif out.tif --algorithm slope --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
+
+# RVI with custom radii
+fujishadergpu dem.tif out.tif --algorithm rvi --radii 4,16,64,256
+
+# Compact uint8 COG (~1/4 size) for visualization
+fujishadergpu dem.tif out.tif --algorithm rvi --output-dtype uint8
+
+# Zarr output (Linux / Dask path)
+fujishadergpu dem.tif out.zarr --algorithm scale_space_surprise
+```
+
+## Preparing input
+
+`fujishadergpu-prepare` converts any GDAL-readable raster into a pipeline-ready
+float32 COG (ZSTD + internal overviews, no reprojection) and optionally fills NoData
+voids — done once, up front:
+
+```bash
+fujishadergpu-prepare raw.tif dem.tif                 # auto-detect NoData, fill interior holes
+fujishadergpu-prepare raw.tif dem.tif --fill-mode all # fill every hole (dense output, no NoData)
+fujishadergpu-prepare raw.tif dem.tif --nodata -9999  # force a specific NoData value
+```
+
+Fill modes (`--fill-mode`): `enclosed` *(default — interior holes only)* ·
+`none` *(keep all NoData)* · `all` *(fill everything)*.
+
+NoData is auto-detected by default (a declared value, a lost `0` / `-9999` sentinel,
+or a value dominating the border). This matters because a stray fill value read as
+real terrain skews contrast and creates a halo at the data edge.
+→ full rules in [ARCHITECTURE.md §13](ARCHITECTURE.md).
+
+## Output formats
+
+- **COG** by default (`.tif`); **Zarr** when the output path ends in `.zarr`
+  (Linux / Dask path).
+- `--output-dtype` keeps the GPU math in float32 and only changes the final encoding.
+  `int16` / `uint8` shrink the file (NoData = `0`) and record GDAL scale/offset so the
+  physical value is recoverable. → details in [ARCHITECTURE.md §14](ARCHITECTURE.md).
+
+## Spatial mode in a nutshell
+
+Most algorithms support `--mode spatial`, which integrates the result over several
+radii instead of just adjacent pixels. Pass `--radii` / `--weights` yourself, or omit
+them and FujiShaderGPU picks sensible defaults from the detected pixel size. (Requested
+on a very small raster, it falls back to `local` mode with a warning.)
+
+## Good to know
+
+- **Geographic (lat/lon) DEMs** are supported in approximation mode (center-latitude
+  meter conversion). Reproject for best accuracy on wide-area / high-latitude data.
+- **Windows + cloud drives:** reading/writing directly on an rclone/FUSE mount
+  (e.g. Cloudflare R2) is supported, though a local disk is faster for large writes.
+- The output is **QGIS-optimized** (512×512 blocks, multi-level overviews, ZSTD).
+
+## Development
 
 ```bash
 pip install -e ".[dev]"
-```
-
-## Run
-
-Entry point:
-
-```bash
-python -m FujiShaderGPU --help
-```
-
-Installed script:
-
-```bash
-fujishadergpu --help
-```
-
-## Preprocessing (recommended first step)
-
-The main pipeline assumes an **overview-bearing COG** input. Convert arbitrary
-rasters (and optionally fill NoData voids) once, up front, with the preprocessing
-command:
-
-```bash
-python -m FujiShaderGPU.prepare input.(tif|img|vrt|...) output_cog.tif
-# console script: fujishadergpu-prepare input.tif output_cog.tif
-```
-
-Output is a single-band float32 COG (ZSTD + internal overviews), pipeline-compatible.
-CRS / pixel grid are preserved (no reprojection); band 1 is used.
-
-NoData fill modes (`--fill-mode`):
-
-- `none` — no filling; NoData preserved.
-- `enclosed` *(default)* — fill only interior voids; border-connected NoData
-  (ocean / dataset exterior) is kept.
-- `all` — fill every NoData cell (including exterior) and remove NoData entirely
-  (dense output; useful for 3D model generation).
-
-Filling is done on a coarse overview grid and upsampled (low-frequency), so the
-cost is nearly independent of the full raster size and streams within bounded
-memory. When the pipeline is given an input without overviews it still runs but
-warns and points to this command (decimated reads fall back to slow full-res reads).
-
-NoData handling (`--nodata`, **default `auto`**; every NoData cell → float NaN
-**before** filling so finite sentinels behave like a declared NoData):
-
-`--nodata auto` infers NoData in priority order, taking the union of what it finds:
-
-1. the raster's **declared** NoData (`src.nodata`) — always honored via masked I/O;
-2. an undeclared **sentinel / extreme dominating the whole grid** — the most common
-   finite value, when it covers ≥ `--nodata-sentinel-fraction` (default `0.05`) of the
-   grid **and** is a known fill (`0`, `-9999`, int8/16/32 min/max, float32 extremes) or
-   the data-range extreme. This catches a float DEM padded with `0` (or `-9999`) whose
-   tag was lost in conversion, **even when the fill is spread through the interior**
-   (the border rule alone misses that);
-3. an undeclared value **dominating the border** (≥ `--nodata-border-fraction`,
-   default `0.5` of the outer ring) — a lost sea / dataset-exterior frame;
-4. otherwise **no NoData**.
-
-Other `--nodata` values:
-
-- a number (`-9999`, `0`, …) **forces** that value as NoData (no inference);
-- `none` (or `--no-detect-nodata`) disables inference (treat all values as valid);
-- `nan` marks NaN as NoData.
-
-```bash
-# Auto-detect (default): a lost 0 / -9999 fill is found and masked
-python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --fill-mode none --force
-# Force a specific sentinel instead of inferring it
-python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --nodata -9999 --force
-```
-
-Why it matters: an undeclared sentinel left as data is read as flat terrain — it
-**skews every algorithm's normalization range** and large-radius operators render a
-halo at the data edge. The **main pipeline** also accepts `--nodata VALUE` (both
-backends): replaced with NaN at load time, before any algorithm runs.
-
-```bash
-python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --fill-mode enclosed --force
-fujishadergpu kyoto_cog.tif kyoto_rvi.tif --algorithm rvi --radii 4,32,256,2048
-```
-
-## Input / Output
-
-- Input:
-  - COG (`.tif`, `.tiff`) on all paths — overview-bearing COG expected (see Preprocessing)
-  - Zarr (`.zarr`) on Dask path
-- Output:
-  - COG by default
-  - Zarr when output path ends with `.zarr` (Dask path)
-
-## Output data type (compact integer COGs)
-
-By default every algorithm is computed and written as **float32** (NoData = NaN).
-For delivery you can quantize the result to a compact integer COG — useful for
-faster COG builds (less disk I/O), smaller object-storage transfers, and lighter
-QGIS reads:
-
-```bash
-# 1/4-size uint8 COG for visualization
-fujishadergpu in.tif out_rvi.tif --algorithm rvi --output-dtype uint8
-
-# 1/2-size int16 (more tonal levels), explicit range
-fujishadergpu in.tif out_slope.tif --algorithm slope --output-dtype int16 --output-range 0,90
-```
-
-- `--output-dtype {float32,int16,uint8}` (default `float32`, unchanged behavior).
-- **NoData = 0** for both integer types; valid data is stretched to fill the
-  remaining codes for maximum tonal resolution. Normalized algorithms (RVI,
-  fractal_anomaly, visual_saliency, scale_space_surprise, multiscale_terrain, and
-  the data-driven `ambient_occlusion` / `openness` stretch) map their robust **p99**
-  value to display magnitude `1` via a **full-resolution stratified pre-pass**
-  (`algorithms/_norm_stats.py::_compute_norm_stats_tiled`, shared by both backends),
-  so float32 lands in `-1..1` (signed) / `0..1` (unsigned); physical maps keep their
-  native range (slope `0..90`, hillshade `0..1`). int16/uint8 reserve a little
-  headroom (value `±1` → ~85% of the code range) so the unclipped tail is preserved.
-  Override with `--output-range lo,hi`.
-- Signed outputs (RVI / fractal_anomaly): `int16` uses the full symmetric
-  `[-32767, +32767]` (DN 0 = value ~0 = flat ground, doubling as NoData — visually
-  negligible); `uint8` centers value 0 at `128`.
-- GDAL `scale`/`offset` are recorded so the physical value is recoverable
-  (`value = scale·DN + offset`); QGIS shows scaled values and treats `0` as nodata.
-- Compute stays float32 on the GPU — only the final encoding changes — so the math
-  and its accuracy are identical to the float32 output. Available on both backends.
-
-## Algorithms (Dask Registry)
-
-Current Dask algorithms:
-
-- `rvi`
-- `hillshade`
-- `slope`
-- `specular`
-- `atmospheric_scattering`
-- `multiscale_terrain`
-- `blur`
-- `curvature`
-- `visual_saliency`
-- `npr_edges`
-- `ambient_occlusion`
-- `openness`
-- `fractal_anomaly`
-- `scale_space_surprise`
-- `multi_light_uncertainty`
-
-Windows/macOS tile path uses the same canonical algorithm names as Dask:
-
-- `rvi`
-- `hillshade`
-- `slope`
-- `specular`
-- `atmospheric_scattering`
-- `multiscale_terrain`
-- `blur`
-- `curvature`
-- `visual_saliency`
-- `npr_edges`
-- `ambient_occlusion`
-- `openness`
-- `fractal_anomaly`
-- `scale_space_surprise`
-- `multi_light_uncertainty`
-
-The tile backend shares the Dask algorithm code via `algorithms/tile/dask_bridge.py`:
-in `local` mode it uses fast tile-native direct paths, and in `spatial` mode every
-algorithm except RVI runs the Dask algorithm on the single tile (RVI keeps a bespoke
-direct path). With the shared overview field and normalization stats, the integer
-outputs are pixel-identical to the Dask-CUDA backend.
-
-Current list can always be checked with:
-
-```bash
-python -m FujiShaderGPU --help
-```
-
-## Examples
-
-Default run:
-
-```bash
-fujishadergpu input.tif output.tif
-```
-
-Run hillshade:
-
-```bash
-fujishadergpu input.tif output.tif --algorithm hillshade
-```
-
-Run spatial-mode hillshade with common radii/weights parameters:
-
-```bash
-fujishadergpu input.tif output.tif --algorithm hillshade --mode spatial --radii 2,4,8,16 --weights 0.4,0.3,0.2,0.1
-```
-
-Run spatial-mode slope (radius-integrated):
-
-```bash
-fujishadergpu input.tif output.tif --algorithm slope --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
-```
-
-Run spatial-mode curvature (radius-integrated):
-
-```bash
-fujishadergpu input.tif output.tif --algorithm curvature --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
-```
-
-Run spatial-mode npr_edges (outlines at multiple smoothing scales):
-
-```bash
-fujishadergpu input.tif output.tif --algorithm npr_edges --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
-```
-
-Dask/Tile path RVI with explicit radii:
-
-```bash
-fujishadergpu input.tif output.tif --algorithm rvi --radii 4,16,64 --weights 0.5,0.3,0.2
-```
-
-Compact integer output (uint8, ~1/4 size) for visualization:
-
-```bash
-fujishadergpu input.tif output.tif --algorithm rvi --output-dtype uint8
-```
-
-int16 output with an explicit quantization range:
-
-```bash
-fujishadergpu input.tif output.tif --algorithm slope --output-dtype int16 --output-range 0,90
-```
-
-Declare a lost NoData sentinel at load time (both backends):
-
-```bash
-fujishadergpu input.tif output.tif --algorithm rvi --nodata -9999
-```
-
-RVI radii behavior:
-
-- `--radii` is interpreted in pixels.
-- `--weights` is optional; if omitted, uniform weighting is used.
-- If `--radii` is omitted, RVI auto-derives radii from terrain characteristics.
-
-Spatial mode auto-preset behavior (all spatial-enabled algorithms):
-
-- If `--mode spatial` and `--radii` is omitted, radii/weights are loaded from `FujiShaderGPU/config/spatial_presets.yaml`.
-- Preset selection is based on detected pixel size (meters), for both projected and geographic DEMs.
-- If user supplies `--radii`, that explicit value has priority.
-- If user supplies `--weights`, it is used only when length matches `--radii`; otherwise fallback weighting is used.
-- Safety fallback: when `--mode spatial` is requested with no explicit `--radii/--weights` and input DEM has any side `<= 1024 px`, processing falls back to `--mode local` with a warning.
-
-Dask path with Zarr output:
-
-```bash
-fujishadergpu input.tif output.zarr --algorithm scale_space_surprise
-```
-
-## Development Checks
-
-```bash
 python -m compileall FujiShaderGPU tests
 ruff check FujiShaderGPU tests
 pytest -q -o addopts='' tests
-python -m pip check
 ```
 
-## Repository Structure (Summary)
-
-- `FujiShaderGPU/prepare.py` (preprocessing CLI: any raster -> pipeline-ready COG)
-- `FujiShaderGPU/algorithms/`
-  - `dask_registry.py`
-  - `dask_shared.py` (re-export hub)
-  - `_base.py`, `_nan_utils.py`, `_global_stats.py`, `_normalization.py` (shared utilities)
-  - `_impl_*.py` (per-algorithm implementation modules)
-  - `tile_shared.py`
-  - `common/kernels.py`
-  - `common/auto_params.py`
-  - `dask/*.py`
-  - `tile/*.py`
-- `FujiShaderGPU/core/`
-  - `dask_processor.py`
-  - `dask_cluster.py`
-  - `dask_io.py`
-  - `tile_processor.py`
-  - `tile_io.py`
-  - `tile_compute.py`
-- `FujiShaderGPU/io/`
-  - `dem_preprocess.py` (preprocessing core: COG-ification + overview-based NoData fill + undeclared-NoData detection)
-  - `output_encoding.py` (output dtype quantization: float32/int16/uint8 ranges, scale/offset, NoData policy)
-  - `cog_builder.py`, `cog_validator.py`, `raster_info.py`
-
-## Notes
-
-- Old monolithic algorithm compatibility layers were removed.
-- Legacy algorithm aliases (`rvi_gaussian`, `composite_terrain`) were removed.
-- The modular `algorithms/dask/*.py` and `algorithms/tile/*.py` layout is canonical.
-- **Tile backend matches the Dask backend.** Every spatial-mode algorithm on the
-  tile path takes its large radii from one shared, seam-free overview field and uses
-  the same full-resolution normalization stats as Dask, so the integer outputs are
-  pixel-identical to the Dask-CUDA backend (verified on Windows). See `ARCHITECTURE.md`
-  §13.6 / §14.
-- **Windows + virtual filesystems (rclone/FUSE mounts, e.g. Cloudflare R2).** Output
-  and temp paths may live on a FUSE mount where Win32 `GetFinalPathNameByHandle`
-  (`Path.resolve()`) raises `WinError 1005` and a just-closed GDAL handle delays
-  `unlink` (`WinError 32`). `utils/paths.py` (`safe_abspath`, `safe_unlink`) handles
-  both, so reading and writing directly on such a mount works. Large COG writes are
-  still faster on a local disk — stage there and upload — but it is not required.
-- Geographic CRS DEM input is supported in approximation mode:
-  - center-latitude based meter conversion computes anisotropic `dx/dy` scales
-  - these scales are injected into algorithms via `pixel_scale_x/pixel_scale_y`
-  - this is a practical approximation for simple use; wide-area/high-latitude data may need reprojection for best accuracy
-- Spatial auto presets are centralized in `FujiShaderGPU/config/spatial_presets.yaml`:
-  - pixel-size bins: `<5`, `5~25`, `25~50`, `50~250`, `250~1250`, `1250~5000`, `>5000` (meters)
-  - each bin defines default `radii` and `weights`
-- Local/spatial mode is unified across these algorithms:
-  - `hillshade`
-  - `slope`
-  - `specular`
-  - `atmospheric_scattering`
-  - `curvature`
-  - `ambient_occlusion`
-  - `openness`
-  - `multi_light_uncertainty`
-  - `npr_edges`
-  - `--mode local` (adjacent-pixel computation)
-  - `--mode spatial --radii ... --weights ...` (multi-radius spatial integration)
+Architecture, design rationale, and per-feature specifications live in
+**[ARCHITECTURE.md](ARCHITECTURE.md)**.
