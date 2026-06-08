@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "FujiShaderGPU"
-version = "0.2.6"
+version = "1.0.0"
 description = "Lightning fast terrain shader for a big Cloud Optimized GeoTIFF"
 readme = "README.md"
 license = {text = "MIT"}
@@ -19,26 +19,27 @@ keywords = [
     "shader", "renderer", "geospatial", "COG", "QGIS"
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: GIS",
     "Topic :: Scientific/Engineering :: Visualization",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
     "Environment :: GPU :: NVIDIA CUDA",
 ]
-requires-python = ">=3.8"
+# cupy-cuda12x 13.x needs >=3.9; the Linux RAPIDS extra (rmm/cudf-cu12 25.6) needs
+# >=3.10, so 3.10 is the project-wide floor.
+requires-python = ">=3.10"
 
 dependencies = [
     "numpy>=1.21.0",
     "PyYAML>=6.0.0",
-    "cupy-cuda12x>=13.4.0",  # or cupy-cuda12x for CUDA 12
+    "cupy-cuda12x>=13.4.0",  # CUDA 12.x build; use cupy-cuda11x instead for CUDA 11
     "rasterio>=1.3.0",
     "psutil>=5.8.0",
     "tqdm",
@@ -76,6 +77,8 @@ full = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "ruff>=0.4.0",
+    "vulture>=2.7",
     "black>=23.0.0",
     "flake8>=6.0.0",
     "mypy>=1.0.0",
@@ -107,9 +110,13 @@ fujishadergpu-prepare = "FujiShaderGPU.prepare:main"
 [tool.setuptools.package-data]
 FujiShaderGPU = ["*.json", "*.yaml", "*.yml", "**/*.yaml", "**/*.yml", "**/*.json"]
 
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
 [tool.black]
 line-length = 120
-target-version = ['py38', 'py39', 'py310', 'py311']
+target-version = ['py310', 'py311', 'py312', 'py313']
 include = '\.pyi?$'
 extend-exclude = '''
 /(
@@ -135,7 +142,7 @@ known_third_party = ["numpy", "cupy", "cupyx", "rasterio", "osgeo", "scipy", "ps
 known_first_party = ["FujiShaderGPU"]
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
