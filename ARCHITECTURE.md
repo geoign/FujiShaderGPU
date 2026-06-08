@@ -66,7 +66,7 @@ slow full-resolution reads).
   - `_impl_multiscale_terrain.py` — Multiscale Terrain
   - `_impl_blur.py` — Blur (raw Gaussian-smoothed elevation)
   - `_impl_curvature.py` — Curvature
-  - `_impl_visual_saliency.py` — Visual Saliency
+  - `_impl_visual_saliency.py` — Visual Saliency (Itti–Koch–Niebur 1998-style, simplified for single-band terrain: DoG center-surround + gradient-orientation; no N(·) operator / Gabor / colour / attention dynamics)
   - `_impl_npr_edges.py` — NPR Edges
   - `_impl_ambient_occlusion.py` — Ambient Occlusion (stylized SSAO heuristic, not a physically based hemisphere integral / sky-view factor)
   - `_impl_openness.py` — Topographic Openness (Yokoyama et al. 2002; directional mean of per-azimuth horizon angles, positive/negative)

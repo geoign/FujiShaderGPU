@@ -81,11 +81,33 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
                                  pixel_size=1.0, pixel_scale_x=None,
                                  pixel_scale_y=None, normalize=True,
                                  norm_min=None, norm_scale=None, weights=None):
-    """Itti-style saliency (intensity + orientation conspicuity) for DEM.
+    """Itti-style saliency, simplified and adapted for single-band terrain (DEM).
+
+    This is an approximation of the Itti-Koch-Niebur (1998) saliency model,
+    deliberately reduced to fit single-channel elevation data and the seam-free
+    tiled/streaming backend.  It keeps the model's skeleton -- multiscale
+    center-surround + orientation conspicuity, then a combined map -- but is NOT
+    the original algorithm.  Differences from Itti et al. (1998):
+
+    * Channels: elevation is used directly as the intensity channel; there is no
+      colour channel (RG/BY) because the input is single-band.
+    * Center-surround (intensity): difference-of-Gaussians ``|G(sigma_c)-G(sigma_s)|``
+      across the conspicuity scales (a standard DoG approximation of the original
+      across-pyramid-level subtraction).
+    * Orientation: a gradient-orientation response ``mag * max(cos(2*(theta-o)), 0)``
+      at four orientations (0/45/90/135deg) -- NOT Gabor filters, and with no
+      center-surround on the orientation channel.
+    * Normalization: the model's defining map-normalization operator N(.) (which
+      promotes maps with a few strong peaks via ``(M - mean_local_maxima)^2``) is
+      omitted because it is global/iterative and would seam across tiles.  It is
+      replaced by a tile-stable ``log1p`` feature compression plus one global
+      percentile scale (``visual_saliency_stat_func``) for display.
+    * Winner-take-all / inhibition-of-return (attention scan-path dynamics) are
+      not implemented -- only the saliency map itself is produced.
 
     The unified ``--weights`` (length-matching the conspicuity scales) weights
     each scale's contribution to the intensity and orientation conspicuity means;
-    absent/mismatched weights keep the original equal averaging.
+    absent/mismatched weights keep equal averaging.
     """
     if radii:  # unified --radii feeds the conspicuity scales
         scales = [float(r) for r in radii]
@@ -219,7 +241,13 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
 
 
 class VisualSaliencyAlgorithm(DaskAlgorithm):
-    """Visual saliency based on Itti-style conspicuity maps."""
+    """Visual saliency from Itti-style conspicuity maps, simplified for terrain.
+
+    A terrain-adapted approximation of Itti-Koch-Niebur (1998): multiscale
+    center-surround (intensity) + gradient-orientation conspicuity, combined and
+    percentile-normalized for display.  It omits the model's N(.) normalization
+    operator, Gabor orientation, colour channel, and attention dynamics -- see
+    ``compute_visual_saliency_block`` for the full list of simplifications."""
     def process(self, gpu_arr, **params):
         radii = params.get('radii')
         scales = [float(r) for r in radii] if radii else params.get('scales', [2, 4, 8, 16])
