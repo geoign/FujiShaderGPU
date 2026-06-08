@@ -77,25 +77,39 @@ cost is nearly independent of the full raster size and streams within bounded
 memory. When the pipeline is given an input without overviews it still runs but
 warns and points to this command (decimated reads fall back to slow full-res reads).
 
-NoData detection / override (all converted to float NaN **before** filling):
+NoData handling (`--nodata`, **default `auto`**; every NoData cell → float NaN
+**before** filling so finite sentinels behave like a declared NoData):
 
-- The raster's **declared** NoData is always honored (masked I/O).
-- `--nodata VALUE` — treat an explicit sentinel as NoData even when the raster
-  declares none (or declares a different value). Accepts `-9999`, `0`, `nan`, …
-- **Undeclared NoData auto-detection is ON by default**: a dominant constant
-  border (a NoData frame whose tag was lost in conversion) is detected and
-  converted to NaN, preventing it from being treated as real terrain (which would
-  otherwise produce a halo around the data edge). Disable with `--no-detect-nodata`;
-  tune sensitivity with `--nodata-border-fraction` (default `0.5` = the value must
-  occupy ≥ 50% of the raster's outer ring).
+`--nodata auto` infers NoData in priority order, taking the union of what it finds:
+
+1. the raster's **declared** NoData (`src.nodata`) — always honored via masked I/O;
+2. an undeclared **sentinel / extreme dominating the whole grid** — the most common
+   finite value, when it covers ≥ `--nodata-sentinel-fraction` (default `0.05`) of the
+   grid **and** is a known fill (`0`, `-9999`, int8/16/32 min/max, float32 extremes) or
+   the data-range extreme. This catches a float DEM padded with `0` (or `-9999`) whose
+   tag was lost in conversion, **even when the fill is spread through the interior**
+   (the border rule alone misses that);
+3. an undeclared value **dominating the border** (≥ `--nodata-border-fraction`,
+   default `0.5` of the outer ring) — a lost sea / dataset-exterior frame;
+4. otherwise **no NoData**.
+
+Other `--nodata` values:
+
+- a number (`-9999`, `0`, …) **forces** that value as NoData (no inference);
+- `none` (or `--no-detect-nodata`) disables inference (treat all values as valid);
+- `nan` marks NaN as NoData.
 
 ```bash
-# Explicitly declare a lost -9999 sentinel while building the COG
+# Auto-detect (default): a lost 0 / -9999 fill is found and masked
+python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --fill-mode none --force
+# Force a specific sentinel instead of inferring it
 python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --nodata -9999 --force
 ```
 
-The **main pipeline** also accepts `--nodata VALUE` (both backends): the value is
-replaced with NaN at load time, before any algorithm runs.
+Why it matters: an undeclared sentinel left as data is read as flat terrain — it
+**skews every algorithm's normalization range** and large-radius operators render a
+halo at the data edge. The **main pipeline** also accepts `--nodata VALUE` (both
+backends): replaced with NaN at load time, before any algorithm runs.
 
 ```bash
 python -m FujiShaderGPU.prepare raw_dem.tif kyoto_cog.tif --fill-mode enclosed --force
@@ -129,12 +143,14 @@ fujishadergpu in.tif out_slope.tif --algorithm slope --output-dtype int16 --outp
 - `--output-dtype {float32,int16,uint8}` (default `float32`, unchanged behavior).
 - **NoData = 0** for both integer types; valid data is stretched to fill the
   remaining codes for maximum tonal resolution. Normalized algorithms (RVI,
-  fractal_anomaly, visual_saliency, scale_space_surprise, multiscale_terrain) map
-  their robust **p99** value to display magnitude `1` via an overview pre-pass, so
-  float32 lands in `-1..1` (signed) / `0..1` (unsigned); physical maps keep their
-  native range (slope `0..90`, hillshade/AO/openness `0..1`). int16/uint8 reserve
-  a little headroom (value `±1` → ~85% of the code range) so the unclipped tail is
-  preserved. Override with `--output-range lo,hi`.
+  fractal_anomaly, visual_saliency, scale_space_surprise, multiscale_terrain, and
+  the data-driven `ambient_occlusion` / `openness` stretch) map their robust **p99**
+  value to display magnitude `1` via a **full-resolution stratified pre-pass**
+  (`algorithms/_norm_stats.py::_compute_norm_stats_tiled`, shared by both backends),
+  so float32 lands in `-1..1` (signed) / `0..1` (unsigned); physical maps keep their
+  native range (slope `0..90`, hillshade `0..1`). int16/uint8 reserve a little
+  headroom (value `±1` → ~85% of the code range) so the unclipped tail is preserved.
+  Override with `--output-range lo,hi`.
 - Signed outputs (RVI / fractal_anomaly): `int16` uses the full symmetric
   `[-32767, +32767]` (DN 0 = value ~0 = flat ground, doubling as NoData — visually
   negligible); `uint8` centers value 0 at `128`.
@@ -179,7 +195,11 @@ Windows/macOS tile path uses the same canonical algorithm names as Dask:
 - `scale_space_surprise`
 - `multi_light_uncertainty`
 
-The tile backend calls tile-native modules where available and uses a Dask-shared bridge for the remaining algorithms.
+The tile backend shares the Dask algorithm code via `algorithms/tile/dask_bridge.py`:
+in `local` mode it uses fast tile-native direct paths, and in `spatial` mode every
+algorithm except RVI runs the Dask algorithm on the single tile (RVI keeps a bespoke
+direct path). With the shared overview field and normalization stats, the integer
+outputs are pixel-identical to the Dask-CUDA backend.
 
 Current list can always be checked with:
 
@@ -308,6 +328,17 @@ python -m pip check
 - Old monolithic algorithm compatibility layers were removed.
 - Legacy algorithm aliases (`rvi_gaussian`, `composite_terrain`) were removed.
 - The modular `algorithms/dask/*.py` and `algorithms/tile/*.py` layout is canonical.
+- **Tile backend matches the Dask backend.** Every spatial-mode algorithm on the
+  tile path takes its large radii from one shared, seam-free overview field and uses
+  the same full-resolution normalization stats as Dask, so the integer outputs are
+  pixel-identical to the Dask-CUDA backend (verified on Windows). See `ARCHITECTURE.md`
+  §13.6 / §14.
+- **Windows + virtual filesystems (rclone/FUSE mounts, e.g. Cloudflare R2).** Output
+  and temp paths may live on a FUSE mount where Win32 `GetFinalPathNameByHandle`
+  (`Path.resolve()`) raises `WinError 1005` and a just-closed GDAL handle delays
+  `unlink` (`WinError 32`). `utils/paths.py` (`safe_abspath`, `safe_unlink`) handles
+  both, so reading and writing directly on such a mount works. Large COG writes are
+  still faster on a local disk — stage there and upload — but it is not required.
 - Geographic CRS DEM input is supported in approximation mode:
   - center-latitude based meter conversion computes anisotropic `dx/dy` scales
   - these scales are injected into algorithms via `pixel_scale_x/pixel_scale_y`

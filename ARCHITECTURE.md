@@ -43,9 +43,20 @@ slow full-resolution reads).
   - Used by both Dask (`dask/*.py`) and Tile (`tile/*.py` via bridge) backends.
 - **Phase 1 shared-foundation modules**:
   - `_base.py` — `Constants`, `DaskAlgorithm` ABC, `classify_resolution`
-  - `_nan_utils.py` — NaN handling, spatial smoothing, down/up-sampling, `restore_nan`
-  - `_global_stats.py` — `determine_optimal_downsample_factor`, `compute_global_stats`, `apply_global_normalization`
-  - `_normalization.py` — per-algorithm stats/normalization functions (`rvi_stat_func`, `npr_stat_func`, etc.)
+  - `_nan_utils.py` — NaN handling, spatial smoothing, down/up-sampling, `restore_nan`,
+    and the shared **overview large-radius helpers** (`read_overview_coarse_dem`,
+    `coarse_large_radius_response`, `multiscale_response_fields`,
+    `hybrid_multiscale_response_combine`, `compute_overview_scale_fields`). These are
+    **tile-origin aware**: the optional `tile_origin` / `tile_full_shape` arguments let
+    the same code sample one global overview field correctly from a single tile
+    (default `None` = the Dask whole-raster behavior), which is what makes the tile
+    backend seam-free and identical to Dask.
+  - `_global_stats.py` — `determine_optimal_downsample_factor`, `compute_global_stats`, `apply_global_normalization`, `apply_display_stretch_dask`
+  - `_normalization.py` — per-algorithm stats/normalization functions (`rvi_stat_func`, `robust_unsigned_stretch_stat_func`, etc.)
+  - `_norm_stats.py` — **backend-neutral** full-resolution normalization statistics:
+    `_NORM_STAT_SPECS` (algorithm → raw block + stat function) and
+    `_compute_norm_stats_tiled` (robust display stat pooled over stratified
+    **full-resolution** tiles). Used by both backends so integer outputs match.
 - **Phase 2–3 algorithm implementation modules** (`_impl_*.py`):
   - `_impl_rvi.py` — RVI (Ridge-Valley Index)
   - `_impl_hillshade.py` — Hillshade
@@ -60,6 +71,12 @@ slow full-resolution reads).
   - `_impl_openness.py` — Openness
   - `_impl_fractal_anomaly.py` — Fractal Anomaly
   - `_impl_experimental.py` — Scale-Space Surprise + Multi-Light Uncertainty
+  - Some `_impl_*` modules also host **backend-neutral global-stat helpers** that
+    both pipelines import (so they are not duplicated, and the Windows tile path does
+    not import the Dask-only `core/dask_processor.py`): `_compute_npr_grad_stats`
+    (`_impl_npr_edges.py`, global per-radius edge threshold) and
+    `_compute_fractal_relief_stats` (`_impl_fractal_anomaly.py`, global roughness
+    p10/p75). `core/dask_processor.py` imports both from here.
 - `tile_shared.py`
   - Tile-side base class (`TileAlgorithm`) and lightweight algorithms that delegate directly to shared kernels.
   - Contains only: `TileAlgorithm`, `ScaleSpaceSurpriseAlgorithm`, `MultiLightUncertaintyAlgorithm`.
@@ -138,6 +155,11 @@ slow full-resolution reads).
 - `config/gpu_config_manager.py`, `config/system_config.py`, `config/gdal_config.py`
 - `config/gpu_presets.yaml` — reference anchor values (no longer primary; `auto_tune.py` is authoritative)
 - `utils/scale_analysis.py`, `utils/nodata_handler.py`, `utils/types.py`
+- `utils/paths.py` — filesystem path helpers shared across backends. `resolve_tmp_dir`
+  (env-driven staging dir), and the **virtual-filesystem-safe** `safe_abspath` /
+  `safe_unlink` used when output/temp paths live on a FUSE mount (rclone / cloud
+  drive) where `Path.resolve()` raises `WinError 1005` and a just-closed GDAL handle
+  delays `unlink` (`WinError 32`). See §6.
 
 ## 4. Dask Algorithm Catalog
 
@@ -194,6 +216,16 @@ Otherwise output is written through COG flow.
 - Canonical algorithm names are synchronized with Dask registry names.
 - For algorithms not reimplemented natively in tile code, `algorithms/tile/dask_bridge.py` delegates to Dask shared algorithm classes.
 - Optimized for local tile-based processing.
+- **Output parity with Dask.** In `spatial` mode the bridge routes every algorithm
+  except RVI through the Dask algorithm on the single tile (RVI keeps a bespoke
+  direct path; `local` mode keeps the fast direct paths). Combined with the unified
+  overview large-radius field (§13.6) and shared full-resolution normalization stats
+  (§14), the integer outputs are pixel-identical to the Dask-CUDA backend.
+- **Virtual filesystem (rclone/FUSE) safety.** Reading or writing on a cloud-mounted
+  drive (e.g. Cloudflare R2 via an rclone FUSE mount) is supported: `utils/paths.py`'s
+  `safe_abspath` avoids `Path.resolve()` (which raises `WinError 1005` on such mounts)
+  and `safe_unlink` retries the temp-file delete that a just-closed GDAL handle blocks
+  (`WinError 32`). Both are no-ops on a normal disk.
 
 ## 7. Design Principles
 
@@ -399,26 +431,36 @@ python -m FujiShaderGPU.prepare input.tif out.tif --fill-mode all --force
 - NoData policy: `none`/`enclosed` emit NaN-nodata; `all` emits a dense raster
   with no NoData.
 
-### 13.3 NoData detection / override (`--nodata`, `--no-detect-nodata`)
+### 13.3 NoData detection / override (`--nodata`, default `auto`)
 
 Before filling, every NoData cell is normalized to float **NaN** so finite
-sentinels are handled identically to declared NoData. Sources of NoData:
+sentinels are handled identically to declared NoData. `--nodata auto` (the default)
+infers NoData with this rule chain, taking the **union** of what it finds (all on a
+NEAREST-resampled coarse grid so the exact sentinel survives; already-declared or
+already-found values are not re-reported):
 
 1. **Declared** NoData (`src.nodata`) — always honored via masked I/O.
-2. **Explicit override** `--nodata VALUE` (`-9999`, `0`, `nan`, …) — treated as
-   NoData even when the raster declares none or a different value.
-3. **Auto-detected undeclared NoData (default ON)** — `io/dem_preprocess.py::
-   _detect_border_nodata` scans a NEAREST-resampled coarse grid: when a single
-   finite value dominates the outer ring (≥ `--nodata-border-fraction`, default
-   `0.5`) and covers a non-trivial share of the grid, it is treated as a lost
-   NoData frame (sea / dataset exterior whose tag was dropped in conversion).
-   Disable with `--no-detect-nodata`. Already-declared values are not re-reported.
+2. **Undeclared sentinel / extreme dominating the whole grid** —
+   `io/dem_preprocess.py::_detect_sentinel_nodata`: the most common finite value,
+   when it covers ≥ `--nodata-sentinel-fraction` (default `0.05`) of the grid **and**
+   is a known fill (`0`, `-9999`, int8/16/32 min/max, float32 extremes, `_NODATA_SENTINELS`)
+   or the data-range extreme. Catches a float DEM padded with `0`/`-9999` whose tag
+   was lost in conversion, **including when the fill is spread through the interior**
+   (which rule 3 alone misses).
+3. **Undeclared value dominating the border** — `_detect_border_nodata`: a single
+   value occupying ≥ `--nodata-border-fraction` (default `0.5`) of the outer ring and
+   a non-trivial share of the grid — a lost sea / dataset-exterior frame.
+4. **Otherwise no NoData.**
 
-Rationale: an undeclared constant frame, if left as data, is read as a flat
-plateau adjacent to real terrain; large-radius / multiscale operators then render
-a halo along the data edge. Converting it to NaN lets the NaN-aware kernels exclude
-it. The main pipeline mirrors source (2) via its own `--nodata` (both backends),
-applied at load time before any algorithm runs.
+Other `--nodata` values: a number **forces** that value (no inference); `none` (or
+`--no-detect-nodata`) disables inference; `nan` marks NaN.
+
+Rationale: an undeclared sentinel left as data is read as flat terrain — it skews
+every algorithm's normalization range (the stat pre-pass §14 pools it as a huge spike
+at one value) and large-radius / multiscale operators render a halo along the data
+edge. Converting it to NaN lets the NaN-aware kernels exclude it. The main pipeline
+mirrors an **explicit** `--nodata VALUE` (both backends) at load time before any
+algorithm runs.
 
 ### 13.4 NoData Fill Modes (`--fill-mode`)
 
@@ -444,39 +486,49 @@ coarse grid and is upsampled — cost is nearly independent of full raster size:
 Implementation streams windowed reads/writes (bounded memory) so very large
 rasters (hundreds of GB) are handled without loading the full array.
 
-### 13.6 Large-radius-from-overview (RVI)
+### 13.6 Unified large-radius-from-overview (all spatial algorithms, both backends)
 
-Because the input is an overview-bearing COG, large-radius low-frequency terms
-can be taken from the stored overview instead of reading a huge per-chunk/per-tile
-halo at full resolution.  For RVI (`Σ wᵢ(block − meanᵢ)`):
+Because the input is an overview-bearing COG, large-radius low-frequency terms are
+taken from the stored overview instead of reading a huge per-chunk/per-tile halo at
+full resolution. **Every spatial-mode algorithm uses this**, so each tile/chunk only
+reads a halo for the *small* radii — large radii come from one global overview field,
+which is both far cheaper and **seam-free**.
 
-- Radii are split at `max(256, chunk_or_tile // 16)`.
-- **Small radii** are computed at full resolution with a small halo (as before).
-- **Large radii** contribute as `W_large·block − upsample(Σ wᵢ·meanᵢ_overview)`,
-  where the coarse mean field is computed once from the overview (decimated read).
-  The per-block part is `W_large·block` (no halo); the field is sampled at global
-  pixel coords (offset 0 for Dask chunks, tile-window origin for tiles), so the
-  result is seam-free across both backends.
+Orchestration (mirrored in `core/dask_processor.py` and `core/tile_processor.py`):
 
-This cuts the per-chunk/per-tile halo from `max_radius` to `max(small_radii)`
-(e.g. 2064→272 px for radii up to 2048), roughly halving I/O for large radii.
-RVI reads the stored overview directly (biggest saving); any failure falls back
+- Read **one** decimated overview of the DEM once (`_nan_utils.read_overview_coarse_dem`)
+  and inject it as `_overview_coarse_dem` / `_overview_decimation`.
+- **Hybrid algorithms** (`fractal_anomaly`, `visual_saliency`, `scale_space_surprise`)
+  additionally precompute per-large-scale response fields from that overview
+  (`compute_overview_scale_fields`) → `_<algo>_large_fields`. The algorithm computes
+  the small scales at full resolution and samples the large fields with no halo inside
+  one depth-0 combine (`hybrid_multiscale_response_combine`).
+- The **spatial-switch algorithms** (`hillshade`, `slope`, `specular`,
+  `atmospheric_scattering`, `curvature`, `ambient_occlusion`, `openness`,
+  `multi_light_uncertainty`, `npr_edges`, `multiscale_terrain`) use
+  `multiscale_response_fields` / `coarse_large_radius_response`: each large radius runs
+  the per-radius block on the overview and is bilinearly upsampled; small radii keep
+  the exact full-resolution path.
+- **RVI** keeps a bespoke split (`Σ wᵢ(block − meanᵢ)`: large radii =
+  `W_large·block − upsample(Σ wᵢ·meanᵢ_overview)`), the biggest single saving.
+- Per-algorithm global stats that would otherwise vary per block (npr edge threshold,
+  fractal relief p10/p75) are injected globally (§3.1) so the small-radius part is also
+  consistent across tiles.
+
+Tile-origin awareness is the key to backend parity: the coarse field is sampled at
+**global** pixel coordinates. On Dask the chunk's `array-location` is already global;
+on the tile backend the dask array is a single tile, so `core/tile_processor.py` injects
+that tile's window origin as `_tile_origin` (+ global `_tile_full_shape`), which the
+shared helpers add to the block coordinates (`tile_origin` / `tile_full_shape` args,
+§3.1). The split is sized so the halo covers only the small radii — e.g.
+`fractal_anomaly` with radii up to 1024 drops from a 2080 px halo (a 5184 px effective
+tile, throttled to one worker, ~hours on a 19469×15478 raster) to a 160 px halo (1344 px
+tile, full worker count, minutes).
+
+Enabled for **projected DEMs only** (geographic DEMs use decimation-dependent local
+latitude scaling that a single global field cannot match — those fall back to the
+full-resolution per-tile path). Any failure to read/build the overview falls back
 transparently to the full-resolution radii path.
-
-The **spatial-mode algorithms** (hillshade, slope, specular, atmospheric_scattering,
-curvature, ambient_occlusion, openness, multi_light_uncertainty) apply the same
-idea via `_nan_utils.coarse_large_radius_response`: for radii above the threshold,
-the per-radius response is computed on a `da.coarsen`-downsampled copy (metric
-pixel scales scaled by the factor) and bilinearly upsampled, then combined as
-before.  Small radii keep the exact previous full-resolution code path, so typical
-runs (preset radii ≤ 64) are unchanged.  This is enabled for **projected DEMs only**
-(geographic DEMs use decimation-dependent local scaling); the coarse copy is
-derived from the same array, so it is offset-free and seam-free on both backends.
-
-Algorithms that do **not** need this: `multiscale_terrain` already caps its halo
-at `Constants.MAX_DEPTH` (150 px), and `fractal_anomaly` / `scale_space_surprise`
-/ `visual_saliency` / `npr_edges` use small scales (no large halo) and combine
-scales non-linearly (not linearly decomposable).
 
 ### 13.7 Pipeline Input Assumption
 
@@ -511,15 +563,29 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
 ### 14.2 Encoding rules
 
 - **NoData = 0** for both integer types (NaN → 0).
-- Normalized algorithms (RVI, fractal_anomaly, visual_saliency,
-  scale_space_surprise, multiscale_terrain) derive their display scale from a
-  **full-extent overview pre-pass**: the algorithm runs on a decimated, whole-raster
-  COG overview and its robust **p99** (`NORMAL_PERCENTILE`) sets the value mapped to
-  display magnitude `1`.  Sampling the whole extent (not a center crop) makes this
-  robust to off-center / sparse data footprints; see
-  `_compute_rvi_global_stats_from_overview` / `_compute_norm_stats_from_overview`
-  in `core/dask_processor.py`.  The normalized float is **unclipped**, so the tail
-  runs a little past `±1`.
+- Normalized algorithms (RVI, fractal_anomaly, visual_saliency, scale_space_surprise,
+  multiscale_terrain, and the data-driven `ambient_occlusion` / `openness` stretch)
+  derive their display scale from a **full-resolution stratified pre-pass**, not a
+  decimated overview: `algorithms/_norm_stats.py::_compute_norm_stats_tiled` runs the
+  algorithm's raw block (`normalize=False`) on several **full-resolution** windows
+  stratified across the valid extent, pools the interior pixels, and takes the robust
+  stat (`_NORM_STAT_SPECS` maps each algorithm to its raw block + stat function; the
+  robust **p99** = `NORMAL_PERCENTILE` — a p1→0 / p99→1 stretch for the unsigned maps,
+  a robust absolute-p99 scale for the signed RVI). Full
+  resolution keeps scale-sensitive magnitudes correct (decimating shrinks the detail
+  and under-estimates the scale, which over-amplifies the output and blows out the
+  integer encoding); pooling the whole extent is robust to off-center / sparse data
+  and dilutes singular outliers into the unclipped `>1` tail. **Both backends import
+  the same `_compute_norm_stats_tiled`**, so the displayed contrast matches. (RVI also
+  keeps an overview-derived stat helper, `_compute_rvi_global_stats_from_overview` in
+  `core/dask_processor.py`.) The normalized float is **unclipped**, so the tail runs a
+  little past `±1`.
+- **No double normalization.** Algorithms that apply their own display stretch inside
+  `.process()` (`apply_display_stretch_dask` in `ambient_occlusion` / `openness`, and
+  the internally-normalized RVI / multiscale_terrain / visual_saliency / fractal_anomaly)
+  are listed in `tile_processor.GLOBAL_STATS_NATIVE_ALGOS`, so the tile pipeline skips
+  its own post-normalization for them — otherwise routing them through the Dask path
+  would normalize twice and crush/blow the result.
 - Native value ranges (`OUTPUT_VALUE_RANGES`): slope `0..90`, AO/hillshade/openness
   `0..1` (physically bounded, no pre-stat), npr_edges `0.2..1.0`; the normalized set
   uses `±1.176` (signed) / `0..1.176` (unsigned), where `1.176 = 1/0.85` reserves
