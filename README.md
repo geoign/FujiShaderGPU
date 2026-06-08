@@ -20,11 +20,11 @@ backend differs.
 
 ## Install
 
-Pick the line for your platform:
+Install straight from GitHub — pick the line for your platform:
 
 ```bash
-pip install -e ".[windows]"   # Windows / macOS (tile pipeline)
-pip install -e ".[linux]"     # Linux (Dask-CUDA pipeline)
+pip install "FujiShaderGPU[windows] @ git+https://github.com/geoign/FujiShaderGPU.git"   # Windows / macOS (tile pipeline)
+pip install "FujiShaderGPU[linux] @ git+https://github.com/geoign/FujiShaderGPU.git"      # Linux (Dask-CUDA pipeline)
 ```
 
 GDAL's Python binding must match your native GDAL, so install it yourself:
