@@ -38,6 +38,20 @@ RADII_DRIVEN_ALGOS = frozenset({
     "npr_edges",
 })
 
+# Algorithms whose result is undefined at a single scale (fractal dimension needs a
+# radius regression; scale-space surprise needs a scale range; saliency center-
+# surround needs >=2 scales).  `--mode local` (radii=[1]) is meaningless for them,
+# so they fall back to the spatial default with a warning.
+MULTISCALE_REQUIRED_ALGOS = frozenset({
+    "fractal_anomaly",
+    "scale_space_surprise",
+    "visual_saliency",
+})
+
+# Canonical single-pixel "local" profile shared by both backends.
+LOCAL_RADII = [1]
+LOCAL_WEIGHTS = [1.0]
+
 
 def auto_spatial_radii(short_side_px: Optional[float]) -> List[int]:
     """Geometric radii truncated to ``min(short_side/10, 2048)`` pixels.

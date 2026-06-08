@@ -42,7 +42,7 @@ except ImportError:
     ALGORITHMS = {}
     logging.warning("dask registry module not found. No algorithms available.")
 
-from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS
+from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS, MULTISCALE_REQUIRED_ALGOS
 from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
 from ..algorithms._impl_npr_edges import _compute_npr_grad_stats
 from ..algorithms._norm_stats import (
@@ -1112,15 +1112,41 @@ def run_pipeline(
         else:
             logger.info(f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m")
         
-        # 6-2.5) Spatial-mode auto radii/weights (shared rule): geometric radii
-        # truncated by the input DEM short side + a 2**n weight profile.  Resolved
-        # once from the full Dask-array shape and injected into params.
+        # 6-2.5) Resolve radii/weights from the full Dask-array shape and inject
+        # into params (see process_dem_tiles for the shared rule):
+        #   * --mode local  -> radii=[1], weights=[1.0]; explicit radii ignored.
+        #   * --mode spatial -> geometric radii truncated by the DEM short side.
+        #   * fractal_anomaly / scale_space_surprise / visual_saliency need >=2
+        #     scales, so --mode local falls back to the spatial default + warning.
+        from ..algorithms.common.spatial_mode import (
+            auto_spatial_profile, LOCAL_RADII, LOCAL_WEIGHTS,
+        )
         _dem_short_side = min(int(gpu_arr.shape[-2]), int(gpu_arr.shape[-1]))
+        _user_mode = str(params.get("mode", "spatial")).lower()
+        _is_local = _user_mode == "local"
+        if _is_local and algorithm in MULTISCALE_REQUIRED_ALGOS:
+            logger.warning(
+                "%s requires multiple scales; --mode local is not supported -- "
+                "using the spatial default instead.", algorithm,
+            )
+            params['mode'] = 'spatial'
+            _user_mode = 'spatial'
+            _is_local = False
+
         if algorithm == "topousm_fast":
             pixel_size = float(params.get('pixel_size', 1.0))
 
-            if radii is None and auto_radii:
-                from ..algorithms.common.spatial_mode import auto_spatial_profile
+            if _is_local:
+                if radii is not None:
+                    logger.warning(
+                        "--mode local ignores explicit radii; forcing radii=%s.", LOCAL_RADII)
+                radii, weights = list(LOCAL_RADII), list(LOCAL_WEIGHTS)
+                logger.info("Local mode: radii=%s, weights=%s", radii, weights)
+                params['mode'] = 'radius'
+                params['radii'] = radii
+                params['weights'] = weights
+
+            elif radii is None and auto_radii:
                 radii, weights = auto_spatial_profile(_dem_short_side)
                 logger.info(
                     "Auto spatial radii (short_side=%d px): radii=%s, weights=%s",
@@ -1144,13 +1170,18 @@ def run_pipeline(
             if 'pixel_size' not in params or params['pixel_size'] == 1.0:
                 params['pixel_size'] = float(params.get('pixel_size', 1.0))
 
-            _mode = str(params.get("mode", "spatial")).lower()
-            if radii is not None:
+            if _is_local:
+                if radii is not None or params.get('scales'):
+                    logger.warning(
+                        "--mode local ignores explicit radii/scales; forcing radii=%s.", LOCAL_RADII)
+                params['radii'] = list(LOCAL_RADII)
+                params['weights'] = list(LOCAL_WEIGHTS)
+                logger.info("Local mode: radii=%s, weights=%s", LOCAL_RADII, LOCAL_WEIGHTS)
+            elif radii is not None:
                 # CLI passes explicit radii through run_pipeline's top-level radii.
                 params['radii'] = radii
                 logger.info(f"Setting radii for {algorithm}: {radii}")
-            elif _mode == "spatial" and algorithm in RADII_DRIVEN_ALGOS:
-                from ..algorithms.common.spatial_mode import auto_spatial_profile
+            elif _user_mode == "spatial" and algorithm in RADII_DRIVEN_ALGOS:
                 _auto_r, _auto_w = auto_spatial_profile(_dem_short_side)
                 params['radii'] = _auto_r
                 if params.get('weights') is None:

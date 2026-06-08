@@ -82,7 +82,10 @@ SIGNED_NORMALIZATION_ALGOS = {"topousm_fast", "fractal_anomaly"}
 
 # Algorithms whose spatial radii/weights are auto-derived from the DEM short side
 # via the shared rule (single source of truth in algorithms.common.spatial_mode).
-from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS as AUTO_SPATIAL_RADII_ALGOS
+from ..algorithms.common.spatial_mode import (
+    RADII_DRIVEN_ALGOS as AUTO_SPATIAL_RADII_ALGOS,
+    MULTISCALE_REQUIRED_ALGOS,
+)
 
 
 def _sanitize_spatial_radii_weights_for_tile(
@@ -1596,23 +1599,48 @@ def process_dem_tiles(
         algo_params.setdefault("contrast_enhance", False)
         algo_params.setdefault("z_factor", 1.0)
 
-    # Spatial-mode auto radii/weights (shared rule): geometric radii truncated by
-    # the input DEM short side + a 2**n weight profile.  Resolved ONCE here from
-    # the full-raster dimensions and injected into algo_params so every downstream
-    # path (padding/cost estimate, global stats, per-tile compute) uses the same
-    # explicit values.  topousm_fast is spatial whenever multiscale_mode is on;
-    # the other radius-driven algorithms key off --mode spatial.
+    # Resolve radii/weights ONCE from the full-raster dimensions and inject them
+    # into algo_params so every downstream path (padding/cost, global stats, the
+    # per-tile compute) uses the same explicit values.
+    #   * --mode local  -> radii=[1], weights=[1.0] (single-pixel "simplest" run);
+    #                      explicit --radii are ignored (with a warning).  For
+    #                      topousm_fast, --single-scale is treated as local too.
+    #   * --mode spatial -> geometric radii truncated by the DEM short side + a
+    #                       2**n weight profile (auto when --radii is omitted).
+    # The intrinsically multi-scale algorithms (fractal_anomaly / scale_space_
+    # surprise / visual_saliency) are undefined at one scale: --mode local falls
+    # back to the spatial default with a warning.
     _mode_now = str(algo_params.get("mode", "spatial")).lower()
-    _wants_auto = (
+    _is_local = _mode_now == "local" or (algorithm == "topousm_fast" and not multiscale_mode)
+    if _is_local and algorithm in MULTISCALE_REQUIRED_ALGOS:
+        logger.warning(
+            "%s requires multiple scales; --mode local is not supported -- "
+            "using the spatial default instead.", algorithm,
+        )
+        algo_params["mode"] = "spatial"
+        _mode_now = "spatial"
+        _is_local = False
+
+    from ..algorithms.common.spatial_mode import (
+        auto_spatial_profile, LOCAL_RADII, LOCAL_WEIGHTS,
+    )
+    if _is_local:
+        if algo_params.get("radii") or algo_params.get("scales"):
+            logger.warning(
+                "--mode local ignores explicit radii/scales; forcing radii=%s.",
+                LOCAL_RADII,
+            )
+        algo_params["radii"] = list(LOCAL_RADII)
+        algo_params["weights"] = list(LOCAL_WEIGHTS)
+        logger.info("Local mode: radii=%s, weights=%s", LOCAL_RADII, LOCAL_WEIGHTS)
+    elif (
         algorithm in AUTO_SPATIAL_RADII_ALGOS
         and not algo_params.get("radii")
-        and (multiscale_mode if algorithm == "topousm_fast" else _mode_now == "spatial")
-    )
-    if _wants_auto:
+        and _mode_now == "spatial"
+    ):
         try:
             with rasterio.open(input_cog_path) as _src:
                 _short_side = min(int(_src.width), int(_src.height))
-            from ..algorithms.common.spatial_mode import auto_spatial_profile
             _auto_r, _auto_w = auto_spatial_profile(_short_side)
             algo_params["radii"] = _auto_r
             if not algo_params.get("weights"):

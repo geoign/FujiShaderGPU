@@ -38,8 +38,10 @@ PIPELINE_ARGS: List[ArgSpec] = [
         help="Explicit quantization range 'lo,hi' (e.g. 0,90); defaults to the algorithm's native range")),
     (("--mode",), dict(
         choices=["local", "spatial"], default="spatial",
-        help="Compute mode: spatial (multi-radius integration, default) / local (single neighborhood). "
-             "With spatial and no --radii, radii are auto-derived from the DEM short side")),
+        help="Compute mode: spatial (multi-radius integration, default; auto radii from the DEM "
+             "short side when --radii is omitted) / local (single-pixel neighborhood = radii=[1], "
+             "weights=[1]; explicit --radii ignored). fractal_anomaly/scale_space_surprise/"
+             "visual_saliency need multiple scales, so local falls back to spatial with a warning")),
     (("--radii",), dict(
         type=str,
         help="Explicit spatial radii (px), e.g. 4,16,64; when omitted, YAML is auto-selected by pixel size")),

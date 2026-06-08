@@ -10,10 +10,28 @@ if str(ROOT) not in sys.path:
 from FujiShaderGPU.algorithms.common.spatial_mode import (  # noqa: E402
     AUTO_RADII_SEQUENCE,
     AUTO_RADIUS_MAX,
+    LOCAL_RADII,
+    LOCAL_WEIGHTS,
+    MULTISCALE_REQUIRED_ALGOS,
+    RADII_DRIVEN_ALGOS,
     auto_spatial_profile,
     auto_spatial_radii,
     auto_spatial_weights,
 )
+
+
+def test_local_profile_is_single_pixel():
+    assert LOCAL_RADII == [1]
+    assert LOCAL_WEIGHTS == [1.0]
+
+
+def test_multiscale_required_algos_are_excluded_from_radii_driven():
+    # The single-scale (local) rule must never be applied to algorithms that are
+    # undefined at one scale; they fall back to spatial instead.
+    assert MULTISCALE_REQUIRED_ALGOS == {
+        "fractal_anomaly", "scale_space_surprise", "visual_saliency",
+    }
+    assert MULTISCALE_REQUIRED_ALGOS.isdisjoint(RADII_DRIVEN_ALGOS)
 
 
 @pytest.mark.parametrize(
