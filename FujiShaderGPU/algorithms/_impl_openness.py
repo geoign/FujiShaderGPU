@@ -26,26 +26,58 @@ def compute_openness_vectorized(block: cp.ndarray, *,
                               pixel_size: float = 1.0,
                               pixel_scale_x: float = None,
                               pixel_scale_y: float = None) -> cp.ndarray:
-    """Openness computation (optimized)."""
+    """Topographic openness (Yokoyama et al., 2002), vectorized over the grid.
+
+    For each of ``num_directions`` azimuths, the elevation angle to every sample
+    along the ray (out to ``max_distance``) is ``beta = arctan(dz / d)``.  Per
+    azimuth we keep the extreme horizon angle, then average the corresponding
+    angle over all azimuths -- this directional **mean** is the defining feature
+    of openness (a single steepest neighbour does not dominate the result):
+
+    * positive openness = mean over azimuths of the zenith angle ``90deg - max(beta)``
+      (large on convexities: ridges, peaks, spurs);
+    * negative openness = mean over azimuths of the nadir angle ``90deg + min(beta)``
+      (large on concavities: valleys, channels, pits).
+
+    The raw mean angle is then rescaled to ``[0, 1]`` (divide by 90deg, clip) and
+    gamma-corrected for visualization -- the output is a display-ready relief
+    image, not the quantitative openness angle in degrees.
+    """
     h, w = block.shape
     nan_mask = cp.isnan(block)
 
     angles = cp.linspace(0, 2 * cp.pi, num_directions, endpoint=False)
     directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
 
+    # Per-azimuth horizon extreme initial value: -90deg so cp.maximum captures the
+    # steepest rise (positive), +90deg so cp.minimum captures the steepest fall.
     init_val = -cp.pi/2 if openness_type == 'positive' else cp.pi/2
-    max_angles = cp.full((h, w), init_val, dtype=cp.float32)
 
     distances = cp.unique(cp.linspace(0.1, 1.0, 10) * max_distance).astype(int)
     distances = distances[distances > 0]
 
     pad_value = Constants.NAN_FILL_VALUE_POSITIVE if openness_type == 'positive' else Constants.NAN_FILL_VALUE_NEGATIVE
 
-    for r in distances:
-        offsets = cp.round(r * directions).astype(int)
+    _sx = abs(float(pixel_scale_x)) if pixel_scale_x is not None else float(pixel_size)
+    _sy = abs(float(pixel_scale_y)) if pixel_scale_y is not None else float(pixel_size)
+    if _sx < 1e-9:
+        _sx = float(pixel_size) if pixel_size else 1.0
+    if _sy < 1e-9:
+        _sy = float(pixel_size) if pixel_size else 1.0
 
-        for offset in offsets:
-            offset_x, offset_y = int(offset[0]), int(offset[1])
+    # Accumulate the per-azimuth angle (zenith for positive, nadir for negative)
+    # then divide by the number of azimuths that contributed a valid sample.
+    angle_sum = cp.zeros((h, w), dtype=cp.float32)
+    dir_count = cp.zeros((h, w), dtype=cp.float32)
+
+    for d in range(num_directions):
+        direction = directions[d]
+        dir_ext = cp.full((h, w), init_val, dtype=cp.float32)
+        dir_valid = cp.zeros((h, w), dtype=cp.bool_)
+
+        for r in distances:
+            offset_x = int(round(float(r) * float(direction[0])))
+            offset_y = int(round(float(r) * float(direction[1])))
 
             if offset_x == 0 and offset_y == 0:
                 continue
@@ -66,26 +98,26 @@ def compute_openness_vectorized(block: cp.ndarray, *,
             start_x = pad_left + offset_x
             shifted = padded[start_y:start_y+h, start_x:start_x+w]
 
-            _sx = abs(float(pixel_scale_x)) if pixel_scale_x is not None else float(pixel_size)
-            _sy = abs(float(pixel_scale_y)) if pixel_scale_y is not None else float(pixel_size)
-            if _sx < 1e-9:
-                _sx = float(pixel_size) if pixel_size else 1.0
-            if _sy < 1e-9:
-                _sy = float(pixel_size) if pixel_size else 1.0
             phys_dx = float(offset_x) * _sx
             phys_dy = float(offset_y) * _sy
             phys_dist = max(float(cp.sqrt(phys_dx ** 2 + phys_dy ** 2)), 1e-9)
             angle = cp.arctan((shifted - block) / phys_dist)
 
+            valid = ~(cp.isnan(angle) | nan_mask)
             if openness_type == 'positive':
-                valid = ~(cp.isnan(angle) | nan_mask)
-                max_angles = cp.where(valid, cp.maximum(max_angles, angle), max_angles)
+                dir_ext = cp.where(valid, cp.maximum(dir_ext, angle), dir_ext)
             else:
-                valid = ~(cp.isnan(angle) | nan_mask)
-                max_angles = cp.where(valid, cp.minimum(max_angles, angle), max_angles)
+                dir_ext = cp.where(valid, cp.minimum(dir_ext, angle), dir_ext)
+            dir_valid |= valid
 
-    openness = (cp.pi/2 - max_angles if openness_type == 'positive'
-                else cp.pi/2 + max_angles)
+        # Zenith (positive) / nadir (negative) angle for this azimuth.
+        dir_angle = (cp.pi/2 - dir_ext if openness_type == 'positive'
+                     else cp.pi/2 + dir_ext)
+        angle_sum += cp.where(dir_valid, dir_angle, 0.0)
+        dir_count += dir_valid.astype(cp.float32)
+
+    # Directional mean (Yokoyama openness), then display normalization + gamma.
+    openness = angle_sum / cp.maximum(dir_count, 1.0)
     openness = cp.clip(openness / (cp.pi/2), 0, 1)
 
     result = cp.power(openness, Constants.DEFAULT_GAMMA)
@@ -127,7 +159,12 @@ def compute_openness_spatial_block(
 
 
 class OpennessAlgorithm(DaskAlgorithm):
-    """Openness algorithm (simplified vectorized version)."""
+    """Topographic openness (Yokoyama et al., 2002).
+
+    Positive openness (``openness_type='positive'``) highlights convex relief
+    (ridges/peaks); negative openness highlights concave relief (valleys/pits).
+    Each pixel is the directional mean of the per-azimuth horizon angle within
+    ``max_distance``, rescaled to [0,1] + gamma for display."""
 
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         max_distance = params.get('max_distance', 50)

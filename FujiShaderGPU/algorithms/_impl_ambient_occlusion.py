@@ -27,7 +27,18 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
                                     pixel_size: float = 1.0,
                                     pixel_scale_x: float = None,
                                     pixel_scale_y: float = None) -> cp.ndarray:
-    """Terrain version of screen-space ambient occlusion (SAO), vectorized with normals."""
+    """Stylized screen-space ambient occlusion (SSAO) for terrain shading.
+
+    This is an artistic, performance-oriented occlusion estimate -- NOT a
+    physically based (hemisphere-integral) ambient occlusion or sky-view factor.
+    For ``num_samples`` azimuths sampled at four radius rings
+    (``0.25/0.5/0.75/1.0 x radius``), each neighbour's elevation angle
+    ``arctan(dz / d)`` is clamped to ``[0, 45deg]`` and normalized; nearer rings
+    weigh slightly more (a distance falloff).  The per-sample occlusions are
+    averaged (no horizon test and no cosine/surface-normal weighting), giving
+    ``AO = 1 - mean_occlusion * intensity``, then gamma-corrected and lightly
+    smoothed.  Use ``openness`` for a horizon-based relief measure.
+    """
     h, w = block.shape
     nan_mask = cp.isnan(block)
 

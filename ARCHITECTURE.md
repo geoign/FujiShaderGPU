@@ -68,8 +68,8 @@ slow full-resolution reads).
   - `_impl_curvature.py` — Curvature
   - `_impl_visual_saliency.py` — Visual Saliency
   - `_impl_npr_edges.py` — NPR Edges
-  - `_impl_ambient_occlusion.py` — Ambient Occlusion
-  - `_impl_openness.py` — Openness
+  - `_impl_ambient_occlusion.py` — Ambient Occlusion (stylized SSAO heuristic, not a physically based hemisphere integral / sky-view factor)
+  - `_impl_openness.py` — Topographic Openness (Yokoyama et al. 2002; directional mean of per-azimuth horizon angles, positive/negative)
   - `_impl_fractal_anomaly.py` — Fractal Anomaly
   - `_impl_experimental.py` — Scale-Space Surprise + Multi-Light Uncertainty
   - Some `_impl_*` modules also host **backend-neutral global-stat helpers** that
