@@ -17,7 +17,9 @@ import rasterio
 from rasterio.transform import from_origin
 
 from FujiShaderGPU.io import dem_preprocess
-from FujiShaderGPU.io.dem_preprocess import _fill_coarse_surface, _coarse_shape
+from FujiShaderGPU.io.dem_preprocess import (
+    _fill_coarse_surface, _coarse_shape, _nan_aware_coarse_average,
+)
 
 
 def _write_test_raster(path, data, *, nodata=None):
@@ -76,6 +78,34 @@ def test_fill_coarse_surface_all_invalid_returns_zeros():
 
     assert np.isfinite(out).all()
     assert np.all(out == 0.0)
+
+
+def test_nan_aware_coarse_average_no_boundary_blend(tmp_path):
+    # Regression: the coarse fill grid must average VALID cells only.  With an
+    # undeclared-0 exterior next to real terrain (5000), a plain GDAL average
+    # blends them into phantom mid values (~800-2500) at the boundary that seed
+    # fill artifacts and break downstream normalization.  The NaN-aware build
+    # must leave every valid coarse cell at the true terrain value and mark the
+    # all-exterior cells as voids -- never an in-between value.
+    H, W = 256, 256
+    data = np.zeros((H, W), dtype=np.float32)   # undeclared NoData exterior (0)
+    data[:, W // 2:] = 5000.0                    # real terrain on the right half
+    src_path = tmp_path / "halfzero.tif"
+    _write_test_raster(src_path, data)           # nodata=None (undeclared)
+
+    ch, cw = _coarse_shape(W, H, coarse_max=64)
+    with rasterio.open(src_path) as src:
+        coarse, cmask = _nan_aware_coarse_average(src, ch, cw, None, [0.0])
+
+    valid = coarse[~cmask]
+    assert valid.size > 0
+    # Every valid coarse cell is real terrain; no blended boundary values.
+    assert float(valid.min()) >= 4999.0
+    assert float(valid.max()) <= 5001.0
+    # The all-zero exterior is a void (masked), not low-valued terrain.
+    assert bool(cmask.any())
+    # No coarse cell sits in the artifact band (1, 4000).
+    assert not bool(((coarse > 1.0) & (coarse < 4000.0)).any())
 
 
 def test_coarse_shape_caps_longest_side():

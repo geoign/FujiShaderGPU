@@ -121,6 +121,58 @@ def _fill_coarse_surface(coarse: np.ndarray, valid: np.ndarray) -> np.ndarray:
     ).astype(np.float32, copy=False)
 
 
+def _nan_aware_coarse_average(
+    src,
+    ch: int,
+    cw: int,
+    src_nodata: Optional[float],
+    extra_nodata: list,
+    *,
+    oversample: int = 4,
+    max_intermediate: int = 4096,
+) -> tuple:
+    """Build the coarse fill grid by averaging *valid cells only*.
+
+    A plain ``Resampling.average`` read blends NoData into terrain at the data
+    boundary -- and when NoData is undeclared (an exterior ``0`` sentinel), GDAL
+    cannot exclude it, so boundary coarse cells become a meaningless mix (e.g.
+    ``0`` and ``5000`` -> ~``800``).  Those contaminated cells are not exactly the
+    sentinel, so they escape the post-hoc sentinel mask and seed phantom low
+    relief that breaks downstream normalization.
+
+    Instead we read an oversampled grid with NEAREST (exact values, no blending),
+    mask every NoData (declared + undeclared sentinels) to NaN, and block-reduce
+    with a NaN-aware mean: a coarse cell is the mean of its *valid* sub-cells, and
+    only a fully-NoData cell becomes a void.  Returns ``(coarse, cmask)`` where
+    ``cmask`` is the NoData (void) mask.
+    """
+    k = max(1, int(oversample))
+    while k > 1 and max(ch * k, cw * k) > int(max_intermediate):
+        k -= 1
+    ih, iw = ch * k, cw * k
+    ma = src.read(
+        1, out_shape=(ih, iw), resampling=Resampling.nearest,
+        out_dtype=np.float32, masked=True,
+    )
+    a = np.ma.getdata(ma).astype(np.float32, copy=False)
+    m = np.ma.getmaskarray(ma) | ~np.isfinite(a)
+    if src_nodata is not None and np.isfinite(src_nodata):
+        m = m | (a == np.float32(src_nodata))
+    for v in extra_nodata:
+        if np.isfinite(v):
+            m = m | (a == np.float32(v))
+    if k == 1:
+        coarse = np.where(m, np.float32(0.0), a).astype(np.float32)
+        return coarse, m
+    a = np.where(m, np.nan, a).reshape(ch, k, cw, k)
+    finite = np.isfinite(a)
+    cnt = finite.sum(axis=(1, 3))
+    s = np.nansum(a, axis=(1, 3))
+    cmask = cnt == 0
+    coarse = np.where(cmask, np.float32(0.0), s / np.maximum(cnt, 1)).astype(np.float32)
+    return coarse, cmask
+
+
 def _detect_border_nodata(
     sample: np.ndarray,
     valid: np.ndarray,
@@ -449,18 +501,10 @@ def preprocess_dem_to_cog(
 
         # ---- 1) Build the coarse fill surface (only when filling) -----------
         ch, cw = _coarse_shape(width, height, coarse_max)
-        coarse_ma = src.read(
-            1, out_shape=(ch, cw), resampling=Resampling.average,
-            out_dtype=np.float32, masked=True,
-        )
-        coarse = np.ma.getdata(coarse_ma).astype(np.float32, copy=False)
-        cmask = np.ma.getmaskarray(coarse_ma)
-
-        # ---- Extra NoData sentinels -> NaN (override + auto-detected) --------
-        # The declared NoData is already masked by the masked read above.  Here
-        # we additionally honour an explicit override and, by default, sniff out
-        # an *undeclared* constant border (a NoData frame whose tag was lost in
-        # conversion) so it is not treated as real terrain by the fill / pipeline.
+        # ---- Detect NoData sentinels FIRST (override + auto-detected) --------
+        # Use a NEAREST coarse read so an *undeclared* sentinel/border keeps its
+        # exact value (averaging would smear it and hide the constant).  The
+        # declared NoData is already masked by the masked read.
         extra_nodata: list[float] = []
         if nodata_override is not None and np.isfinite(nodata_override):
             extra_nodata.append(float(nodata_override))
@@ -495,10 +539,14 @@ def preprocess_dem_to_cog(
                         _why, float(_detected),
                     )
 
-        # Fold the sentinels into the coarse mask so the fill surface, edge
-        # connectivity (enclosed), and hole detection treat them as NoData.
-        for v in extra_nodata:
-            cmask = cmask | (coarse == np.float32(v))
+        # ---- Build the coarse fill surface, averaging VALID cells only -------
+        # NoData (declared + the sentinels detected above) is masked to NaN
+        # *before* averaging, so the data/NoData boundary is not contaminated by
+        # the exterior sentinel (which otherwise seeds phantom low relief, e.g.
+        # ~800 between 0 and 5000, and breaks downstream normalization).
+        coarse, cmask = _nan_aware_coarse_average(
+            src, ch, cw, src_nodata, extra_nodata,
+        )
         cvalid = (~cmask) & np.isfinite(coarse)
         has_holes = bool((~cvalid).any())
 
