@@ -4,7 +4,10 @@ GPU-accelerated terrain visualization for **very large DEMs** (digital elevation
 models). Turn a height raster into a hillshade, TopoUSM relief, slope, openness,
 and more — written straight to a Cloud-Optimized GeoTIFF (COG) you can open in QGIS.
 
-- **Windows / macOS** — tile-based local GPU pipeline
+An **NVIDIA GPU (CUDA 12.x) is required** — the pipeline is built on CuPy/CUDA and
+does not run on CPU-only machines or non-NVIDIA GPUs (no macOS support).
+
+- **Windows** — tile-based local GPU pipeline
 - **Linux** — Dask-CUDA distributed pipeline (built for huge multi-GB rasters)
 
 The algorithms and command-line options are the **same on every platform**; only the
@@ -14,7 +17,7 @@ backend differs.
 
 ## Requirements
 
-- An NVIDIA GPU with **CUDA 12.x**
+- **An NVIDIA GPU with CUDA 12.x** (required — there is no CPU fallback)
 - **Python 3.10+**
 - **GDAL** (installed separately — see below)
 
@@ -23,7 +26,7 @@ backend differs.
 Install straight from GitHub — pick the line for your platform:
 
 ```bash
-pip install "FujiShaderGPU[windows] @ git+https://github.com/geoign/FujiShaderGPU.git"   # Windows / macOS (tile pipeline)
+pip install "FujiShaderGPU[windows] @ git+https://github.com/geoign/FujiShaderGPU.git"   # Windows (tile pipeline)
 pip install "FujiShaderGPU[linux] @ git+https://github.com/geoign/FujiShaderGPU.git"      # Linux (Dask-CUDA pipeline)
 ```
 
