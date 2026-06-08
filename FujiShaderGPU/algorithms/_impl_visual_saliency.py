@@ -251,7 +251,7 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
             stats = (0.0, 1.0)
 
-        # Hybrid coarse path (RVI-style): when the orchestrator supplies the
+        # Hybrid coarse path (TopoUSM Fast-style): when the orchestrator supplies the
         # large-scale smooth fields precomputed from the COG overview, compute the
         # small conspicuity scales at full resolution (bounded halo) and sample the
         # large scales from their concrete overview fields inside one depth-0

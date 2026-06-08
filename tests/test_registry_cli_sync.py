@@ -54,7 +54,7 @@ def test_build_algo_params_parity_across_platforms():
     from FujiShaderGPU.cli.args import build_algo_params, parse_list_fields
 
     cases = [
-        ["i", "o", "--algorithm", "rvi", "--radii", "4,16,64", "--weights", "0.5,0.3,0.2"],
+        ["i", "o", "--algorithm", "topousm_fast", "--radii", "4,16,64", "--weights", "0.5,0.3,0.2"],
         ["i", "o", "--algorithm", "hillshade", "--azimuth", "300", "--multiscale"],
         ["i", "o", "--algorithm", "blur", "--blur-radius", "9"],
         ["i", "o", "--algorithm", "blur", "--radii", "5,20"],

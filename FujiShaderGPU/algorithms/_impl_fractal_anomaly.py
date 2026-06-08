@@ -273,7 +273,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
                 rp10, rp75 = float(stats[2]), float(stats[3])
         mean_D, std_D = float(stats[0]), float(stats[1])
 
-        # Hybrid coarse path (RVI-style): when the orchestrator supplies the
+        # Hybrid coarse path (TopoUSM Fast-style): when the orchestrator supplies the
         # large-radius roughness fields precomputed from the COG overview, compute
         # small radii at full resolution (bounded halo) and sample the large radii
         # from their concrete overview fields inside one depth-0 combine.  This is

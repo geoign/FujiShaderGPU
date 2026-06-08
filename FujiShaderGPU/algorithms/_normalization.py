@@ -18,10 +18,10 @@ NORMAL_PERCENTILE = 99.0
 OVERFLOW_LIMIT = 1.5  # retained for backward-compat imports; no longer clipped
 
 
-# --- RVI ---
+# --- TopoUSM Fast ---
 
-def rvi_stat_func(data: cp.ndarray) -> Tuple[float]:
-    """RVI normalization scale from robust absolute percentile."""
+def topousm_fast_stat_func(data: cp.ndarray) -> Tuple[float]:
+    """TopoUSM Fast normalization scale from robust absolute percentile."""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
         abs_valid = cp.abs(valid_data)
@@ -33,11 +33,11 @@ def rvi_stat_func(data: cp.ndarray) -> Tuple[float]:
     return (1.0,)
 
 
-def rvi_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
-    """Normalization for RVI."""
+def topousm_fast_norm_func(block: cp.ndarray, stats: Tuple[float], nan_mask: cp.ndarray) -> cp.ndarray:
+    """Normalization for TopoUSM Fast."""
     scale_global = stats[0]
     if scale_global > 0:
-        # p99(|RVI|) -> magnitude 1.0; tail passes through unclipped.
+        # p99(|TopoUSM Fast|) -> magnitude 1.0; tail passes through unclipped.
         return block / scale_global
     return cp.zeros_like(block)
 
@@ -59,8 +59,8 @@ def robust_unsigned_stretch_stat_func(data: cp.ndarray) -> Tuple[float, float]:
 
 
 __all__ = [
-    "rvi_stat_func",
-    "rvi_norm_func",
+    "topousm_fast_stat_func",
+    "topousm_fast_norm_func",
     "robust_unsigned_stretch_stat_func",
     "NORMAL_PERCENTILE",
     "OVERFLOW_LIMIT",

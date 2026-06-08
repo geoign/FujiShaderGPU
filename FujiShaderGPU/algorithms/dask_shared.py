@@ -5,7 +5,7 @@ Re-export hub for backward compatibility.
 All algorithm implementations are split into separate _impl_*.py modules.
 
 Phase 1: shared foundation (_base, _nan_utils, _global_stats, _normalization)
-Phase 2: six large algorithms (_impl_rvi, _impl_npr_edges,
+Phase 2: six large algorithms (_impl_topousm_fast, _impl_npr_edges,
          _impl_ambient_occlusion, _impl_openness, _impl_specular,
          _impl_fractal_anomaly)
 Phase 3: remaining eight algorithms (_impl_hillshade, _impl_slope,
@@ -55,17 +55,17 @@ from ._global_stats import (
 
 # --- _normalization.py ---
 from ._normalization import (
-    rvi_stat_func,
-    rvi_norm_func,
+    topousm_fast_stat_func,
+    topousm_fast_norm_func,
 )
 
 # ---------------------------------------------------------------------------
 # Phase 2: re-export the large algorithms
 # ---------------------------------------------------------------------------
 
-# --- _impl_rvi.py ---
-from ._impl_rvi import (
-    high_pass, compute_rvi_efficient_block, multiscale_rvi, RVIAlgorithm,
+# --- _impl_topousm_fast.py ---
+from ._impl_topousm_fast import (
+    high_pass, compute_topousm_fast_efficient_block, multiscale_topousm_fast, TopoUSMFastAlgorithm,
 )
 
 # --- _impl_npr_edges.py ---

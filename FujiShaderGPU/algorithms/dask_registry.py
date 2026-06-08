@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .dask_shared import DaskAlgorithm
-from .dask.rvi import RVIAlgorithm
+from .dask.topousm_fast import TopoUSMFastAlgorithm
 from .dask.hillshade import HillshadeAlgorithm
 from .dask.slope import SlopeAlgorithm
 from .dask.specular import SpecularAlgorithm
@@ -19,7 +19,7 @@ from .dask.scale_space_surprise import ScaleSpaceSurpriseAlgorithm
 from .dask.multi_light_uncertainty import MultiLightUncertaintyAlgorithm
 
 ALGORITHMS = {
-    'rvi': RVIAlgorithm(),
+    'topousm_fast': TopoUSMFastAlgorithm(),
     'hillshade': HillshadeAlgorithm(),
     'slope': SlopeAlgorithm(),
     'specular': SpecularAlgorithm(),

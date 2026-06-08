@@ -11,7 +11,7 @@ from ..core.tile_io import read_tile_window, write_tile_output
 from ..core.tile_compute import (
     run_tile_algorithm,
     apply_nodata_mask,
-    _normalize_rvi_radii_and_weights,
+    _normalize_topousm_fast_radii_and_weights,
 )
 from ..io.raster_info import detect_pixel_size_from_cog, metric_pixel_scales_from_metadata
 from ..utils.types import TileResult
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 # Algorithms available by default (Windows/macOS)
 DEFAULT_ALGORITHMS = {
     # Canonical names aligned with Dask registry
-    "rvi": "RVIAlgorithm",
+    "topousm_fast": "TopoUSMFastAlgorithm",
     "hillshade": "HillshadeAlgorithm",
     "slope": "SlopeAlgorithm",
     "specular": "SpecularAlgorithm",
@@ -66,7 +66,7 @@ DEFAULT_ALGORITHMS = {
 }
 
 GLOBAL_STATS_NATIVE_ALGOS = {
-    "rvi",
+    "topousm_fast",
     "multiscale_terrain",
     "visual_saliency",
     "fractal_anomaly",
@@ -79,7 +79,7 @@ GLOBAL_STATS_NATIVE_ALGOS = {
 # blur outputs raw smoothed elevation (same units as the input); the tile pipeline
 # must NOT apply its generic [0,1] display normalization to it.
 NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges", "blur"}
-SIGNED_NORMALIZATION_ALGOS = {"rvi", "fractal_anomaly"}
+SIGNED_NORMALIZATION_ALGOS = {"topousm_fast", "fractal_anomaly"}
 
 
 def _sanitize_spatial_radii_weights_for_tile(
@@ -249,7 +249,7 @@ def _required_padding_for_algorithm(
     # radii then come from the overview and need no per-tile halo.
     _overview_active = (
         _mode == "spatial" and bool(algo_params.get("radii"))
-        and not _is_geo and algorithm != "rvi"
+        and not _is_geo and algorithm != "topousm_fast"
     )
     # large_radius_threshold for the spatial-switch algorithms (matches
     # _nan_utils.large_radius_threshold's floor; the tile is one chunk).
@@ -272,8 +272,8 @@ def _required_padding_for_algorithm(
         small = [s for s in scales if int(s * 5) <= _MAX_DEPTH] or [min(scales)]
         max_scale = max(small) if _overview_active else max(scales)
         required = max(required, int(math.ceil(max_scale * 5.0)))
-    elif algorithm == "rvi":
-        radii, _ = _normalize_rvi_radii_and_weights(
+    elif algorithm == "topousm_fast":
+        radii, _ = _normalize_topousm_fast_radii_and_weights(
             target_distances=target_distances,
             weights=algo_params.get("weights"),
             pixel_size=pixel_size,
@@ -281,7 +281,7 @@ def _required_padding_for_algorithm(
             manual_weights=algo_params.get("weights"),
         )
         if radii:
-            # RVI uses a uniform (box) mean of radius R, which needs exactly R
+            # TopoUSM Fast uses a uniform (box) mean of radius R, which needs exactly R
             # pixels of real neighbour context -- not 2R.  R + small margin keeps
             # adjacent tile cores identical (seam-free) while halving the per-tile
             # halo read.  Matches the Dask map_overlap depth (max_radius + 16).
@@ -384,8 +384,8 @@ def _estimate_scale_count(
 ) -> int:
     """Estimate multi-scale fan-out count for rough cost warning."""
     try:
-        if algorithm == "rvi":
-            radii, _ = _normalize_rvi_radii_and_weights(
+        if algorithm == "topousm_fast":
+            radii, _ = _normalize_topousm_fast_radii_and_weights(
                 target_distances=target_distances,
                 weights=algo_params.get("weights"),
                 pixel_size=pixel_size,
@@ -600,7 +600,7 @@ def _compute_geotiff_tile_profile(
     return tile_profile
 
 
-def _compute_global_rvi_stats(
+def _compute_global_topousm_fast_stats(
     input_cog_path: str,
     nodata: Optional[float],
     pixel_size: float,
@@ -609,11 +609,11 @@ def _compute_global_rvi_stats(
     algo_params: dict,
     elevation_scale: float = 1.0,
 ) -> Optional[Tuple[float]]:
-    """Estimate global RVI normalization stats from an overview sample once."""
+    """Estimate global TopoUSM Fast normalization stats from an overview sample once."""
     try:
-        from ..algorithms.dask_shared import compute_rvi_efficient_block, rvi_stat_func
+        from ..algorithms.dask_shared import compute_topousm_fast_efficient_block, topousm_fast_stat_func
     except Exception as exc:
-        logger.warning(f"RVI global stats helpers unavailable: {exc}")
+        logger.warning(f"TopoUSM Fast global stats helpers unavailable: {exc}")
         return None
 
     try:
@@ -638,16 +638,16 @@ def _compute_global_rvi_stats(
         # Manual radii are full-resolution pixel counts.  The stats sample is
         # decimated by `scale`, so scale the radii down to the sample grid;
         # otherwise (now that the 256px cap is removed) a radius can exceed the
-        # whole sample and collapse the RVI signal.  Auto radii (manual_radii is
+        # whole sample and collapse the TopoUSM Fast signal.  Auto radii (manual_radii is
         # None) are already derived from target distances at sample_pixel_size.
         # Prefer the *full* radii (before the large-radius overview split) so the
-        # global normalization scale reflects the combined RVI, not just the
+        # global normalization scale reflects the combined TopoUSM Fast, not just the
         # small-radius part left in algo_params["radii"].
-        manual_radii = algo_params.get("_rvi_full_radii") or algo_params.get("radii")
-        manual_weights = algo_params.get("_rvi_full_weights") or algo_params.get("weights")
+        manual_radii = algo_params.get("_topousm_fast_full_radii") or algo_params.get("radii")
+        manual_weights = algo_params.get("_topousm_fast_full_weights") or algo_params.get("weights")
         if manual_radii is not None:
             manual_radii = [max(1.0, float(r) / max(scale, 1.0)) for r in manual_radii]
-        radii, rvi_weights = _normalize_rvi_radii_and_weights(
+        radii, topousm_fast_weights = _normalize_topousm_fast_radii_and_weights(
             target_distances=target_distances,
             weights=weights,
             pixel_size=sample_pixel_size,
@@ -661,10 +661,10 @@ def _compute_global_rvi_stats(
         # Pass the sample-grid pixel size so the internal radius->downsample-factor
         # logic matches the full-resolution tiles (decimated overview => larger
         # metric pixel size); omitting it defaulted to 1.0 and skewed the factor.
-        rvi_sample = compute_rvi_efficient_block(
-            sample_gpu, radii=radii, weights=rvi_weights, pixel_size=sample_pixel_size,
+        topousm_fast_sample = compute_topousm_fast_efficient_block(
+            sample_gpu, radii=radii, weights=topousm_fast_weights, pixel_size=sample_pixel_size,
         )
-        stats = rvi_stat_func(rvi_sample)
+        stats = topousm_fast_stat_func(topousm_fast_sample)
         if not stats:
             return None
         std_global = float(stats[0])
@@ -672,11 +672,11 @@ def _compute_global_rvi_stats(
             return None
         return (std_global,)
     except Exception as exc:
-        logger.warning(f"Failed to compute global RVI stats; fallback to per-run stats: {exc}")
+        logger.warning(f"Failed to compute global TopoUSM Fast stats; fallback to per-run stats: {exc}")
         return None
 
 
-def _compute_rvi_overview_coarse_field_tile(
+def _compute_topousm_fast_overview_coarse_field_tile(
     input_cog_path: str,
     *,
     large_radii: List[int],
@@ -685,9 +685,9 @@ def _compute_rvi_overview_coarse_field_tile(
     elevation_scale: float = 1.0,
     sample_max: int = 2048,
 ):
-    """Large-radius RVI coarse field (Sum w*mean) from the COG overview, for tiles.
+    """Large-radius TopoUSM Fast coarse field (Sum w*mean) from the COG overview, for tiles.
 
-    A single global field (shared by every tile) keeps the large-radius RVI
+    A single global field (shared by every tile) keeps the large-radius TopoUSM Fast
     contribution seam-free while letting each tile read only a small halo for the
     small radii.  Returns a CuPy 2D field, or ``None`` on any failure (caller
     then keeps the full-resolution radii path).
@@ -695,9 +695,9 @@ def _compute_rvi_overview_coarse_field_tile(
     if not large_radii:
         return None
     try:
-        from ..algorithms._impl_rvi import compute_rvi_large_coarse_field
+        from ..algorithms._impl_topousm_fast import compute_topousm_fast_large_coarse_field
     except Exception as exc:
-        logger.warning(f"RVI overview coarse-field helper unavailable: {exc}")
+        logger.warning(f"TopoUSM Fast overview coarse-field helper unavailable: {exc}")
         return None
     try:
         with rasterio.open(input_cog_path, "r") as src:
@@ -714,17 +714,17 @@ def _compute_rvi_overview_coarse_field_tile(
         if nodata is not None:
             sample = _replace_nodata_with_nan(sample, nodata)
         coarse_dem = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
-        field = compute_rvi_large_coarse_field(
+        field = compute_topousm_fast_large_coarse_field(
             coarse_dem, large_radii=large_radii, large_weights=large_weights,
             decimation=float(scale),
         )
         logger.info(
-            "RVI large-radius overview field (tile): decimation=%.1fx, large_radii=%s",
+            "TopoUSM Fast large-radius overview field (tile): decimation=%.1fx, large_radii=%s",
             scale, list(large_radii),
         )
         return field
     except Exception as exc:
-        logger.warning(f"Failed to compute tile RVI overview coarse field: {exc}")
+        logger.warning(f"Failed to compute tile TopoUSM Fast overview coarse field: {exc}")
         return None
 
 
@@ -1163,7 +1163,7 @@ def _format_algorithm_output(
 
 def _apply_output_display_hints(output_cog_path: str, algorithm: str) -> None:
     """Attach lightweight display metadata to improve QGIS default rendering."""
-    if algorithm != "rvi":
+    if algorithm != "topousm_fast":
         return
 
     try:
@@ -1326,7 +1326,7 @@ def process_single_tile(
     multiscale_mode: bool = True,
     pixel_size: float = 0.5,
     target_distances: Optional[List[float]] = None,
-    rvi_weights: Optional[List[float]] = None,
+    topousm_fast_weights: Optional[List[float]] = None,
     **algo_params
 ) -> TileResult:
     """
@@ -1386,10 +1386,10 @@ def process_single_tile(
             algo_instance = _load_algorithm(algorithm)
             # Build per-tile params so geographic DEMs can use local latitude scaling.
             tile_algo_params = dict(algo_params)
-            # RVI overview large-radius path: tell the algorithm this tile's global
+            # TopoUSM Fast overview large-radius path: tell the algorithm this tile's global
             # origin so the shared coarse field is sampled at the correct position.
-            if "_rvi_coarse_field" in tile_algo_params:
-                tile_algo_params["_rvi_field_offset"] = (int(win_y_off), int(win_x_off))
+            if "_topousm_fast_coarse_field" in tile_algo_params:
+                tile_algo_params["_topousm_fast_field_offset"] = (int(win_y_off), int(win_x_off))
             # Unified overview path (all other spatial algorithms): this tile's
             # padded-window global origin lets the shared coarse-sampling helpers
             # (_nan_utils) read the one global overview field at the correct
@@ -1431,7 +1431,7 @@ def process_single_tile(
                 sigma,
                 multiscale_mode,
                 target_distances,
-                rvi_weights,
+                topousm_fast_weights,
                 pixel_size,
                 tile_algo_params,
             )
@@ -1524,7 +1524,7 @@ def process_dem_tiles(
     input_cog_path: str,
     output_cog_path: str,
     tmp_tile_dir: str = "tiles_tmp",
-    algorithm: str = "rvi",  # added algorithm selection
+    algorithm: str = "topousm_fast",  # added algorithm selection
     tile_size: Optional[int] = None,
     padding: Optional[int] = None,
     sigma: float = 10.0,
@@ -1593,10 +1593,10 @@ def process_dem_tiles(
         algo_params.setdefault("contrast_enhance", False)
         algo_params.setdefault("z_factor", 1.0)
     
-    # Scale analysis (RVI only)
-    if algorithm == "rvi" and multiscale_mode and auto_scale_analysis:
+    # Scale analysis (TopoUSM Fast only)
+    if algorithm == "topousm_fast" and multiscale_mode and auto_scale_analysis:
         target_distances, weights = analyze_terrain_scales(input_cog_path, pixel_size)
-    elif algorithm == "rvi" and multiscale_mode:
+    elif algorithm == "topousm_fast" and multiscale_mode:
         target_distances, weights = _get_default_scales()
     else:
         target_distances, weights = None, None
@@ -1658,13 +1658,13 @@ def process_dem_tiles(
         if adj_warn:
             logger.warning(adj_warn)
 
-    # RVI large-radius-from-overview fast path (tile).  Split radii at a
+    # TopoUSM Fast large-radius-from-overview fast path (tile).  Split radii at a
     # tile-size-aware threshold; the large radii are taken from a single global
     # overview-derived coarse field (seam-free, no large per-tile halo), so the
     # tile padding only needs to cover the small radii.  Projected-only: on
     # geographic DEMs each tile uses a local-latitude elevation_scale, which a
     # single global field cannot match, so the optimization is skipped there.
-    if algorithm == "rvi":
+    if algorithm == "topousm_fast":
         try:
             with rasterio.open(input_cog_path, "r") as _src:
                 _sx, _sy, _pxm, _is_geo, _lat = metric_pixel_scales_from_metadata(
@@ -1672,11 +1672,11 @@ def process_dem_tiles(
                 )
                 _full_w_px, _full_h_px = int(_src.width), int(_src.height)
             if not _is_geo:
-                from ..algorithms._impl_rvi import (
-                    rvi_default_large_radius_threshold,
+                from ..algorithms._impl_topousm_fast import (
+                    topousm_fast_default_large_radius_threshold,
                     split_radii_by_threshold,
                 )
-                _full_r, _full_w = _normalize_rvi_radii_and_weights(
+                _full_r, _full_w = _normalize_topousm_fast_radii_and_weights(
                     target_distances=target_distances,
                     weights=weights,
                     pixel_size=float(pixel_size),
@@ -1684,33 +1684,33 @@ def process_dem_tiles(
                     manual_weights=algo_params.get("weights"),
                 )
                 if _full_r:
-                    _thr = rvi_default_large_radius_threshold(int(tile_size))
+                    _thr = topousm_fast_default_large_radius_threshold(int(tile_size))
                     _sr, _sw, _lr, _lw = split_radii_by_threshold(_full_r, _full_w, _thr)
                     if _lr:
-                        _field = _compute_rvi_overview_coarse_field_tile(
+                        _field = _compute_topousm_fast_overview_coarse_field_tile(
                             input_cog_path, large_radii=_lr, large_weights=_lw,
                             nodata=nodata_override, elevation_scale=1.0,
                         )
                         if _field is not None:
                             # Keep the full radii for the global normalization stat,
                             # but use small radii for padding + per-tile compute.
-                            algo_params["_rvi_full_radii"] = list(_full_r)
-                            algo_params["_rvi_full_weights"] = list(_full_w)
+                            algo_params["_topousm_fast_full_radii"] = list(_full_r)
+                            algo_params["_topousm_fast_full_weights"] = list(_full_w)
                             algo_params["radii"] = _sr
                             algo_params["weights"] = _sw
-                            algo_params["_rvi_coarse_field"] = _field
-                            algo_params["_rvi_small_radii"] = _sr
-                            algo_params["_rvi_small_weights"] = _sw
-                            algo_params["_rvi_w_large"] = float(sum(_lw))
-                            algo_params["_rvi_full_shape"] = (_full_h_px, _full_w_px)
+                            algo_params["_topousm_fast_coarse_field"] = _field
+                            algo_params["_topousm_fast_small_radii"] = _sr
+                            algo_params["_topousm_fast_small_weights"] = _sw
+                            algo_params["_topousm_fast_w_large"] = float(sum(_lw))
+                            algo_params["_topousm_fast_full_shape"] = (_full_h_px, _full_w_px)
                             logger.info(
-                                "RVI overview large-radius path (tile): small=%s, large=%s "
+                                "TopoUSM Fast overview large-radius path (tile): small=%s, large=%s "
                                 "(threshold=%dpx)",
                                 _sr, _lr, _thr,
                             )
         except Exception as exc:
             logger.warning(
-                "RVI tile overview large-radius path unavailable; using full radii: %s",
+                "TopoUSM Fast tile overview large-radius path unavailable; using full radii: %s",
                 exc,
             )
 
@@ -1779,7 +1779,7 @@ def process_dem_tiles(
 
         # VRAM fit check.  The Windows/tile backend loads the whole padded tile
         # window onto the GPU, so large radii / halos can push a single tile past
-        # available VRAM.  The RVI radius cap was intentionally removed, so warn
+        # available VRAM.  The TopoUSM Fast radius cap was intentionally removed, so warn
         # explicitly (rather than silently clamping) when an OOM is likely.
         _complexity = float(ALGORITHM_COMPLEXITY.get(algorithm, 1.0))
         est_tile_vram_gb = (effective_span ** 2 * 4.0 * 15.0 * _complexity) / (1024 ** 3)
@@ -1974,8 +1974,8 @@ def process_dem_tiles(
                 if _fr_stats is not None:
                     algo_params["global_stats"] = tuple(_fr_stats)
 
-            if algorithm == "rvi":
-                global_rvi_stats = _compute_global_rvi_stats(
+            if algorithm == "topousm_fast":
+                global_topousm_fast_stats = _compute_global_topousm_fast_stats(
                     input_cog_path=input_cog_path,
                     nodata=nodata,
                     pixel_size=pixel_size,
@@ -1984,11 +1984,11 @@ def process_dem_tiles(
                     algo_params=algo_params,
                     elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
-                if global_rvi_stats is not None:
-                    algo_params["global_stats"] = global_rvi_stats
+                if global_topousm_fast_stats is not None:
+                    algo_params["global_stats"] = global_topousm_fast_stats
                     logger.info(
-                        f"RVI global normalization stats fixed for all tiles: "
-                        f"abs_p80={global_rvi_stats[0]:.6f}"
+                        f"TopoUSM Fast global normalization stats fixed for all tiles: "
+                        f"abs_p80={global_topousm_fast_stats[0]:.6f}"
                     )
             elif algorithm == "multiscale_terrain" and "global_stats" not in algo_params:
                 global_ms_stats = _compute_global_multiscale_terrain_stats(
@@ -2100,12 +2100,12 @@ def process_dem_tiles(
             # (seam-free, bounded halo) instead of a per-tile coarsen.  The per-tile
             # global origin is injected in process_single_tile (_tile_origin).
             # Projected DEMs only: a single global field is incompatible with the
-            # per-tile latitude metre scaling used on geographic DEMs.  RVI has its
+            # per-tile latitude metre scaling used on geographic DEMs.  TopoUSM Fast has its
             # own split above (bespoke direct path).
             if (
                 mode == "spatial"
                 and algo_params.get("radii")
-                and algorithm != "rvi"
+                and algorithm != "topousm_fast"
                 and not bool(algo_params.get("is_geographic_dem", False))
             ):
                 try:
@@ -2291,7 +2291,7 @@ def process_dem_tiles(
         # COG quality validation
         _validate_cog_for_qgis(output_cog_path)
         if quantize_scale_offset is None:
-            # Float output: apply float-oriented display hints (e.g. RVI -1/1).
+            # Float output: apply float-oriented display hints (e.g. TopoUSM Fast -1/1).
             _apply_output_display_hints(output_cog_path, algorithm)
         else:
             # Integer output: record GDAL scale/offset (DN -> physical recovery),

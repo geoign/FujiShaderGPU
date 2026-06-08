@@ -21,7 +21,7 @@ ALGORITHM_COMPLEXITY: Dict[str, float] = {
     "atmospheric_scattering": 0.9,
     "curvature": 1.0,
     "npr_edges": 1.1,
-    "rvi": 1.2,
+    "topousm_fast": 1.2,
     "visual_saliency": 1.4,
     # specular is the heaviest spatial block: a single padded block peaks at
     # ~3x the baseline per-pixel VRAM (surface normals + multiple filters).  At

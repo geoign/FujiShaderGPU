@@ -9,7 +9,7 @@ usable both as a standalone "soften the terrain" output and as the smoothing
 primitive behind the preprocessing void fill (see ``io.dem_preprocess``).
 
 The smoothing core (``handle_nan_with_gaussian``) and the large-radius overview
-path (``coarse_large_radius_response``) are shared verbatim with RVI /
+path (``coarse_large_radius_response``) are shared verbatim with TopoUSM Fast /
 multiscale_terrain, so blur inherits the same NaN handling, tiling, and
 overview-accelerated large-radius behaviour without forking that plumbing.
 """

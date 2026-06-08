@@ -38,17 +38,17 @@ writes them out as Cloud-Optimized GeoTIFF."""
         algos = ", ".join(self.get_supported_algorithms())
         return f"""
     Examples:
-    # RVI: analyze terrain and auto-determine radii (recommended, fast)
+    # TopoUSM Fast: analyze terrain and auto-determine radii (recommended, fast)
     fujishadergpu input.tif output.tif
 
-    # RVI: specify radii manually (new method, fast)
+    # TopoUSM Fast: specify radii manually (new method, fast)
     fujishadergpu input.tif output.tif --radii 4,16,64,256
 
     # Other algorithms
     fujishadergpu input.tif output.tif --algo hillshade
 
     # Specify a large chunk size
-    fujishadergpu input.tif output.tif --algo rvi --chunk 4096
+    fujishadergpu input.tif output.tif --algo topousm_fast --chunk 4096
 
     All available algorithms:
     {algos}
@@ -63,8 +63,8 @@ writes them out as Cloud-Optimized GeoTIFF."""
         add_arguments(parser, DASK_ARGS)
 
     def _validate_platform_args(self, args: argparse.Namespace):
-        # RVI needs either explicit radii or auto-determination.
-        if args.algorithm == "rvi":
+        # TopoUSM Fast needs either explicit radii or auto-determination.
+        if args.algorithm == "topousm_fast":
             if not getattr(args, "radii_list", None) and not getattr(args, "auto_radii", True):
                 self.parser.error("Specify radii or enable --auto-radii")
 
@@ -131,7 +131,7 @@ writes them out as Cloud-Optimized GeoTIFF."""
         self.logger.info(f"Algorithm: {args.algorithm}")
 
         algo_params = build_algo_params(args)
-        # RVI auto-determines radii unless explicit --radii were given.
+        # TopoUSM Fast auto-determines radii unless explicit --radii were given.
         auto_radii = getattr(args, "radii_list", None) is None and getattr(args, "auto_radii", True)
 
         try:

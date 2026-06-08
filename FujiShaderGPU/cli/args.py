@@ -115,7 +115,7 @@ DASK_ARGS: List[ArgSpec] = [
     (("--verbose",), dict(action="store_true", help="Enable verbose logging")),
     (("--auto-radii",), dict(
         action=argparse.BooleanOptionalAction, default=True,
-        help="Auto-determine radii via terrain analysis (RVI only, default: enabled)")),
+        help="Auto-determine radii via terrain analysis (TopoUSM Fast only, default: enabled)")),
 ]
 
 TILE_ARGS: List[ArgSpec] = [
@@ -207,7 +207,7 @@ def build_algo_params(args: argparse.Namespace) -> dict:
     each algorithm's own knobs); pipeline-level options (pixel_size, nodata,
     output dtype/range, chunk, memory fraction) are handled by each ``execute``.
 
-    Spatial radii/weights are emitted for *every* algorithm (including RVI): the
+    Spatial radii/weights are emitted for *every* algorithm (including TopoUSM Fast): the
     Dask backend routes them through ``run_pipeline``'s ``radii`` parameter and the
     tile backend reads them straight from the algorithm params, so one rule serves
     both.  Platform-divergent extras (e.g. ``verbose`` on Dask) are included only

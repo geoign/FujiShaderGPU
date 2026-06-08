@@ -186,7 +186,7 @@ def _combine_multiscale_dask(
 def large_radius_threshold(gpu_arr: da.Array, fallback: int) -> int:
     """Radii above this are computed from a coarsened copy (no large halo).
 
-    Default = max(256, min_chunk // 16), matching the RVI threshold.
+    Default = max(256, min_chunk // 16), matching the TopoUSM Fast threshold.
     """
     try:
         min_chunk = min(min(gpu_arr.chunks[0]), min(gpu_arr.chunks[1]))
@@ -303,7 +303,7 @@ def coarse_large_radius_response(
 
     ``coarse_dem`` (a concrete CuPy overview read once from the COG, with its own
     ``coarse_decimation``) short-circuits the da.coarsen pass: the block function
-    runs on that single overview array directly.  This is the unified, RVI-style
+    runs on that single overview array directly.  This is the unified, TopoUSM Fast-style
     coarse source -- every algorithm derives its large radii from the same cheap
     decimated overview read instead of a full-resolution da.coarsen per algorithm.
     """
@@ -512,7 +512,7 @@ def _radius_to_downsample_factor(
     px = max(1e-3, float(pixel_size) if pixel_size else 1.0)
 
     algo_factor_map = {
-        "rvi": 1.15,
+        "topousm_fast": 1.15,
         "hillshade": 1.0,
         "slope": 1.0,
         "specular": 1.4,
@@ -587,7 +587,7 @@ def _downsample_nan_aware(block: cp.ndarray, factor: int) -> cp.ndarray:
     # extrapolated *every* void -- including the border-connected exterior --
     # falling back to the coarse global mean where the Gaussian support did not
     # reach.  That injected a flat plateau at the mean elevation just outside the
-    # data boundary.  The downstream large-radius operators (RVI mean-subtraction,
+    # data boundary.  The downstream large-radius operators (TopoUSM Fast mean-subtraction,
     # AO occlusion) are NaN-aware and would down-weight a NaN exterior to zero,
     # but a *finite* plateau is not excluded: it leaks into the interior valid
     # pixels and renders a broad halo along the periphery that destroys detail.
@@ -721,7 +721,7 @@ def hybrid_multiscale_response_combine(
     tile_full_shape=None,
     **block_kwargs,
 ) -> da.Array:
-    """RVI-style hybrid multiscale combine (bounded VRAM + accurate large scales).
+    """TopoUSM Fast-style hybrid multiscale combine (bounded VRAM + accurate large scales).
 
     Small scales (those NOT in ``large_fields``) are computed at full resolution as
     bounded-halo ``map_overlap`` fields.  Large scales arrive precomputed as
@@ -804,7 +804,7 @@ def compute_overview_scale_fields(
     coarse_dem: Optional[cp.ndarray] = None,
     decimation: Optional[float] = None,
 ):
-    """Per-large-scale response fields from the COG overview (RVI-style fast path).
+    """Per-large-scale response fields from the COG overview (TopoUSM Fast-style fast path).
 
     Runs ``block_fn(coarse, scale=r/decimation)`` for each large radius on a single
     decimated overview, returning ``({int(radius): cupy_field}, decimation)``.  Pass

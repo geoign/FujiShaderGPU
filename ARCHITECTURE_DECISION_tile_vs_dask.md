@@ -94,7 +94,7 @@ raster** (always discontinuous/wrong at boundaries).
 
 These do not close under a local halo and require whole-extent data movement /
 iterative propagation, so dask (or a dedicated global algorithm) is needed.
-**All of FujiShaderGPU's current algorithms are local** (hillshade/RVI/openness etc. =
+**All of FujiShaderGPU's current algorithms are local** (hillshade/TopoUSM Fast/openness etc. =
 finite halo), so this does not apply today, but it becomes **a decisive branch point
 if hydrology/visibility is added in the future**.
 
@@ -129,7 +129,7 @@ unnecessary, but dask is more robust against unexpectedly large halos/intermedia
 
 | Aspect | Current (all algorithms local + COG-centric) | Does dask's advantage apply? |
 |---|---|---|
-| hillshade / RVI / openness / AO / curvature etc. | Closes under a local halo | ✗ (tile is sufficient — if anything, superior) |
+| hillshade / TopoUSM Fast / openness / AO / curvature etc. | Closes under a local halo | ✗ (tile is sufficient — if anything, superior) |
 | Hydrology / visibility / cost distance | **Not implemented** | ◎ (if added later, dask or a dedicated global impl is required) |
 | Pathological beyond-VRAM cases | Avoided via tile size | △ (dask is a safety net) |
 | Zarr / multi-band / time series | COG-centric | ○ (dask if needed) |

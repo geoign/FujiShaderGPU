@@ -1,7 +1,7 @@
 """
-FujiShaderGPU/algorithms/_impl_rvi.py
+FujiShaderGPU/algorithms/_impl_topousm_fast.py
 
-RVI (Ridge-Valley Index) algorithm implementation.
+TopoUSM Fast algorithm implementation.
 Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ from ._nan_utils import (
 from ._global_stats import (
     apply_global_normalization,
 )
-from ._normalization import rvi_stat_func, rvi_norm_func
+from ._normalization import topousm_fast_stat_func, topousm_fast_norm_func
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +47,11 @@ def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
     return result
 
 
-def compute_rvi_efficient_block(block: cp.ndarray, *,
+def compute_topousm_fast_efficient_block(block: cp.ndarray, *,
                                radii: List[int] = [4, 16, 64],
                                weights: Optional[List[float]] = None,
                                pixel_size: float = 1.0) -> cp.ndarray:
-    """Efficient RVI computation (memory-optimized)."""
+    """Efficient TopoUSM Fast computation (memory-optimized)."""
     nan_mask = cp.isnan(block)
 
     if weights is None:
@@ -62,14 +62,14 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
         if len(weights) != len(radii):
             raise ValueError(f"Length of weights ({len(weights)}) must match length of radii ({len(radii)})")
 
-    rvi_combined = None
+    topousm_fast_combined = None
 
     for i, (radius, weight) in enumerate(zip(radii, weights)):
         ds_factor = _radius_to_downsample_factor(
             float(radius),
             block_shape=block.shape,
             pixel_size=pixel_size,
-            algorithm_name="rvi",
+            algorithm_name="topousm_fast",
         )
         if ds_factor > 1:
             small = _downsample_nan_aware(block, ds_factor)
@@ -87,19 +87,19 @@ def compute_rvi_efficient_block(block: cp.ndarray, *,
 
         diff = weight * (block - mean_elev)
 
-        if rvi_combined is None:
-            rvi_combined = diff
+        if topousm_fast_combined is None:
+            topousm_fast_combined = diff
         else:
-            rvi_combined += diff
+            topousm_fast_combined += diff
 
         del mean_elev, diff
 
-    rvi_combined = restore_nan(rvi_combined, nan_mask)
+    topousm_fast_combined = restore_nan(topousm_fast_combined, nan_mask)
 
-    return rvi_combined
+    return topousm_fast_combined
 
 
-def rvi_default_large_radius_threshold(min_chunk: int) -> int:
+def topousm_fast_default_large_radius_threshold(min_chunk: int) -> int:
     """Radii above this are computed from the COG overview (no large halo).
 
     Default = max(256, min_chunk // 16): radii within this are cheap to halo at
@@ -113,7 +113,7 @@ def split_radii_by_threshold(radii, weights, threshold):
     """Split (radii, weights) into (small, large) groups by ``threshold`` px.
 
     Weights are NOT renormalized: each group keeps its absolute weights so the
-    two partial RVI sums add back to the original full-radii RVI.
+    two partial TopoUSM Fast sums add back to the original full-radii TopoUSM Fast.
     """
     n = len(radii)
     if weights is None or len(weights) != n:
@@ -129,7 +129,7 @@ def split_radii_by_threshold(radii, weights, threshold):
     return small_r, small_w, large_r, large_w
 
 
-def compute_rvi_large_coarse_field(
+def compute_topousm_fast_large_coarse_field(
     coarse_dem: cp.ndarray,
     *,
     large_radii: List[int],
@@ -140,7 +140,7 @@ def compute_rvi_large_coarse_field(
 
     Returns ``Sum_i w_i * mean_{r_i}(coarse_dem)`` (NaN-aware), where ``r_i`` is
     the full-resolution radius scaled into the coarse grid by ``decimation``.
-    The full large-radius RVI is then ``W_large * block - upsample(field)``.
+    The full large-radius TopoUSM Fast is then ``W_large * block - upsample(field)``.
     """
     field = None
     for r, w in zip(large_radii, large_weights):
@@ -154,7 +154,7 @@ def compute_rvi_large_coarse_field(
     return field.astype(cp.float32)
 
 
-def _rvi_add_large_block(
+def _topousm_fast_add_large_block(
     block: cp.ndarray,
     *,
     coarse_field: cp.ndarray,
@@ -165,7 +165,7 @@ def _rvi_add_large_block(
     full_w: int,
     block_info=None,
 ) -> cp.ndarray:
-    """Large-radius RVI contribution for one block: W_large*block - upsample(field).
+    """Large-radius TopoUSM Fast contribution for one block: W_large*block - upsample(field).
 
     The coarse field is sampled at the block's *global* pixel positions
     (block-local location + (off_r, off_c)) so the result is seam-free across
@@ -185,11 +185,11 @@ def _rvi_add_large_block(
     return (cp.float32(w_large) * block - up).astype(cp.float32)
 
 
-def multiscale_rvi(gpu_arr: da.Array, *,
+def multiscale_topousm_fast(gpu_arr: da.Array, *,
                    radii: List[int],
                    weights: Optional[List[float]] = None,
                    pixel_size: float = 1.0) -> da.Array:
-    """Efficient multiscale RVI (Dask version)."""
+    """Efficient multiscale TopoUSM Fast (Dask version)."""
     if not radii:
         raise ValueError("At least one radius value is required")
 
@@ -202,7 +202,7 @@ def multiscale_rvi(gpu_arr: da.Array, *,
     depth = int(max_radius + 16)
 
     result = gpu_arr.map_overlap(
-        compute_rvi_efficient_block,
+        compute_topousm_fast_efficient_block,
         depth=depth,
         boundary="reflect",
         dtype=cp.float32,
@@ -215,21 +215,21 @@ def multiscale_rvi(gpu_arr: da.Array, *,
     return result
 
 
-def compute_rvi_input_sample_stats(
+def compute_topousm_fast_input_sample_stats(
     gpu_arr: da.Array,
     *,
     radii: List[int],
     weights: Optional[List[float]] = None,
     pixel_size: float = 1.0,
 ) -> tuple:
-    """Estimate RVI scale from a bounded central crop of the DEM.
+    """Estimate TopoUSM Fast scale from a bounded central crop of the DEM.
 
     A strided sample of the full-resolution Dask array (``gpu_arr[::n, ::n]``)
     looks cheap but forces *every* chunk -- i.e. the entire dataset -- to be read
     from disk and copied to the GPU before any write progress is visible, which
     stalls on very large rasters.  Reading a single contiguous central window
     only materializes the few chunks overlapping that window, giving a stable
-    global scale at a tiny, bounded cost.  ``compute_rvi_efficient_block`` already
+    global scale at a tiny, bounded cost.  ``compute_topousm_fast_efficient_block`` already
     downsamples large radii internally, so the original radii are used as-is.
     """
     h, w = gpu_arr.shape
@@ -244,7 +244,7 @@ def compute_rvi_input_sample_stats(
     x1 = min(int(w), x0 + win)
 
     logger.info(
-        "Estimating RVI global stats from central %dx%d window (radii=%s)",
+        "Estimating TopoUSM Fast global stats from central %dx%d window (radii=%s)",
         x1 - x0,
         y1 - y0,
         list(radii),
@@ -254,19 +254,19 @@ def compute_rvi_input_sample_stats(
     if getattr(sample, "size", 0) == 0:
         return (1.0,)
 
-    rvi_sample = compute_rvi_efficient_block(
+    topousm_fast_sample = compute_topousm_fast_efficient_block(
         sample.astype(cp.float32, copy=False),
         radii=[max(1, int(r)) for r in radii],
         weights=weights,
         pixel_size=float(pixel_size),
     )
-    stats = rvi_stat_func(rvi_sample)
-    logger.info("RVI global normalization stats estimated: abs_p80=%.6f", float(stats[0]))
+    stats = topousm_fast_stat_func(topousm_fast_sample)
+    logger.info("TopoUSM Fast global normalization stats estimated: abs_p80=%.6f", float(stats[0]))
     return stats
 
 
-class RVIAlgorithm(DaskAlgorithm):
-    """Ridge-Valley Index algorithm (efficient implementation)."""
+class TopoUSMFastAlgorithm(DaskAlgorithm):
+    """TopoUSM Fast algorithm (efficient implementation)."""
 
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         pixel_size = params.get('pixel_size', 1.0)
@@ -281,15 +281,15 @@ class RVIAlgorithm(DaskAlgorithm):
         # large radii contribute as `W_large*block - upsample(field)` (no halo),
         # and only the small radii are computed at full resolution.  Seam-free
         # via global coords (offset 0 for Dask, tile-window origin for tiles).
-        coarse_field = params.get("_rvi_coarse_field", None)
+        coarse_field = params.get("_topousm_fast_coarse_field", None)
         if coarse_field is not None:
-            small_r = params.get("_rvi_small_radii", [])
-            small_w = params.get("_rvi_small_weights", None)
-            w_large = float(params.get("_rvi_w_large", 0.0))
-            off_r, off_c = params.get("_rvi_field_offset", (0, 0))
-            full_h, full_w = params.get("_rvi_full_shape", gpu_arr.shape)
+            small_r = params.get("_topousm_fast_small_radii", [])
+            small_w = params.get("_topousm_fast_small_weights", None)
+            w_large = float(params.get("_topousm_fast_w_large", 0.0))
+            off_r, off_c = params.get("_topousm_fast_field_offset", (0, 0))
+            full_h, full_w = params.get("_topousm_fast_full_shape", gpu_arr.shape)
             large_part = gpu_arr.map_blocks(
-                _rvi_add_large_block,
+                _topousm_fast_add_large_block,
                 dtype=cp.float32,
                 meta=cp.empty((0, 0), dtype=cp.float32),
                 coarse_field=coarse_field,
@@ -300,13 +300,13 @@ class RVIAlgorithm(DaskAlgorithm):
                 full_w=int(full_w),
             )
             if small_r:
-                rvi = multiscale_rvi(
+                topousm_fast = multiscale_topousm_fast(
                     gpu_arr, radii=small_r, weights=small_w, pixel_size=pixel_size,
                 ) + large_part
             else:
-                rvi = large_part
+                topousm_fast = large_part
         else:
-            rvi = multiscale_rvi(gpu_arr, radii=radii, weights=weights, pixel_size=pixel_size)
+            topousm_fast = multiscale_topousm_fast(gpu_arr, radii=radii, weights=weights, pixel_size=pixel_size)
 
         # Prefer externally supplied global stats (tile backend computes once).
         stats = params.get("global_stats", None)
@@ -316,7 +316,7 @@ class RVIAlgorithm(DaskAlgorithm):
             and float(stats[0]) > 1e-9
         )
         if not stats_ok:
-            stats = compute_rvi_input_sample_stats(
+            stats = compute_topousm_fast_input_sample_stats(
                 gpu_arr,
                 radii=radii,
                 weights=weights,
@@ -325,8 +325,8 @@ class RVIAlgorithm(DaskAlgorithm):
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 1 and float(stats[0]) > 1e-9):
             stats = (1.0,)
 
-        return rvi.map_blocks(
-            lambda block: apply_global_normalization(block, rvi_norm_func, stats),
+        return topousm_fast.map_blocks(
+            lambda block: apply_global_normalization(block, topousm_fast_norm_func, stats),
             dtype=cp.float32,
             meta=cp.empty((0, 0), dtype=cp.float32)
         )
@@ -362,10 +362,10 @@ class RVIAlgorithm(DaskAlgorithm):
 
 __all__ = [
     "high_pass",
-    "compute_rvi_efficient_block",
-    "multiscale_rvi",
-    "RVIAlgorithm",
-    "rvi_default_large_radius_threshold",
+    "compute_topousm_fast_efficient_block",
+    "multiscale_topousm_fast",
+    "TopoUSMFastAlgorithm",
+    "topousm_fast_default_large_radius_threshold",
     "split_radii_by_threshold",
-    "compute_rvi_large_coarse_field",
+    "compute_topousm_fast_large_coarse_field",
 ]

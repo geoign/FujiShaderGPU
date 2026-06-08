@@ -52,13 +52,13 @@ slow full-resolution reads).
     (default `None` = the Dask whole-raster behavior), which is what makes the tile
     backend seam-free and identical to Dask.
   - `_global_stats.py` — `determine_optimal_downsample_factor`, `compute_global_stats`, `apply_global_normalization`, `apply_display_stretch_dask`
-  - `_normalization.py` — per-algorithm stats/normalization functions (`rvi_stat_func`, `robust_unsigned_stretch_stat_func`, etc.)
+  - `_normalization.py` — per-algorithm stats/normalization functions (`topousm_fast_stat_func`, `robust_unsigned_stretch_stat_func`, etc.)
   - `_norm_stats.py` — **backend-neutral** full-resolution normalization statistics:
     `_NORM_STAT_SPECS` (algorithm → raw block + stat function) and
     `_compute_norm_stats_tiled` (robust display stat pooled over stratified
     **full-resolution** tiles). Used by both backends so integer outputs match.
 - **Phase 2–3 algorithm implementation modules** (`_impl_*.py`):
-  - `_impl_rvi.py` — RVI (Ridge-Valley Index)
+  - `_impl_topousm_fast.py` — TopoUSM Fast
   - `_impl_hillshade.py` — Hillshade
   - `_impl_slope.py` — Slope
   - `_impl_specular.py` — Specular
@@ -166,7 +166,7 @@ slow full-resolution reads).
 
 Registered in `algorithms/dask_registry.py` (and `dask_shared.py` ALGORITHMS):
 
-- `rvi`
+- `topousm_fast`
 - `hillshade`
 - `slope`
 - `specular`
@@ -219,7 +219,7 @@ Otherwise output is written through COG flow.
 - For algorithms not reimplemented natively in tile code, `algorithms/tile/dask_bridge.py` delegates to Dask shared algorithm classes.
 - Optimized for local tile-based processing.
 - **Output parity with Dask.** In `spatial` mode the bridge routes every algorithm
-  except RVI through the Dask algorithm on the single tile (RVI keeps a bespoke
+  except TopoUSM Fast through the Dask algorithm on the single tile (TopoUSM Fast keeps a bespoke
   direct path; `local` mode keeps the fast direct paths). Combined with the unified
   overview large-radius field (§13.6) and shared full-resolution normalization stats
   (§14), the integer outputs are pixel-identical to the Dask-CUDA backend.
@@ -277,8 +277,8 @@ Otherwise output is written through COG flow.
   - `prepare` preprocessing: NoData fill modes and undeclared-NoData detection/override.
 - `test_cog_overviews.py`
   - COG overview pyramid presence/structure.
-- `test_rvi_normalization.py`
-  - RVI output normalization stability.
+- `test_topousm_fast_normalization.py`
+  - TopoUSM Fast output normalization stability.
 - `test_visual_saliency_normalization.py`
   - Visual saliency normalization.
 - `test_visual_saliency_tile_stability.py`
@@ -311,7 +311,7 @@ pytest -q -o addopts='' tests
 
 - Current structure treats modular algorithm files as canonical.
 - Algorithm implementations live in individual `_impl_*.py` modules; `dask_shared.py` is a thin re-export hub for backward compatibility.
-- `hillshade`, `slope`, `specular`, `atmospheric_scattering`, `curvature`, `ambient_occlusion`, `openness`, `multi_light_uncertainty`, `npr_edges` support unified local/spatial mode (`npr_edges` spatial = outlines at multiple smoothing scales; tile path bridges via Dask-shared). Intrinsically multi-scale algorithms (`rvi`, `multiscale_terrain`, `visual_saliency`, `scale_space_surprise`, `fractal_anomaly`) consume the unified `--radii` as their scale set.
+- `hillshade`, `slope`, `specular`, `atmospheric_scattering`, `curvature`, `ambient_occlusion`, `openness`, `multi_light_uncertainty`, `npr_edges` support unified local/spatial mode (`npr_edges` spatial = outlines at multiple smoothing scales; tile path bridges via Dask-shared). Intrinsically multi-scale algorithms (`topousm_fast`, `multiscale_terrain`, `visual_saliency`, `scale_space_surprise`, `fractal_anomaly`) consume the unified `--radii` as their scale set.
 
 ## 12. Dynamic GPU Optimization
 
@@ -346,7 +346,7 @@ Calibration anchors (derived from validated presets for known GPUs) are defined 
 ALGORITHM_COMPLEXITY = {
     "hillshade": 0.8,  "slope": 0.8,
     "atmospheric_scattering": 0.9,  "curvature": 1.0,
-    "npr_edges": 1.1,  "rvi": 1.2,
+    "npr_edges": 1.1,  "topousm_fast": 1.2,
     "visual_saliency": 1.4,
     "multiscale_terrain": 1.5,  "fractal_anomaly": 1.6,
     "openness": 1.8,  "ambient_occlusion": 2.0,  "specular": 2.0,
@@ -513,7 +513,7 @@ Orchestration (mirrored in `core/dask_processor.py` and `core/tile_processor.py`
   `multiscale_response_fields` / `coarse_large_radius_response`: each large radius runs
   the per-radius block on the overview and is bilinearly upsampled; small radii keep
   the exact full-resolution path.
-- **RVI** keeps a bespoke split (`Σ wᵢ(block − meanᵢ)`: large radii =
+- **TopoUSM Fast** keeps a bespoke split (`Σ wᵢ(block − meanᵢ)`: large radii =
   `W_large·block − upsample(Σ wᵢ·meanᵢ_overview)`), the biggest single saving.
 - Per-algorithm global stats that would otherwise vary per block (npr edge threshold,
   fractal relief p10/p75) are injected globally (§3.1) so the small-radius part is also
@@ -567,7 +567,7 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
 ### 14.2 Encoding rules
 
 - **NoData = 0** for both integer types (NaN → 0).
-- Normalized algorithms (RVI, fractal_anomaly, visual_saliency, scale_space_surprise,
+- Normalized algorithms (TopoUSM Fast, fractal_anomaly, visual_saliency, scale_space_surprise,
   multiscale_terrain, and the data-driven `ambient_occlusion` / `openness` stretch)
   derive their display scale from a **full-resolution stratified pre-pass**, not a
   decimated overview: `algorithms/_norm_stats.py::_compute_norm_stats_tiled` runs the
@@ -575,7 +575,7 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
   stratified across the valid extent, pools the interior pixels, and takes the robust
   stat (`_NORM_STAT_SPECS` maps each algorithm to its raw block + stat function; the
   robust **p99** = `NORMAL_PERCENTILE` — a p1→0 / p99→1 stretch for the unsigned maps,
-  a robust absolute-p99 scale for the signed RVI). Full
+  a robust absolute-p99 scale for the signed TopoUSM Fast). Full
   resolution keeps scale-sensitive magnitudes correct (decimating shrinks the detail
   and under-estimates the scale, which over-amplifies the output and blows out the
   integer encoding); pooling the whole extent is robust to off-center / sparse data
@@ -585,7 +585,7 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
   little past `±1`.
 - **No double normalization.** Algorithms that apply their own display stretch inside
   `.process()` (`apply_display_stretch_dask` in `ambient_occlusion` / `openness`, and
-  the internally-normalized RVI / multiscale_terrain / visual_saliency / fractal_anomaly)
+  the internally-normalized TopoUSM Fast / multiscale_terrain / visual_saliency / fractal_anomaly)
   are listed in `tile_processor.GLOBAL_STATS_NATIVE_ALGOS`, so the tile pipeline skips
   its own post-normalization for them — otherwise routing them through the Dask path
   would normalize twice and crush/blow the result.
@@ -615,7 +615,7 @@ the same registry so int outputs are consistent.
   `_format_algorithm_output`; tile profiles and the VRT/COG assembler inherit the
   integer dtype + NoData=0 from the tiles (data-driven, no extra plumbing).
 - After the COG is built, `apply_scale_offset` records the band scale/offset
-  (best-effort; non-critical).  Float-only display hints (e.g. RVI ±1) are skipped
+  (best-effort; non-critical).  Float-only display hints (e.g. TopoUSM Fast ±1) are skipped
   for integer outputs.
 
 Quantization is skipped (writes float32) when the algorithm changes the result

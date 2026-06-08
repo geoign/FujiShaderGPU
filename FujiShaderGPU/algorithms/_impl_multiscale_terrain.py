@@ -48,7 +48,7 @@ def _smooth_only_block(block, *, scale, **_ignored):
     Used for large scales: the *smooth* term is low-frequency so it can be
     computed on a coarsened copy and upsampled without losing accuracy, while the
     fine detail is recovered by subtracting it from the full-resolution block.
-    Computing the whole ``block - smooth`` detail on the coarse grid (as RVI /
+    Computing the whole ``block - smooth`` detail on the coarse grid (as TopoUSM Fast /
     specular do for their already-smooth responses) would instead drop every
     feature finer than the coarse pixel -- wrong for a detail field.
     """

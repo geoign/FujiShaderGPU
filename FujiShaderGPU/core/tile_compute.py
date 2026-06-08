@@ -6,14 +6,14 @@ from typing import Dict, Any, Iterable, Optional, Tuple, List
 import cupy as cp
 
 
-def _normalize_rvi_radii_and_weights(
+def _normalize_topousm_fast_radii_and_weights(
     target_distances,
     weights,
     pixel_size: float,
     manual_radii: Optional[Iterable] = None,
     manual_weights: Optional[Iterable] = None,
 ) -> Tuple[Optional[List[int]], Optional[List[float]]]:
-    """Convert tile-scale parameters into Dask-shared RVI radii/weights."""
+    """Convert tile-scale parameters into Dask-shared TopoUSM Fast radii/weights."""
     if pixel_size <= 0:
         pixel_size = 1.0
 
@@ -89,8 +89,8 @@ def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma
     else:
         dem_in = dem_gpu
 
-    if algorithm == 'rvi':
-        radii, rvi_weights = _normalize_rvi_radii_and_weights(
+    if algorithm == 'topousm_fast':
+        radii, topousm_fast_weights = _normalize_topousm_fast_radii_and_weights(
             target_distances=target_distances,
             weights=weights,
             pixel_size=pixel_size,
@@ -100,16 +100,16 @@ def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma
         params = {
             'multiscale_mode': multiscale_mode,
             'radii': radii,
-            'weights': rvi_weights,
+            'weights': topousm_fast_weights,
             'pixel_size': pixel_size,
             'sigma': sigma,
         }
         for key in (
             "global_stats", "downsample_factor",
             # Large-radius-from-overview fast path (set by process_dem_tiles /
-            # process_single_tile); RVIAlgorithm uses these instead of `radii`.
-            "_rvi_coarse_field", "_rvi_small_radii", "_rvi_small_weights",
-            "_rvi_w_large", "_rvi_full_shape", "_rvi_field_offset",
+            # process_single_tile); TopoUSMFastAlgorithm uses these instead of `radii`.
+            "_topousm_fast_coarse_field", "_topousm_fast_small_radii", "_topousm_fast_small_weights",
+            "_topousm_fast_w_large", "_topousm_fast_full_shape", "_topousm_fast_field_offset",
         ):
             if key in algo_params and algo_params[key] is not None:
                 params[key] = algo_params[key]

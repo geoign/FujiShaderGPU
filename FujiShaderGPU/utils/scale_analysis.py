@@ -43,8 +43,8 @@ def _analyze_scale_variances_scipy_fast(
         sigma = max(0.5, distance / pixel_size)
         blurred = gaussian_filter(dem_work, sigma=sigma, mode="nearest", truncate=4.0)
         # Take the difference from the source; keep NaN where the input is NaN
-        rvi = dem_2d - blurred
-        variance = float(np.nanvar(rvi))
+        topousm_fast = dem_2d - blurred
+        variance = float(np.nanvar(topousm_fast))
         variances.append(variance)
 
     return variances
@@ -148,11 +148,11 @@ def _analyze_scale_variances_ultra_fast(
             blurred = cpx_ndimage.gaussian_filter(
                 dem_filled, sigma=sigma, mode="nearest", truncate=4.0
             )
-            rvi = dem_gpu - blurred
+            topousm_fast = dem_gpu - blurred
             # Compute variance excluding NaN locations
-            variance = float(cp.nanvar(rvi))
+            variance = float(cp.nanvar(topousm_fast))
             variances.append(variance)
-            del blurred, rvi
+            del blurred, topousm_fast
 
         del dem_gpu, dem_filled
         return variances

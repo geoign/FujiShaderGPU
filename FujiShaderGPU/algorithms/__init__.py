@@ -12,7 +12,7 @@ except Exception:
 # Tile-side classes (same canonical names as Dask)
 try:
     from .tile_shared import TileAlgorithm  # noqa: F401
-    from .tile.rvi import RVIAlgorithm  # noqa: F401
+    from .tile.topousm_fast import TopoUSMFastAlgorithm  # noqa: F401
     from .tile.hillshade import HillshadeAlgorithm  # noqa: F401
     from .tile.slope import SlopeAlgorithm  # noqa: F401
     from .tile.specular import SpecularAlgorithm  # noqa: F401
@@ -30,7 +30,7 @@ try:
 
     __all__.extend([
         "TileAlgorithm",
-        "RVIAlgorithm",
+        "TopoUSMFastAlgorithm",
         "HillshadeAlgorithm",
         "SlopeAlgorithm",
         "SpecularAlgorithm",

@@ -1,7 +1,7 @@
 # FujiShaderGPU
 
 GPU-accelerated terrain visualization for **very large DEMs** (digital elevation
-models). Turn a height raster into a hillshade, ridge–valley map, slope, openness,
+models). Turn a height raster into a hillshade, TopoUSM relief, slope, openness,
 and more — written straight to a Cloud-Optimized GeoTIFF (COG) you can open in QGIS.
 
 - **Windows / macOS** — tile-based local GPU pipeline
@@ -42,7 +42,7 @@ FujiShaderGPU runs best on a COG that already has overviews. Two steps:
 # 1) Prepare your DEM once (any raster -> pipeline-ready COG, fills NoData holes)
 fujishadergpu-prepare raw_dem.tif dem.tif
 
-# 2) Run an algorithm (default is RVI, the ridge–valley index)
+# 2) Run an algorithm (default is TopoUSM Fast, multiscale topographic unsharp masking)
 fujishadergpu dem.tif shaded.tif --algorithm hillshade
 ```
 
@@ -53,10 +53,10 @@ That's it — `shaded.tif` is a COG you can drop into QGIS.
 
 ## Algorithms
 
-Choose one with `--algorithm <name>` (default: `rvi`):
+Choose one with `--algorithm <name>` (default: `topousm_fast`):
 
 ```text
-rvi   hillshade   slope   specular   atmospheric_scattering   multiscale_terrain
+topousm_fast   hillshade   slope   specular   atmospheric_scattering   multiscale_terrain
 blur   curvature   visual_saliency   npr_edges   ambient_occlusion   openness
 fractal_anomaly   scale_space_surprise   multi_light_uncertainty
 ```
@@ -68,7 +68,7 @@ fractal_anomaly   scale_space_surprise   multi_light_uncertainty
 
 | Option | What it does | Default |
 | --- | --- | --- |
-| `--algorithm NAME` | Which terrain analysis to run | `rvi` |
+| `--algorithm NAME` | Which terrain analysis to run | `topousm_fast` |
 | `--mode local\|spatial` | Single-neighborhood vs. multi-scale radius integration | `local` |
 | `--radii 4,16,64` | Scales (pixels) for spatial mode | auto by pixel size |
 | `--weights 0.5,0.3,0.2` | Per-radius weights | equal |
@@ -88,11 +88,11 @@ fujishadergpu dem.tif out.tif --algorithm hillshade
 # Spatial (multi-scale) slope with explicit radii + weights
 fujishadergpu dem.tif out.tif --algorithm slope --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
 
-# RVI with custom radii
-fujishadergpu dem.tif out.tif --algorithm rvi --radii 4,16,64,256
+# TopoUSM Fast with custom radii
+fujishadergpu dem.tif out.tif --algorithm topousm_fast --radii 4,16,64,256
 
 # Compact uint8 COG (~1/4 size) for visualization
-fujishadergpu dem.tif out.tif --algorithm rvi --output-dtype uint8
+fujishadergpu dem.tif out.tif --algorithm topousm_fast --output-dtype uint8
 
 # Zarr output (Linux / Dask path)
 fujishadergpu dem.tif out.zarr --algorithm scale_space_surprise

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # with normalize=False and the main-pass parameters; the stat function returns the
 # algorithm's native (offset, ..., scale) tuple consumed as ``global_stats``.
 _NORM_STAT_SPECS = {
-    "rvi": ("_impl_rvi", "compute_rvi_efficient_block", "rvi_stat_func"),
+    "topousm_fast": ("_impl_topousm_fast", "compute_topousm_fast_efficient_block", "topousm_fast_stat_func"),
     "fractal_anomaly": ("_impl_fractal_anomaly",
                         "compute_fractal_dimension_block", "fractal_stat_func"),
     "scale_space_surprise": ("_impl_experimental",

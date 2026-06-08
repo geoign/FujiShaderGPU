@@ -18,7 +18,7 @@ class BaseCLI(ABC):
 
     def _create_parser(self) -> argparse.ArgumentParser:
         supported_algorithms = self.get_supported_algorithms()
-        default_algorithm = supported_algorithms[0] if supported_algorithms else "rvi"
+        default_algorithm = supported_algorithms[0] if supported_algorithms else "topousm_fast"
 
         parser = argparse.ArgumentParser(
             description=self.get_description(),

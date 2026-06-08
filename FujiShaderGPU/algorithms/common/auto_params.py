@@ -5,7 +5,7 @@ from typing import List, Tuple
 
 
 def determine_optimal_radii(terrain_stats: dict) -> Tuple[List[int], List[float]]:
-    """Estimate RVI radii and weights from sampled terrain statistics."""
+    """Estimate TopoUSM Fast radii and weights from sampled terrain statistics."""
     complexity = terrain_stats.get('complexity_score', 0.5)
     if complexity > 0.7:
         radii = [3, 8, 20, 50]

@@ -172,7 +172,7 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
         # on a coarsened overview (no oversized halo -> accurate large --radii, no
         # rechunk-merge OOM).  The surprise then combines |smooth[i+1]-smooth[i]|.
         sorted_scales, pair_w = _sorted_scales_and_pair_weights(scales, weights)
-        # Hybrid coarse path (RVI-style): large scales' smooths come precomputed
+        # Hybrid coarse path (TopoUSM Fast-style): large scales' smooths come precomputed
         # from the COG overview (sampled per-block by global coords, no halo) and
         # the small scales are full-resolution bounded-halo fields, all fused in one
         # depth-0 combine.  Accurate large scales (no MAX_DEPTH halo truncation -> no

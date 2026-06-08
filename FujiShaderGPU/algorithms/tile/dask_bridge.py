@@ -290,11 +290,11 @@ def _direct_openness(block, params):
     )
 
 
-def _direct_rvi(block, params, algo):
+def _direct_topousm_fast(block, params, algo):
     from .._global_stats import apply_global_normalization
-    from .._impl_rvi import compute_rvi_efficient_block
+    from .._impl_topousm_fast import compute_topousm_fast_efficient_block
     from .._nan_utils import _bilinear_sample_coarse
-    from .._normalization import rvi_norm_func, rvi_stat_func
+    from .._normalization import topousm_fast_norm_func, topousm_fast_stat_func
 
     pixel_size = params.get("pixel_size", 1.0)
     radii = params.get("radii", None)
@@ -302,13 +302,13 @@ def _direct_rvi(block, params, algo):
     if radii is None:
         radii = algo._determine_optimal_radii(pixel_size)
 
-    coarse_field = params.get("_rvi_coarse_field", None)
+    coarse_field = params.get("_topousm_fast_coarse_field", None)
     if coarse_field is not None:
-        small_r = params.get("_rvi_small_radii", [])
-        small_w = params.get("_rvi_small_weights", None)
-        w_large = float(params.get("_rvi_w_large", 0.0))
-        off_r, off_c = params.get("_rvi_field_offset", (0, 0))
-        full_h, full_w = params.get("_rvi_full_shape", block.shape)
+        small_r = params.get("_topousm_fast_small_radii", [])
+        small_w = params.get("_topousm_fast_small_weights", None)
+        w_large = float(params.get("_topousm_fast_w_large", 0.0))
+        off_r, off_c = params.get("_topousm_fast_field_offset", (0, 0))
+        full_h, full_w = params.get("_topousm_fast_full_shape", block.shape)
         large_part = cp.float32(w_large) * block - _bilinear_sample_coarse(
             coarse_field,
             int(off_r), int(off_r) + int(block.shape[0]),
@@ -316,13 +316,13 @@ def _direct_rvi(block, params, algo):
             int(full_h), int(full_w),
         )
         if small_r:
-            rvi = compute_rvi_efficient_block(
+            topousm_fast = compute_topousm_fast_efficient_block(
                 block, radii=small_r, weights=small_w, pixel_size=pixel_size,
             ) + large_part
         else:
-            rvi = large_part.astype(cp.float32, copy=False)
+            topousm_fast = large_part.astype(cp.float32, copy=False)
     else:
-        rvi = compute_rvi_efficient_block(
+        topousm_fast = compute_topousm_fast_efficient_block(
             block, radii=radii, weights=weights, pixel_size=pixel_size,
         )
 
@@ -330,8 +330,8 @@ def _direct_rvi(block, params, algo):
     if not (
         isinstance(stats, (tuple, list)) and len(stats) >= 1 and float(stats[0]) > 1e-9
     ):
-        stats = rvi_stat_func(rvi)
-    return apply_global_normalization(rvi, rvi_norm_func, stats)
+        stats = topousm_fast_stat_func(topousm_fast)
+    return apply_global_normalization(topousm_fast, topousm_fast_norm_func, stats)
 
 
 def _direct_npr_edges(block, params):
@@ -399,7 +399,7 @@ def _process_direct(algo, class_name, dem_gpu, params):
     p = _merged_params(algo, params)
     # Spatial-mode multi-radius runs take the shared Dask overview path (large
     # radii sampled from one global overview, tile-origin aware) so the tile
-    # backend is seam-free and matches the Linux backend.  RVI and fractal keep
+    # backend is seam-free and matches the Linux backend.  TopoUSM Fast and fractal keep
     # their own overview-based direct paths; `local` mode keeps the fast direct
     # paths below (single radius -> no large halo, no seams).
     if str(p.get("mode", "local")).lower() == "spatial" and class_name in {
@@ -423,8 +423,8 @@ def _process_direct(algo, class_name, dem_gpu, params):
         return _direct_ambient_occlusion(dem_gpu, p)
     if class_name == "OpennessAlgorithm":
         return _direct_openness(dem_gpu, p)
-    if class_name == "RVIAlgorithm":
-        return _direct_rvi(dem_gpu, p, algo)
+    if class_name == "TopoUSMFastAlgorithm":
+        return _direct_topousm_fast(dem_gpu, p, algo)
     if class_name == "NPREdgesAlgorithm":
         return _direct_npr_edges(dem_gpu, p)
     # VisualSaliencyAlgorithm intentionally has no direct path: it is always

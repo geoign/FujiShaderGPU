@@ -45,7 +45,7 @@ def determine_optimal_downsample_factor(
     # Algorithm complexity factors (higher = more expensive)
     if algorithm_complexity is None:
         algorithm_complexity = {
-            'rvi': 1.2,                    # multiscale processing
+            'topousm_fast': 1.2,                    # multiscale processing
             'hillshade': 0.8,              # simple gradient computation
             'slope': 0.8,                  # simple gradient computation
             'specular': 1.5,               # roughness computation is heavy

@@ -954,14 +954,14 @@ def validate_inputs(src_cog: str):
         raise FileNotFoundError(f"Input file not found: {src_cog}")
 
 
-def _compute_rvi_overview_coarse_field(
+def _compute_topousm_fast_overview_coarse_field(
     src_cog: str,
     *,
     large_radii: List[int],
     large_weights: List[float],
     sample_max: int = 2048,
 ):
-    """Compute the large-radius RVI coarse field (Sum w*mean) from the COG overview.
+    """Compute the large-radius TopoUSM Fast coarse field (Sum w*mean) from the COG overview.
 
     Reading the stored overview (decimated read) avoids materialising the huge
     full-resolution halo a large radius would otherwise require.  The returned
@@ -972,10 +972,10 @@ def _compute_rvi_overview_coarse_field(
     if not large_radii:
         return None
     try:
-        from ..algorithms._impl_rvi import compute_rvi_large_coarse_field
+        from ..algorithms._impl_topousm_fast import compute_topousm_fast_large_coarse_field
         from rasterio.enums import Resampling
     except Exception as exc:
-        logger.warning("RVI overview coarse-field helpers unavailable: %s", exc)
+        logger.warning("TopoUSM Fast overview coarse-field helpers unavailable: %s", exc)
         return None
     try:
         with rasterio.open(src_cog) as src:
@@ -993,17 +993,17 @@ def _compute_rvi_overview_coarse_field(
                 np.isclose(sample, float(nodata), rtol=0.0, atol=1e-6), np.nan, sample
             ).astype(np.float32, copy=False)
         coarse_dem = cp.asarray(sample, dtype=cp.float32)
-        field = compute_rvi_large_coarse_field(
+        field = compute_topousm_fast_large_coarse_field(
             coarse_dem, large_radii=large_radii, large_weights=large_weights,
             decimation=float(scale),
         )
         logger.info(
-            "RVI large-radius overview field: decimation=%.1fx, large_radii=%s",
+            "TopoUSM Fast large-radius overview field: decimation=%.1fx, large_radii=%s",
             scale, list(large_radii),
         )
         return field
     except Exception as exc:
-        logger.warning("Failed to compute RVI overview coarse field: %s", exc)
+        logger.warning("Failed to compute TopoUSM Fast overview coarse field: %s", exc)
         return None
 
 
@@ -1044,7 +1044,7 @@ def _estimate_output_range(result_gpu: da.Array,
 def run_pipeline(
     src_cog: str,
     dst_cog: str,
-    algorithm: str = "rvi",
+    algorithm: str = "topousm_fast",
     radii: Optional[List[int]] = None,
     agg: str = "mean",
     chunk: Optional[int] = None,
@@ -1196,8 +1196,8 @@ def run_pipeline(
         else:
             logger.info(f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m")
         
-        # 6-2.5) Auto-determination (for the RVI algorithm)
-        if algorithm == "rvi":
+        # 6-2.5) Auto-determination (for the TopoUSM Fast algorithm)
+        if algorithm == "topousm_fast":
             pixel_size = float(params.get('pixel_size', 1.0))
             
             # Make the new efficient mode the default
@@ -1232,18 +1232,18 @@ def run_pipeline(
             else:
                 raise ValueError("Either provide radii or enable auto_radii")
 
-        # Many algorithms need the pixel size (for non-RVI cases)
-        elif algorithm != "rvi" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
+        # Many algorithms need the pixel size (for non-TopoUSM Fast cases)
+        elif algorithm != "topousm_fast" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
             # Already injected above; keep this branch as a no-op for compatibility.
             params['pixel_size'] = float(params.get('pixel_size', 1.0))
 
         # CLI passes explicit radii through run_pipeline's top-level radii
-        # parameter, so restore it for non-RVI spatial algorithms.
-        if algorithm != "rvi" and radii is not None:
+        # parameter, so restore it for non-TopoUSM Fast spatial algorithms.
+        if algorithm != "topousm_fast" and radii is not None:
             params['radii'] = radii
             logger.info(f"Setting radii for {algorithm}: {radii}")
 
-        # Normalized algorithms (RVI/fractal_anomaly/scale_space_surprise/
+        # Normalized algorithms (TopoUSM Fast/fractal_anomaly/scale_space_surprise/
         # visual_saliency/multiscale_terrain): derive the display range
         # (-1..1 / 0..1) from a robust p99 of the algorithm's own FULL-RESOLUTION
         # output, pooled over tiles stratified across the whole valid extent.
@@ -1287,7 +1287,7 @@ def run_pipeline(
 
         # Unified coarse source: read ONE decimated overview of the DEM and share it
         # across every algorithm's large-radius path (the coarse-overview combine is
-        # the seam-free, memory-bounded RVI method).  All multiscale algorithms then
+        # the seam-free, memory-bounded TopoUSM Fast method).  All multiscale algorithms then
         # derive their large radii from this single cheap read instead of a
         # full-resolution da.coarsen pass each.  Injected for any spatial run with
         # explicit radii; algorithms that do not use the coarse path ignore it.
@@ -1312,7 +1312,7 @@ def run_pipeline(
             except Exception as exc:
                 logger.warning("Unified overview coarse source unavailable: %s", exc)
 
-        # fractal_anomaly / visual_saliency hybrid coarse path (RVI-style): when the
+        # fractal_anomaly / visual_saliency hybrid coarse path (TopoUSM Fast-style): when the
         # user gives explicit large --radii, precompute their per-scale response
         # fields (roughness / smooth) from the COG overview.  The algorithm then
         # computes small radii at full resolution and samples these large fields with
@@ -1372,39 +1372,39 @@ def run_pipeline(
                     "%s hybrid overview path unavailable; using single-block path: %s",
                     algorithm, exc)
 
-        # RVI large-radius-from-overview fast path: split radii at a chunk-aware
+        # TopoUSM Fast large-radius-from-overview fast path: split radii at a chunk-aware
         # threshold; compute the large-radius contribution from the COG overview
         # (no huge per-chunk halo) and let the algorithm add it to the small-radius
-        # full-resolution RVI.  Any failure falls back to the full-resolution path.
+        # full-resolution TopoUSM Fast.  Any failure falls back to the full-resolution path.
         if (
-            algorithm == "rvi"
+            algorithm == "topousm_fast"
             and not is_zarr_path(src_cog)
-            and "_rvi_coarse_field" not in params
+            and "_topousm_fast_coarse_field" not in params
         ):
             try:
-                from ..algorithms._impl_rvi import (
-                    rvi_default_large_radius_threshold,
+                from ..algorithms._impl_topousm_fast import (
+                    topousm_fast_default_large_radius_threshold,
                     split_radii_by_threshold,
                 )
                 _full_radii = list(params.get("radii") or [])
                 if _full_radii:
-                    _threshold = rvi_default_large_radius_threshold(int(chunk))
+                    _threshold = topousm_fast_default_large_radius_threshold(int(chunk))
                     _sr, _sw, _lr, _lw = split_radii_by_threshold(
                         _full_radii, params.get("weights"), _threshold
                     )
                     if _lr:
-                        _field = _compute_rvi_overview_coarse_field(
+                        _field = _compute_topousm_fast_overview_coarse_field(
                             src_cog, large_radii=_lr, large_weights=_lw,
                         )
                         if _field is not None:
-                            params["_rvi_coarse_field"] = _field
-                            params["_rvi_small_radii"] = _sr
-                            params["_rvi_small_weights"] = _sw
-                            params["_rvi_w_large"] = float(sum(_lw))
-                            params["_rvi_full_shape"] = tuple(int(s) for s in gpu_arr.shape)
-                            params["_rvi_field_offset"] = (0, 0)
+                            params["_topousm_fast_coarse_field"] = _field
+                            params["_topousm_fast_small_radii"] = _sr
+                            params["_topousm_fast_small_weights"] = _sw
+                            params["_topousm_fast_w_large"] = float(sum(_lw))
+                            params["_topousm_fast_full_shape"] = tuple(int(s) for s in gpu_arr.shape)
+                            params["_topousm_fast_field_offset"] = (0, 0)
                             logger.info(
-                                "RVI overview large-radius path: small=%s, large=%s "
+                                "TopoUSM Fast overview large-radius path: small=%s, large=%s "
                                 "(threshold=%dpx) -> per-chunk halo from %d to %d px",
                                 _sr, _lr, _threshold,
                                 max(_full_radii) + 16,
@@ -1412,15 +1412,15 @@ def run_pipeline(
                             )
             except Exception as exc:
                 logger.warning(
-                    "RVI overview large-radius path unavailable; using full-resolution radii: %s",
+                    "TopoUSM Fast overview large-radius path unavailable; using full-resolution radii: %s",
                     exc,
                 )
 
         # 6-3) Run the algorithm (within run_pipeline)
-        # Redact bulky internal arrays (e.g. the RVI coarse field) from logs/metadata.
+        # Redact bulky internal arrays (e.g. the TopoUSM Fast coarse field) from logs/metadata.
         _log_params = {
             k: v for k, v in params.items()
-            if not (k.startswith("_rvi_coarse_field")
+            if not (k.startswith("_topousm_fast_coarse_field")
                     or k in ("_fractal_large_fields", "_vs_large_fields",
                              "_sss_large_fields", "_overview_coarse_dem"))
         }
@@ -1441,8 +1441,8 @@ def run_pipeline(
 
         # Drop internal helper arrays so they never reach COG metadata (str(params)).
         for _k in (
-            "_rvi_coarse_field", "_rvi_small_radii", "_rvi_small_weights",
-            "_rvi_w_large", "_rvi_full_shape", "_rvi_field_offset",
+            "_topousm_fast_coarse_field", "_topousm_fast_small_radii", "_topousm_fast_small_weights",
+            "_topousm_fast_w_large", "_topousm_fast_full_shape", "_topousm_fast_field_offset",
             "_fractal_large_fields", "_fractal_full_shape",
             "_vs_large_fields", "_vs_full_shape",
             "_sss_large_fields", "_sss_full_shape",
@@ -1472,7 +1472,7 @@ def run_pipeline(
             # (uint8: 0..255, int16: raw codes) with NoData=0 and NO GDAL
             # scale/offset metadata.  Embedding scale/offset makes QGIS auto-
             # unscale the band and present it as Float32 over the physical range
-            # (e.g. RVI -1.5..1.5), which looks "quantized float with NoData=0"
+            # (e.g. TopoUSM Fast -1.5..1.5), which looks "quantized float with NoData=0"
             # and is confusing for a display product.  The DN<->value mapping is
             # still logged and recorded in the COG 'parameters'/value_range attrs
             # for anyone who needs to recover physical units.
@@ -1546,7 +1546,7 @@ def run_pipeline(
                 "unit": unit,
                 "data_type": "float32"
             }
-        elif algorithm in ['rvi', 'fractal_anomaly']:
+        elif algorithm in ['topousm_fast', 'fractal_anomaly']:
             # Signed terrain anomaly outputs map p80(abs(value)) to +/-1,
             # with overflow preserved for strong extrema.
             attrs = {

@@ -30,14 +30,14 @@ class WindowsCLI(BaseCLI):
     def get_epilog(self) -> str:
         return """
 Examples:
-  # RVI (Ridge-Valley Index)
+  # TopoUSM Fast
   fujishadergpu input.tif output.tif
 
   # Hillshade
   fujishadergpu input.tif output.tif --algorithm hillshade
 
-  # Spatial RVI (manual radii)
-  fujishadergpu input.tif output.tif --algorithm rvi --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
+  # Spatial TopoUSM Fast (manual radii)
+  fujishadergpu input.tif output.tif --algorithm topousm_fast --mode spatial --radii 4,16,64 --weights 0.5,0.3,0.2
 
   # COG generation only (from existing tiles)
   fujishadergpu dummy.tif output.tif --cog-only --tmp-dir existing_tiles
@@ -61,7 +61,7 @@ Note: Windows and Linux share the same algorithm names and options.
                 self.parser.error(f"--cog-only mode requires a tile directory: {args.tmp_dir}")
             args._skip_input_check = True
 
-        if args.algorithm == "rvi" and not getattr(args, "no_auto_scale", False):
+        if args.algorithm == "topousm_fast" and not getattr(args, "no_auto_scale", False):
             self.logger.info("When radii are omitted, scales are auto-determined via terrain analysis")
         if args.cog_backend == "external" and not args.gdal_bin_dir:
             self.logger.warning(
