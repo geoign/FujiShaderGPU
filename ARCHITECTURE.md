@@ -84,15 +84,13 @@ slow full-resolution reads).
   - Most tile algorithms import their implementation from `dask_shared.py` via `tile/dask_bridge.py`.
 - `common/kernels.py`
   - Shared CuPy kernels used by both Dask and Tile.
-- `common/auto_params.py`
-  - Shared auto-parameter helpers (e.g., radii derivation).
 - `common/spatial_mode.py`
-  - Shared local/spatial execution helpers:
-    - spatial radii/weights auto-derivation from YAML presets
-    - NaN-aware radius smoothing
-    - multi-radius weighted aggregation
-- `config/spatial_presets.yaml`
-  - Spatial auto presets keyed by pixel-size bins (meters).
+  - Shared local/spatial helpers, including the spatial radii/weights auto rule:
+    geometric radii `[2,8,32,128,512,2048]` truncated so the largest is
+    `<= min(DEM_short_side/10, 2048)`, with a `2**n` (near-weighted) weight
+    profile normalized to 1.  Used by every radius-driven spatial algorithm
+    (`RADII_DRIVEN_ALGOS`) on both backends; the orchestrators resolve it once
+    from the full-raster short side and inject explicit `radii`/`weights`.
   - Current bins:
     - `<5`
     - `5~25`
@@ -155,7 +153,7 @@ slow full-resolution reads).
 - `config/auto_tune.py` — VRAM-based dynamic performance parameter computation (single source of truth)
 - `config/gpu_config_manager.py`, `config/system_config.py`, `config/gdal_config.py`
 - `config/gpu_presets.yaml` — reference anchor values (no longer primary; `auto_tune.py` is authoritative)
-- `utils/scale_analysis.py`, `utils/nodata_handler.py`, `utils/types.py`
+- `utils/nodata_handler.py`, `utils/types.py`
 - `utils/paths.py` — filesystem path helpers shared across backends. `resolve_tmp_dir`
   (env-driven staging dir), and the **virtual-filesystem-safe** `safe_abspath` /
   `safe_unlink` used when output/temp paths live on a FUSE mount (rclone / cloud
@@ -305,7 +303,7 @@ pytest -q -o addopts='' tests
 5. `FujiShaderGPU/core/dask_cluster.py`, `FujiShaderGPU/core/dask_io.py`, `FujiShaderGPU/core/tile_io.py`, `FujiShaderGPU/core/tile_compute.py`
 6. `FujiShaderGPU/algorithms/dask_registry.py`
 7. `FujiShaderGPU/algorithms/dask/*.py` and `FujiShaderGPU/algorithms/tile/*.py`
-8. `FujiShaderGPU/algorithms/common/kernels.py` and `FujiShaderGPU/algorithms/common/auto_params.py`
+8. `FujiShaderGPU/algorithms/common/kernels.py` and `FujiShaderGPU/algorithms/common/spatial_mode.py`
 
 ## 11. Notes
 

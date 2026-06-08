@@ -15,7 +15,6 @@ from ..core.tile_compute import (
 )
 from ..io.raster_info import detect_pixel_size_from_cog, metric_pixel_scales_from_metadata
 from ..utils.types import TileResult
-from ..utils.scale_analysis import analyze_terrain_scales, _get_default_scales
 from ..io.cog_builder import _build_vrt_and_cog_ultra_fast
 from ..io.cog_validator import _validate_cog_for_qgis
 from ..io.output_encoding import (
@@ -80,6 +79,10 @@ GLOBAL_STATS_NATIVE_ALGOS = {
 # must NOT apply its generic [0,1] display normalization to it.
 NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges", "blur"}
 SIGNED_NORMALIZATION_ALGOS = {"topousm_fast", "fractal_anomaly"}
+
+# Algorithms whose spatial radii/weights are auto-derived from the DEM short side
+# via the shared rule (single source of truth in algorithms.common.spatial_mode).
+from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS as AUTO_SPATIAL_RADII_ALGOS
 
 
 def _sanitize_spatial_radii_weights_for_tile(
@@ -243,7 +246,7 @@ def _required_padding_for_algorithm(
     required = max(32, base)
 
     _MAX_DEPTH = 150  # keep in sync with algorithms._base.Constants.MAX_DEPTH
-    _mode = str(algo_params.get("mode", "local")).lower()
+    _mode = str(algo_params.get("mode", "spatial")).lower()
     _is_geo = bool(algo_params.get("is_geographic_dem", False))
     # Overview path engaged for these runs (mirrors the injection gate); large
     # radii then come from the overview and need no per-tile halo.
@@ -346,10 +349,10 @@ def _required_padding_for_algorithm(
         radii = algo_params.get("radii")
         if not radii:
             try:
-                from ..algorithms.common.spatial_mode import determine_spatial_profile
-                radii, _ = determine_spatial_profile(pixel_size=float(pixel_size))
+                from ..algorithms.common.spatial_mode import auto_spatial_radii
+                radii = auto_spatial_radii(None)
             except Exception:
-                radii = [2, 4, 16, 64]
+                radii = [2, 8, 32, 128]
         try:
             radii_f = [float(r) for r in radii if float(r) > 0]
             if _overview_active:
@@ -406,15 +409,15 @@ def _estimate_scale_count(
                 return len(scales)
             return 4 if algorithm == "visual_saliency" else 5
 
-        mode = str(algo_params.get("mode", "local")).lower()
+        mode = str(algo_params.get("mode", "spatial")).lower()
         if mode == "spatial":
             radii = algo_params.get("radii")
             if not radii:
                 try:
-                    from ..algorithms.common.spatial_mode import determine_spatial_profile
-                    radii, _ = determine_spatial_profile(pixel_size=float(pixel_size))
+                    from ..algorithms.common.spatial_mode import auto_spatial_radii
+                    radii = auto_spatial_radii(None)
                 except Exception:
-                    radii = [2, 4, 16, 64]
+                    radii = [2, 8, 32, 128]
             return max(1, len(radii))
     except Exception:
         pass
@@ -1592,14 +1595,38 @@ def process_dem_tiles(
         # Stable defaults for tile-consistent hillshade output.
         algo_params.setdefault("contrast_enhance", False)
         algo_params.setdefault("z_factor", 1.0)
-    
-    # Scale analysis (TopoUSM Fast only)
-    if algorithm == "topousm_fast" and multiscale_mode and auto_scale_analysis:
-        target_distances, weights = analyze_terrain_scales(input_cog_path, pixel_size)
-    elif algorithm == "topousm_fast" and multiscale_mode:
-        target_distances, weights = _get_default_scales()
-    else:
-        target_distances, weights = None, None
+
+    # Spatial-mode auto radii/weights (shared rule): geometric radii truncated by
+    # the input DEM short side + a 2**n weight profile.  Resolved ONCE here from
+    # the full-raster dimensions and injected into algo_params so every downstream
+    # path (padding/cost estimate, global stats, per-tile compute) uses the same
+    # explicit values.  topousm_fast is spatial whenever multiscale_mode is on;
+    # the other radius-driven algorithms key off --mode spatial.
+    _mode_now = str(algo_params.get("mode", "spatial")).lower()
+    _wants_auto = (
+        algorithm in AUTO_SPATIAL_RADII_ALGOS
+        and not algo_params.get("radii")
+        and (multiscale_mode if algorithm == "topousm_fast" else _mode_now == "spatial")
+    )
+    if _wants_auto:
+        try:
+            with rasterio.open(input_cog_path) as _src:
+                _short_side = min(int(_src.width), int(_src.height))
+            from ..algorithms.common.spatial_mode import auto_spatial_profile
+            _auto_r, _auto_w = auto_spatial_profile(_short_side)
+            algo_params["radii"] = _auto_r
+            if not algo_params.get("weights"):
+                algo_params["weights"] = _auto_w
+            logger.info(
+                "Auto spatial radii (short_side=%d px): radii=%s, weights=%s",
+                _short_side, _auto_r, [round(w, 3) for w in _auto_w],
+            )
+        except Exception as exc:
+            logger.warning("Auto spatial radii determination failed: %s", exc)
+
+    # Radii now live in algo_params (explicit pixel radii); the per-algorithm
+    # padding/cost/normalization paths read them directly.
+    target_distances, weights = None, None
 
     # Get GPU configuration
     gpu_config = get_gpu_config(
@@ -1619,7 +1646,7 @@ def process_dem_tiles(
     if max_workers is None:
         max_workers = gpu_config["max_workers"]
 
-    mode_norm = str(algo_params.get("mode", "local")).lower()
+    mode_norm = str(algo_params.get("mode", "spatial")).lower()
     spatial_algorithms = {
         "hillshade",
         "slope",
@@ -1631,13 +1658,14 @@ def process_dem_tiles(
         "multi_light_uncertainty",
     }
     if mode_norm == "spatial" and algorithm in spatial_algorithms:
-        # Resolve auto profile early so padding/cost estimation uses the effective list.
+        # Radii are normally injected above from the DEM short side; this is a
+        # defensive fallback (full geometric sequence) if that was skipped.
         if algo_params.get("radii", None) is None:
             try:
-                from ..algorithms.common.spatial_mode import determine_spatial_profile
-                auto_radii, auto_weights = determine_spatial_profile(pixel_size=float(pixel_size))
+                from ..algorithms.common.spatial_mode import auto_spatial_profile
+                auto_radii, auto_weights = auto_spatial_profile(None)
                 algo_params["radii"] = auto_radii
-                if algo_params.get("weights", None) is None and auto_weights is not None:
+                if algo_params.get("weights", None) is None and auto_weights:
                     algo_params["weights"] = auto_weights
             except Exception:
                 pass
@@ -1866,7 +1894,7 @@ def process_dem_tiles(
                     )
             except Exception:
                 pass
-            requested_mode = str(algo_params.get("mode", "local")).lower()
+            requested_mode = str(algo_params.get("mode", "spatial")).lower()
             user_radii_specified = ("radii" in algo_params) and (algo_params.get("radii") is not None)
             user_weights_specified = ("weights" in algo_params) and (algo_params.get("weights") is not None)
             # Spatial preset may include large radii (up to 512px). For small rasters,
@@ -1939,7 +1967,7 @@ def process_dem_tiles(
                     f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m"
                 )
 
-            mode = str(algo_params.get("mode", "local")).lower()
+            mode = str(algo_params.get("mode", "spatial")).lower()
             global_stats_required = _is_global_stats_required(algorithm, mode)
             if algorithm == "specular" and bool(algo_params.get("is_geographic_dem", False)):
                 # Geographic specular uses per-tile local meter scaling.
@@ -2345,12 +2373,12 @@ def resume_cog_generation(
     except Exception as e:
         logger.warning(f"Tile info retrieval warning: {e}")
     
-    # Get GPU configuration (considering the original processing settings)
+    # Get GPU configuration (considering the original processing settings).
+    # COG-resume only sizes padding; no per-radius compute happens here.
     try:
-        target_distances, weights = _get_default_scales()
         gpu_config = get_gpu_config(
             sigma=sigma, multiscale_mode=multiscale_mode,
-            pixel_size=pixel_size, target_distances=target_distances,
+            pixel_size=pixel_size, target_distances=None,
         )
     except Exception as e:
         logger.warning(f"GPU configuration warning: {e}; using default settings")

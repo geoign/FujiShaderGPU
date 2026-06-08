@@ -12,7 +12,7 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter, zoom
 
 from ._base import Constants
-from .common.spatial_mode import determine_spatial_radii, determine_spatial_profile
+from .common.spatial_mode import auto_spatial_radii, auto_spatial_profile, auto_spatial_weights
 
 
 def handle_nan_with_gaussian(block: cp.ndarray, sigma: float, mode: str = 'nearest') -> Tuple[cp.ndarray, cp.ndarray]:
@@ -73,7 +73,7 @@ def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0,
 def _normalize_spatial_radii(radii: Optional[List[int]], pixel_size: float) -> List[int]:
     """Normalize user-provided radii or auto-derive stable defaults."""
     if radii is None:
-        return determine_spatial_radii(pixel_size=pixel_size)
+        return auto_spatial_radii(None)
     out: List[int] = []
     for r in radii:
         try:
@@ -83,7 +83,7 @@ def _normalize_spatial_radii(radii: Optional[List[int]], pixel_size: float) -> L
         if rv > 0:
             out.append(rv)
     if not out:
-        return determine_spatial_radii(pixel_size=pixel_size)
+        return auto_spatial_radii(None)
     # Keep user order while dropping duplicates.
     seen = set()
     ordered = []
@@ -98,27 +98,46 @@ def _resolve_spatial_radii_weights(
     radii: Optional[List[int]],
     weights: Optional[List[float]],
     pixel_size: float,
+    short_side_px: Optional[float] = None,
 ) -> Tuple[List[int], Optional[List[float]]]:
-    """Resolve radii/weights with YAML presets when user values are omitted."""
+    """Resolve radii/weights with the DEM-size-aware auto rule.
+
+    Orchestrators (process_dem_tiles / run_pipeline) normally inject explicit
+    radii+weights derived from the *full* DEM short side, so the ``radii is None``
+    branch here is only a defensive fallback (``short_side_px=None`` -> full
+    geometric sequence).  When radii are present but weights are omitted, the
+    ``2**n`` weight profile is applied.
+    """
     if radii is None:
-        auto_radii, auto_weights = determine_spatial_profile(pixel_size=pixel_size)
-        return auto_radii, auto_weights if weights is None else weights
+        auto_radii, auto_weights = auto_spatial_profile(short_side_px)
+        if isinstance(weights, (list, tuple)) and len(weights) == len(auto_radii):
+            user = _clean_normalized_weights(weights)
+            if user is not None:
+                return auto_radii, user
+        return auto_radii, auto_weights
 
     resolved_radii = _normalize_spatial_radii(radii, pixel_size)
-    if not isinstance(weights, (list, tuple)) or len(weights) != len(resolved_radii):
-        return resolved_radii, None
+    if isinstance(weights, (list, tuple)) and len(weights) == len(resolved_radii):
+        user = _clean_normalized_weights(weights)
+        if user is not None:
+            return resolved_radii, user
+    # Weights omitted or invalid: fall back to the 2**n profile (nearer = heavier).
+    return resolved_radii, auto_spatial_weights(len(resolved_radii))
 
+
+def _clean_normalized_weights(weights) -> Optional[List[float]]:
+    """Sanitize and L1-normalize weights; None if all non-positive/invalid."""
     cleaned: List[float] = []
     for w in weights:
         try:
             fv = float(w)
         except (TypeError, ValueError):
-            return resolved_radii, None
+            return None
         cleaned.append(fv if np.isfinite(fv) and fv > 0 else 0.0)
     s = float(sum(cleaned))
     if s <= 0:
-        return resolved_radii, None
-    return resolved_radii, [v / s for v in cleaned]
+        return None
+    return [v / s for v in cleaned]
 
 
 def resolve_block_weights(weights, n: int) -> Optional[cp.ndarray]:

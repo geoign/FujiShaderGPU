@@ -37,8 +37,9 @@ PIPELINE_ARGS: List[ArgSpec] = [
         type=str, default=None,
         help="Explicit quantization range 'lo,hi' (e.g. 0,90); defaults to the algorithm's native range")),
     (("--mode",), dict(
-        choices=["local", "spatial"], default="local",
-        help="Compute mode: local (neighborhood) / spatial (radius integration). With spatial and no radii, YAML presets are used")),
+        choices=["local", "spatial"], default="spatial",
+        help="Compute mode: spatial (multi-radius integration, default) / local (single neighborhood). "
+             "With spatial and no --radii, radii are auto-derived from the DEM short side")),
     (("--radii",), dict(
         type=str,
         help="Explicit spatial radii (px), e.g. 4,16,64; when omitted, YAML is auto-selected by pixel size")),
@@ -217,7 +218,7 @@ def build_algo_params(args: argparse.Namespace) -> dict:
     p: dict = {}
 
     # Universal controls.
-    p["mode"] = getattr(args, "mode", "local")
+    p["mode"] = getattr(args, "mode", "spatial")
     p["agg"] = getattr(args, "agg", "mean")
     p["intensity"] = getattr(args, "intensity", 1.0)
     if getattr(args, "radii_list", None):

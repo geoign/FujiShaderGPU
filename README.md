@@ -72,9 +72,9 @@ fractal_anomaly   scale_space_surprise   multi_light_uncertainty
 | Option | What it does | Default |
 | --- | --- | --- |
 | `--algorithm NAME` | Which terrain analysis to run | `topousm_fast` |
-| `--mode local\|spatial` | Single-neighborhood vs. multi-scale radius integration | `local` |
-| `--radii 4,16,64` | Scales (pixels) for spatial mode | auto by pixel size |
-| `--weights 0.5,0.3,0.2` | Per-radius weights | equal |
+| `--mode spatial\|local` | Multi-scale radius integration vs. single neighborhood | `spatial` |
+| `--radii 4,16,64` | Scales (pixels) for spatial mode | auto: `2,8,32,128,512,2048` truncated to ≤ DEM short side ÷ 10 (max 2048) |
+| `--weights 0.5,0.3,0.2` | Per-radius weights | auto: 2ⁿ profile, near scales weighted most, normalized to 1 |
 | `--output-dtype float32\|int16\|uint8` | Smaller files for viewing (`int16`≈½, `uint8`≈¼) | `float32` |
 | `--nodata VALUE` | Treat this value as NoData (e.g. `-9999`, `nan`) | declared |
 | `--pixel-size METERS` | Override pixel size | auto-detected |

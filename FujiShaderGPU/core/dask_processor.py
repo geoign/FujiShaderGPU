@@ -42,7 +42,7 @@ except ImportError:
     ALGORITHMS = {}
     logging.warning("dask registry module not found. No algorithms available.")
 
-from ..algorithms.common.auto_params import determine_optimal_radii
+from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS
 from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
 from ..algorithms._impl_npr_edges import _compute_npr_grad_stats
 from ..algorithms._norm_stats import (
@@ -207,90 +207,6 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
 ###############################################################################
 # 3. Automatic parameter determination via terrain analysis
 ###############################################################################
-
-def analyze_terrain_characteristics(dem_arr: da.Array, src_path: "str | None" = None) -> dict:
-    """Analyze terrain characteristics holistically.
-
-    Samples a coarse, FULL-EXTENT view of the DEM rather than a fixed center
-    crop, so datasets whose valid data is off-center or sparse (e.g. an
-    L-shaped footprint whose raster center is entirely NoData) are handled
-    correctly.  When the source COG path is provided the sample is read from a
-    low-resolution overview (cheap, full-extent); otherwise a strided
-    decimation of the in-memory array is used.  The decimation factor ``decim``
-    is divided back out of the gradient so ``mean_slope`` stays in
-    per-original-pixel units and remains comparable across resolutions.
-    """
-    h, w = dem_arr.shape
-    sample = None
-    decim = 1
-
-    # Preferred: a low-resolution, full-extent overview from the source COG.
-    if src_path is not None and not is_zarr_path(src_path):
-        try:
-            from rasterio.enums import Resampling
-            target = 2048
-            with rasterio.open(src_path) as src:
-                ovr = src.overviews(1)
-                long_side = max(h, w)
-                # Align to a real overview factor when possible (no extra
-                # resampling / NoData blending); else use the plain ratio.
-                cand = [f for f in ovr if f >= 1] or [max(1, long_side // target)]
-                decim = min(cand, key=lambda f: abs((long_side // max(f, 1)) - target))
-                decim = max(1, int(decim))
-                out_h = max(1, h // decim)
-                out_w = max(1, w // decim)
-                ov = src.read(1, out_shape=(out_h, out_w),
-                              resampling=Resampling.nearest, masked=True)
-                src_nodata = src.nodata
-            data = np.ma.getdata(ov).astype(np.float32, copy=False)
-            mask = np.ma.getmaskarray(ov)
-            arr = cp.asarray(data)
-            arr = cp.where(cp.asarray(mask), cp.asarray(np.float32(np.nan)), arr)
-            if src_nodata is not None and np.isfinite(src_nodata):
-                arr = cp.where(arr == cp.float32(src_nodata),
-                               cp.asarray(np.float32(np.nan)), arr)
-            sample = arr
-        except Exception:
-            sample = None
-            decim = 1
-
-    # Fallback: strided full-extent decimation of the in-memory array.
-    if sample is None:
-        decim = max(1, min(h, w) // 2048)
-        sample = dem_arr[::decim, ::decim].compute()
-
-    # Basic statistics (shared part)
-    valid_mask = ~cp.isnan(sample)
-    if not valid_mask.any():
-        raise ValueError("No valid elevation data found")
-
-    elevations = sample[valid_mask]
-    stats = {
-        'elevation_range': float(cp.ptp(elevations)),
-        'std_dev': float(cp.std(elevations)),
-        'sample_size': sample.shape
-    }
-
-    # Gradient computation (shared part). NoData boundaries produce NaN
-    # gradients, so aggregate over finite slope values only.  Divide by the
-    # decimation factor to recover per-original-pixel slope magnitude.
-    dy, dx = cp.gradient(sample)
-    slope = cp.sqrt(dy**2 + dx**2) / float(max(decim, 1))
-    valid_slope = slope[valid_mask]
-    valid_slope = valid_slope[cp.isfinite(valid_slope)]
-    if valid_slope.size == 0:
-        stats['mean_slope'] = 0.0
-        stats['max_slope'] = 0.0
-    else:
-        stats['mean_slope'] = float(cp.mean(valid_slope))
-        stats['max_slope'] = float(cp.percentile(valid_slope, 95))
-
-    # Common metrics for auto-parameter estimation
-    stats["complexity_score"] = float(stats["mean_slope"] * stats["std_dev"])
-    return stats
-
-
-
 
 ###############################################################################
 # 4. Direct COG output (GDAL >= 3.8) - improved
@@ -1196,52 +1112,53 @@ def run_pipeline(
         else:
             logger.info(f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m")
         
-        # 6-2.5) Auto-determination (for the TopoUSM Fast algorithm)
+        # 6-2.5) Spatial-mode auto radii/weights (shared rule): geometric radii
+        # truncated by the input DEM short side + a 2**n weight profile.  Resolved
+        # once from the full Dask-array shape and injected into params.
+        _dem_short_side = min(int(gpu_arr.shape[-2]), int(gpu_arr.shape[-1]))
         if algorithm == "topousm_fast":
             pixel_size = float(params.get('pixel_size', 1.0))
-            
-            # Make the new efficient mode the default
+
             if radii is None and auto_radii:
-                logger.info("Analyzing terrain for automatic radii determination...")
-                
-                # Terrain analysis
-                terrain_stats = analyze_terrain_characteristics(
-                    gpu_arr, src_path=src_cog)
-                terrain_stats['pixel_size'] = pixel_size
-                
-                # Determine optimal radii
-                radii, weights = determine_optimal_radii(terrain_stats)
-                
-                logger.info("Terrain analysis results:")
-                logger.info(f"  - Elevation range: {terrain_stats['elevation_range']:.1f} m")
-                logger.info(f"  - Mean slope: {terrain_stats['mean_slope']:.3f}")
-                logger.info(f"  - Auto-determined radii: {radii} pixels")
-                logger.info(f"  - Weights: {[f'{w:.2f}' for w in weights]}")
-                
-                # Store into parameters
+                from ..algorithms.common.spatial_mode import auto_spatial_profile
+                radii, weights = auto_spatial_profile(_dem_short_side)
+                logger.info(
+                    "Auto spatial radii (short_side=%d px): radii=%s, weights=%s",
+                    _dem_short_side, radii, [round(w, 3) for w in weights],
+                )
                 params['mode'] = 'radius'
                 params['radii'] = radii
                 params['weights'] = weights
-                
+
             elif radii is not None:
                 # Manually specified radius mode
                 params['mode'] = 'radius'
                 params['radii'] = radii
                 params['weights'] = algo_params.get('weights', None)
-            
+
             else:
                 raise ValueError("Either provide radii or enable auto_radii")
 
-        # Many algorithms need the pixel size (for non-TopoUSM Fast cases)
-        elif algorithm != "topousm_fast" and ('pixel_size' not in params or params['pixel_size'] == 1.0):
-            # Already injected above; keep this branch as a no-op for compatibility.
-            params['pixel_size'] = float(params.get('pixel_size', 1.0))
+        else:
+            # Many algorithms need the pixel size (for non-TopoUSM Fast cases)
+            if 'pixel_size' not in params or params['pixel_size'] == 1.0:
+                params['pixel_size'] = float(params.get('pixel_size', 1.0))
 
-        # CLI passes explicit radii through run_pipeline's top-level radii
-        # parameter, so restore it for non-TopoUSM Fast spatial algorithms.
-        if algorithm != "topousm_fast" and radii is not None:
-            params['radii'] = radii
-            logger.info(f"Setting radii for {algorithm}: {radii}")
+            _mode = str(params.get("mode", "spatial")).lower()
+            if radii is not None:
+                # CLI passes explicit radii through run_pipeline's top-level radii.
+                params['radii'] = radii
+                logger.info(f"Setting radii for {algorithm}: {radii}")
+            elif _mode == "spatial" and algorithm in RADII_DRIVEN_ALGOS:
+                from ..algorithms.common.spatial_mode import auto_spatial_profile
+                _auto_r, _auto_w = auto_spatial_profile(_dem_short_side)
+                params['radii'] = _auto_r
+                if params.get('weights') is None:
+                    params['weights'] = _auto_w
+                logger.info(
+                    "Auto spatial radii (%s, short_side=%d px): radii=%s",
+                    algorithm, _dem_short_side, _auto_r,
+                )
 
         # Normalized algorithms (TopoUSM Fast/fractal_anomaly/scale_space_surprise/
         # visual_saliency/multiscale_terrain): derive the display range
