@@ -1,4 +1,4 @@
-﻿"""
+"""
 FujiShaderGPU/algorithms/tile_shared.py
 Shared foundation for tile-based processing (Windows/macOS).
 

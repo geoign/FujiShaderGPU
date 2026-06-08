@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 FujiShaderGPU/core/dask_processor.py
 Core implementation of Dask-CUDA terrain analysis.
@@ -1134,8 +1134,6 @@ def run_pipeline(
             _is_local = False
 
         if algorithm == "topousm_fast":
-            pixel_size = float(params.get('pixel_size', 1.0))
-
             if _is_local:
                 if radii is not None:
                     logger.warning(

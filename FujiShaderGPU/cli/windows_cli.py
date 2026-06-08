@@ -61,7 +61,7 @@ Note: Windows and Linux share the same algorithm names and options.
                 self.parser.error(f"--cog-only mode requires a tile directory: {args.tmp_dir}")
             args._skip_input_check = True
 
-        if args.algorithm == "topousm_fast" and not getattr(args, "no_auto_scale", False):
+        if args.algorithm == "topousm_fast":
             self.logger.info("When radii are omitted, scales are auto-determined via terrain analysis")
         if args.cog_backend == "external" and not args.gdal_bin_dir:
             self.logger.warning(
@@ -80,7 +80,6 @@ Note: Windows and Linux share the same algorithm names and options.
             "max_workers": args.max_workers,
             "nodata_threshold": args.nodata_threshold,
             "multiscale_mode": not args.single_scale,
-            "auto_scale_analysis": not args.no_auto_scale,
             "cog_only": args.cog_only,
             "cog_backend": args.cog_backend,
             "gdal_bin_dir": args.gdal_bin_dir,
@@ -120,7 +119,6 @@ Note: Windows and Linux share the same algorithm names and options.
                 output_range=parse_output_range(getattr(args, "output_range", None)),
                 multiscale_mode=params["multiscale_mode"],
                 pixel_size=params["pixel_size"],
-                auto_scale_analysis=params["auto_scale_analysis"],
                 cog_only=params["cog_only"],
                 cog_backend=params["cog_backend"],
                 gdal_bin_dir=params["gdal_bin_dir"],

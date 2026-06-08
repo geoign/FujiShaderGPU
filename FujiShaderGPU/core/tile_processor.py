@@ -26,6 +26,12 @@ from ..io.output_encoding import (
 )
 from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
 from ..algorithms._norm_stats import _NORM_STAT_SPECS, _compute_norm_stats_tiled
+# Spatial radii/weights are auto-derived from the DEM short side via the shared
+# rule (single source of truth in algorithms.common.spatial_mode).
+from ..algorithms.common.spatial_mode import (
+    RADII_DRIVEN_ALGOS as AUTO_SPATIAL_RADII_ALGOS,
+    MULTISCALE_REQUIRED_ALGOS,
+)
 from ..utils.paths import safe_abspath
 import os
 import math
@@ -79,13 +85,6 @@ GLOBAL_STATS_NATIVE_ALGOS = {
 # must NOT apply its generic [0,1] display normalization to it.
 NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges", "blur"}
 SIGNED_NORMALIZATION_ALGOS = {"topousm_fast", "fractal_anomaly"}
-
-# Algorithms whose spatial radii/weights are auto-derived from the DEM short side
-# via the shared rule (single source of truth in algorithms.common.spatial_mode).
-from ..algorithms.common.spatial_mode import (
-    RADII_DRIVEN_ALGOS as AUTO_SPATIAL_RADII_ALGOS,
-    MULTISCALE_REQUIRED_ALGOS,
-)
 
 
 def _sanitize_spatial_radii_weights_for_tile(
@@ -1538,7 +1537,6 @@ def process_dem_tiles(
     nodata_threshold: float = 1.0,
     multiscale_mode: bool = True,
     pixel_size: Optional[float] = None,
-    auto_scale_analysis: bool = True,
     cog_only: bool = False,
     nodata_override: Optional[float] = None,
     cog_backend: str = "internal",

@@ -1,4 +1,4 @@
-﻿"""Public algorithm package exports."""
+"""Public algorithm package exports."""
 
 __all__ = []
 

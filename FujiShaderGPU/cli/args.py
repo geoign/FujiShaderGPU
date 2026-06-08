@@ -127,7 +127,6 @@ TILE_ARGS: List[ArgSpec] = [
     (("--max-workers",), dict(type=int, help="Number of parallel workers (auto-detected when omitted)")),
     (("--nodata-threshold",), dict(type=float, default=1.0, help="NoData skip threshold (default: 1.0)")),
     (("--single-scale",), dict(action="store_true", help="Force single-scale mode")),
-    (("--no-auto-scale",), dict(action="store_true", help="Disable automatic scale analysis")),
     (("--cog-only",), dict(action="store_true", help="Only generate a COG from existing tiles")),
     (("--cog-backend",), dict(choices=["internal", "external", "auto"], default="internal", help="COG generation backend (default: internal)")),
     (("--gdal-bin-dir",), dict(type=str, default=None, help="External GDAL bin directory (e.g. C:\\Program Files\\GDAL)")),

@@ -1,4 +1,4 @@
-﻿"""
+"""
 FujiShaderGPU/__main__.py
 Entry point that selects platform CLI implementation.
 """

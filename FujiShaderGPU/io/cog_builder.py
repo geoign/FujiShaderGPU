@@ -1,4 +1,4 @@
-﻿"""COG/VRT builder utilities."""
+"""COG/VRT builder utilities."""
 
 from __future__ import annotations
 

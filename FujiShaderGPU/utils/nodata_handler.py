@@ -1,4 +1,4 @@
-﻿"""NoData preprocessing helpers for tile-based computation."""
+"""NoData preprocessing helpers for tile-based computation."""
 
 from __future__ import annotations
 
