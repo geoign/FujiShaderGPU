@@ -637,6 +637,25 @@ def restore_nan(result: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
     return result
 
 
+def pyramid_fill_surface(coarse: cp.ndarray, valid: cp.ndarray) -> cp.ndarray:
+    """Smooth, cliff-free void fill via a push-pull (multigrid) image pyramid (GPU).
+
+    Thin CuPy wrapper over the backend-neutral ``_pyramid_fill.pushpull_fill`` so the
+    GPU pipeline and the CPU preprocessing fill share one implementation.  This is
+    the multiscale replacement for the old single-grid "nearest valid + one
+    Gaussian" fill, which injected phantom relief; push-pull instead solves a
+    membrane-like (minimal-curvature) interpolation that fills small voids from fine
+    levels and large voids from coarse levels without inventing relief.
+
+    ``coarse`` : float32 grid (values at invalid cells are ignored).
+    ``valid``  : bool mask of finite/known cells.
+    Returns a fully-finite float32 surface; ``valid`` cells are preserved exactly.
+    """
+    from ._pyramid_fill import pushpull_fill
+
+    return pushpull_fill(coarse, valid, xp=cp, zoom=zoom)
+
+
 def _hybrid_combine_wrapper(dem, *small_blocks, _scales_order, _small_scales,
                             _large_scales, _large_list, _full_h, _full_w,
                             _combine_fn, _combine_kwargs,
@@ -817,6 +836,7 @@ __all__ = [
     "_downsample_nan_aware",
     "_upsample_to_shape",
     "restore_nan",
+    "pyramid_fill_surface",
     "large_radius_threshold",
     "coarsen_factor_for_shape",
     "coarse_large_radius_response",

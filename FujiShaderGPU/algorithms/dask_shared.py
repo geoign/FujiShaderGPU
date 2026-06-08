@@ -127,6 +127,9 @@ from ._impl_atmospheric_scattering import (
 # --- _impl_multiscale_terrain.py ---
 from ._impl_multiscale_terrain import MultiscaleDaskAlgorithm
 
+# --- _impl_blur.py ---
+from ._impl_blur import BlurAlgorithm, smooth_block
+
 # --- _impl_curvature.py ---
 from ._impl_curvature import compute_curvature_block, CurvatureAlgorithm
 
@@ -150,6 +153,7 @@ ALGORITHMS = {
     'specular': SpecularAlgorithm(),
     'atmospheric_scattering': AtmosphericScatteringAlgorithm(),
     'multiscale_terrain': MultiscaleDaskAlgorithm(),
+    'blur': BlurAlgorithm(),
     'curvature': CurvatureAlgorithm(),
     'visual_saliency': VisualSaliencyAlgorithm(),
     'npr_edges': NPREdgesAlgorithm(),

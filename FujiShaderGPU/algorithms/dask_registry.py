@@ -8,6 +8,7 @@ from .dask.slope import SlopeAlgorithm
 from .dask.specular import SpecularAlgorithm
 from .dask.atmospheric_scattering import AtmosphericScatteringAlgorithm
 from .dask.multiscale_terrain import MultiscaleDaskAlgorithm
+from .dask.blur import BlurAlgorithm
 from .dask.curvature import CurvatureAlgorithm
 from .dask.visual_saliency import VisualSaliencyAlgorithm
 from .dask.npr_edges import NPREdgesAlgorithm
@@ -24,6 +25,7 @@ ALGORITHMS = {
     'specular': SpecularAlgorithm(),
     'atmospheric_scattering': AtmosphericScatteringAlgorithm(),
     'multiscale_terrain': MultiscaleDaskAlgorithm(),
+    'blur': BlurAlgorithm(),
     'curvature': CurvatureAlgorithm(),
     'visual_saliency': VisualSaliencyAlgorithm(),
     'npr_edges': NPREdgesAlgorithm(),

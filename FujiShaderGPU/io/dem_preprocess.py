@@ -11,6 +11,12 @@ edge-connectivity and interpolation are effectively free -- and bilinearly
 upsample that surface to fill the full-resolution voids while streaming the
 output.  This keeps the cost almost independent of the full raster size.
 
+The coarse fill itself is a multiscale **push-pull (multigrid) pyramid** on the
+GPU (``algorithms._nan_utils.pyramid_fill_surface``, the same NaN-aware
+smoothing plumbing the ``blur`` / spatial algorithms build on): a membrane-like,
+minimal-curvature interpolation that fills small voids from fine levels and large
+voids from coarse levels without inventing relief inside the void.
+
 Fill modes
 ----------
 - ``none``      : no filling; NoData is preserved.
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import math
+import multiprocessing as mp
 import os
 import tempfile
 import uuid
@@ -61,36 +68,57 @@ STRIPS_PER_WORKER = 6
 def _fill_coarse_surface(coarse: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """Return a fully-valued smooth surface over a small coarse grid.
 
-    Valid cells are preserved exactly; invalid cells receive a valid-weighted
-    Gaussian estimate (smooth), falling back to the nearest valid value where the
-    Gaussian support does not reach (e.g. the middle of a very large void).
-    """
-    from scipy.ndimage import distance_transform_edt, gaussian_filter
+    Valid cells are preserved exactly; voids are filled with a multiscale
+    push-pull (multigrid) pyramid -- a membrane-like, minimal-curvature
+    interpolation that does not invent relief inside a void.  This is the GPU
+    smoothing/NaN plumbing shared with the main pipeline (``blur`` and the
+    spatial algorithms all build on ``_nan_utils``); the coarse grid is tiny
+    (``coarse_max`` px on its longest side) so the single device round-trip is
+    cheap and runs once per preprocessing.
 
-    out = coarse.astype(np.float32, copy=True)
+    The earlier "nearest-valid + one Gaussian" fill injected phantom relief
+    (flat Voronoi plateaus from the nearest fallback, plus the coarse grid's own
+    undulations smeared into featureless voids); push-pull removes both.
+
+    Runs on the GPU (CuPy) when available -- the same ``pushpull_fill`` core the
+    main pipeline uses -- and transparently falls back to the identical NumPy/SciPy
+    computation otherwise (the coarse grid is small, so either backend is cheap).
+    """
+    from ..algorithms._pyramid_fill import pushpull_fill
+
     if valid.all():
-        return out
+        return coarse.astype(np.float32, copy=True)
     if not valid.any():
         # No reference data at all; nothing meaningful to fill with.
-        return np.zeros_like(out, dtype=np.float32)
+        return np.zeros_like(coarse, dtype=np.float32)
 
-    # Nearest valid value for every cell (guarantees a finite value everywhere).
-    nearest_idx = distance_transform_edt(
-        ~valid, return_distances=False, return_indices=True
-    )
-    nearest = out[tuple(nearest_idx)]
+    # GPU path: same algorithm, on the device (unified with the pipeline).
+    try:
+        import cupy as cp
+        from cupyx.scipy.ndimage import zoom as cp_zoom
 
-    # Valid-weighted Gaussian smoothing removes nearest-neighbour (Voronoi) seams
-    # in the filled region while keeping valid cells exact.
-    sigma = float(max(1.0, min(coarse.shape) / 64.0))
-    weights = valid.astype(np.float32)
-    sv = gaussian_filter(np.where(valid, coarse, 0.0).astype(np.float32), sigma, mode="nearest")
-    sw = gaussian_filter(weights, sigma, mode="nearest")
-    smooth = np.where(sw > 1e-6, sv / np.maximum(sw, 1e-6), nearest)
+        surface_gpu = pushpull_fill(
+            cp.asarray(coarse, dtype=cp.float32), cp.asarray(valid),
+            xp=cp, zoom=cp_zoom,
+        )
+        surface = cp.asnumpy(surface_gpu).astype(np.float32, copy=False)
+        del surface_gpu
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        return surface
+    except Exception as exc:
+        logger.info("GPU push-pull fill unavailable (%s); using CPU fallback.", exc)
 
-    out = np.where(valid, coarse, smooth).astype(np.float32)
-    out = np.where(np.isfinite(out), out, nearest).astype(np.float32)
-    return out
+    # CPU fallback: identical push-pull via NumPy + SciPy.
+    from scipy.ndimage import zoom as sp_zoom
+
+    return pushpull_fill(
+        coarse.astype(np.float32, copy=False),
+        valid.astype(bool, copy=False),
+        xp=np, zoom=sp_zoom,
+    ).astype(np.float32, copy=False)
 
 
 def _detect_border_nodata(
@@ -862,7 +890,16 @@ def _stream_fill_parallel(
             "(GDAL cache %dMB/worker)",
             len(tasks), bands_per_strip * band_rows, n_workers, gdal_cachemax_mb,
         )
-        with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        # Use 'spawn' so workers start as fresh processes: the parent may have
+        # initialized a CUDA context while building the coarse fill surface, and
+        # forking after CUDA init is unsafe.  The workers are CPU-only (they never
+        # import CuPy), so spawning fresh interpreters avoids inheriting that
+        # context entirely.  (Windows already defaults to spawn.)
+        try:
+            _ctx = mp.get_context("spawn")
+        except ValueError:  # pragma: no cover - platform without spawn
+            _ctx = None
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=_ctx) as ex:
             futures = [ex.submit(_process_strip, t) for t in tasks]
             for fut in as_completed(futures):
                 fut.result()  # re-raise any worker exception

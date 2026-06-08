@@ -53,6 +53,7 @@ DEFAULT_ALGORITHMS = {
     "specular": "SpecularAlgorithm",
     "atmospheric_scattering": "AtmosphericScatteringAlgorithm",
     "multiscale_terrain": "MultiscaleDaskAlgorithm",
+    "blur": "BlurAlgorithm",
     "curvature": "CurvatureAlgorithm",
     "visual_saliency": "VisualSaliencyAlgorithm",
     "npr_edges": "NPREdgesAlgorithm",
@@ -74,7 +75,9 @@ GLOBAL_STATS_NATIVE_ALGOS = {
     "ambient_occlusion",
     "openness",
 }
-NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges"}
+# blur outputs raw smoothed elevation (same units as the input); the tile pipeline
+# must NOT apply its generic [0,1] display normalization to it.
+NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges", "blur"}
 SIGNED_NORMALIZATION_ALGOS = {"rvi", "fractal_anomaly"}
 
 

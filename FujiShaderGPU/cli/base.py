@@ -6,6 +6,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
+from .args import SHARED_ARGS, add_arguments, parse_list_fields
+
 
 class BaseCLI(ABC):
     """Base class for platform-specific CLI implementations."""
@@ -67,6 +69,10 @@ class BaseCLI(ABC):
             help="Overwrite the output file even if it exists",
         )
 
+        # Shared algorithm/output/spatial arguments (identical on every platform).
+        add_arguments(parser, SHARED_ARGS)
+
+        # Backend-specific options (Dask cluster knobs vs. tile/COG knobs).
         self._add_platform_specific_args(parser)
         return parser
 
@@ -93,6 +99,9 @@ class BaseCLI(ABC):
             level=getattr(logging, parsed_args.log_level),
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
+
+        # Parse all comma-separated list arguments uniformly (--radii, --scales, ...).
+        parse_list_fields(parsed_args, self.parser)
 
         self._validate_platform_args(parsed_args)
         return parsed_args

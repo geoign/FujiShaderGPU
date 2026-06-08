@@ -52,6 +52,22 @@ def test_fill_coarse_surface_fills_voids_and_preserves_valid():
     assert float(out[~valid].max()) <= float(coarse[valid].max()) + 1e-3
 
 
+def test_fill_coarse_surface_flat_region_stays_flat():
+    # Regression: the push-pull fill must not invent relief.  A flat plateau with
+    # a large interior void must be filled with the same constant -- the old
+    # "nearest valid + one Gaussian" fill injected phantom bumps here.
+    coarse = np.full((128, 128), 100.0, dtype=np.float32)
+    valid = np.ones((128, 128), dtype=bool)
+    valid[40:90, 40:90] = False  # large interior void
+
+    out = _fill_coarse_surface(coarse, valid)
+
+    assert np.isfinite(out).all()
+    # Filled cells stay at the plateau value (no invented relief).
+    assert np.allclose(out[~valid], 100.0, atol=1e-2)
+    assert float(out[~valid].std()) < 1e-2
+
+
 def test_fill_coarse_surface_all_invalid_returns_zeros():
     coarse = np.full((4, 4), np.nan, dtype=np.float32)
     valid = np.zeros((4, 4), dtype=bool)

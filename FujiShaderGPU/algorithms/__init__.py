@@ -18,6 +18,7 @@ try:
     from .tile.specular import SpecularAlgorithm  # noqa: F401
     from .tile.atmospheric_scattering import AtmosphericScatteringAlgorithm  # noqa: F401
     from .tile.multiscale_terrain import MultiscaleDaskAlgorithm  # noqa: F401
+    from .tile.blur import BlurAlgorithm  # noqa: F401
     from .tile.curvature import CurvatureAlgorithm  # noqa: F401
     from .tile.visual_saliency import VisualSaliencyAlgorithm  # noqa: F401
     from .tile.npr_edges import NPREdgesAlgorithm  # noqa: F401
@@ -35,6 +36,7 @@ try:
         "SpecularAlgorithm",
         "AtmosphericScatteringAlgorithm",
         "MultiscaleDaskAlgorithm",
+        "BlurAlgorithm",
         "CurvatureAlgorithm",
         "VisualSaliencyAlgorithm",
         "NPREdgesAlgorithm",
