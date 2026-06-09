@@ -459,210 +459,163 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             y_dim, x_dim = data.dims[0], data.dims[1]
             src_crs = data.rio.crs if hasattr(data, 'rio') else None
 
-            def _persist_chunk(idx: int, i: int, j: int, chunk_data) -> Path:
-                """Write one computed chunk to a temporary GeoTIFF; return its path."""
-                chunk_height, chunk_width = chunk_data.shape[0], chunk_data.shape[1]
-                y_start = sum(data.chunks[0][:i])
-                x_start = sum(data.chunks[1][:j])
-                y_end = y_start + chunk_height
-                x_end = x_start + chunk_width
-                chunk_da = xr.DataArray(
-                    chunk_data,
-                    dims=data.dims,
-                    coords={
-                        y_dim: data.coords[y_dim].isel({y_dim: slice(y_start, y_end)}),
-                        x_dim: data.coords[x_dim].isel({x_dim: slice(x_start, x_end)}),
-                    },
-                    attrs=data.attrs,
-                )
-                if src_crs is not None:
-                    chunk_da.rio.write_crs(src_crs, inplace=True)
-                chunk_file = Path(tmpdir) / f"chunk_{idx}.tif"
-                chunk_da.rio.to_raster(
-                    chunk_file,
-                    driver="GTiff",
-                    compress="ZSTD",
-                    zstd_level=1,
-                    predictor=int(cog_options.get("PREDICTOR", 1)),
-                    tiled=True,
-                    blockxsize=512,
-                    blockysize=512,
-                    BIGTIFF="YES",
-                    num_threads="ALL_CPUS",
-                )
-                del chunk_da
-                return chunk_file
+            # ---- Direct single-file windowed write (no per-chunk files / VRT) ----
+            # Each computed chunk is written straight into ONE pre-created tiled
+            # BigTIFF via a windowed WriteArray, with cluster compute overlapped
+            # against the disk write through a dedicated writer thread.  This drops
+            # the old per-chunk-TIFF + VRT + consolidation-Translate stage (a full
+            # extra read+write of the whole raster) and lets the GPU keep computing
+            # while finished tiles are compressed/written -- a large win on huge
+            # rasters where that staging dominated wall-clock and disk I/O.
+            from osgeo import gdal_array
+            import queue as _queue
+            import threading as _threading
 
-            # Parallel streaming write:
-            # The chunk graph is embarrassingly parallel, so multiple Dask-CUDA
-            # workers (= GPUs) compute different chunks in parallel while the client
-            # writes the finished ones. Fall back to serial when no distributed client is available.
+            H = int(sum(data.chunks[0]))
+            W = int(sum(data.chunks[1]))
+            gdal_dtype = gdal_array.NumericTypeCodeToGDALTypeCode(np.dtype(data.dtype).type)
+            nodata_val = float(output_nodata_for_dtype(data.dtype))
+            row_off = [int(sum(data.chunks[0][:i])) for i in range(n_rows)]
+            col_off = [int(sum(data.chunks[1][:j])) for j in range(n_cols)]
+
+            merged_tif = Path(tmpdir) / "merged_tmp.tif"
+            create_opts = [
+                "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+                "COMPRESS=ZSTD", f"ZLEVEL={cog_options.get('LEVEL', '1')}",
+                "BIGTIFF=YES", "NUM_THREADS=ALL_CPUS",
+            ]
+            if 'PREDICTOR' in cog_options:
+                create_opts.append(f"PREDICTOR={cog_options['PREDICTOR']}")
+            out_ds = gdal.GetDriverByName("GTiff").Create(
+                str(merged_tif), W, H, 1, gdal_dtype, options=create_opts,
+            )
+            if out_ds is None:
+                raise ValueError("Failed to create intermediate GeoTIFF for chunked write")
+            try:
+                out_ds.SetGeoTransform(data.rio.transform().to_gdal())
+            except Exception as exc:
+                logger.warning("Could not set geotransform on chunked output: %s", exc)
+            try:
+                if src_crs is not None:
+                    out_ds.SetProjection(src_crs.to_wkt())
+            except Exception as exc:
+                logger.warning("Could not set projection on chunked output: %s", exc)
+            out_band = out_ds.GetRasterBand(1)
+            out_band.SetNoDataValue(nodata_val)
+
+            # Single writer thread (GDAL dataset writes must be serialized); the
+            # bounded queue back-pressures compute so host RAM stays low.
+            write_q = _queue.Queue(maxsize=8)
+            write_err = {}
+
+            def _writer():
+                while True:
+                    item = write_q.get()
+                    try:
+                        if item is None:
+                            break
+                        arr, xoff, yoff = item
+                        out_band.WriteArray(np.ascontiguousarray(arr), xoff, yoff)
+                    except Exception as exc:  # surface in the main thread
+                        write_err.setdefault("e", exc)
+                    finally:
+                        write_q.task_done()
+
+            wt = _threading.Thread(target=_writer, name="cog-writer", daemon=True)
+            wt.start()
+
             client = None
             try:
                 client = get_client()
             except Exception:
                 client = None
 
-            if client is not None:
-                try:
-                    n_workers = max(1, len(client.scheduler_info().get("workers", {})))
-                except Exception:
-                    n_workers = 1
-                max_inflight = max(2, n_workers * 2)
-                from distributed import as_completed as _as_completed
-
-                coords_flat = [(i, j) for i in range(n_rows) for j in range(n_cols)]
-                task_iter = iter(enumerate(coords_flat))
-                fut_meta = {}
-                inflight = _as_completed()
-
-                def _submit_next() -> bool:
-                    try:
-                        idx, (i, j) = next(task_iter)
-                    except StopIteration:
-                        return False
-                    fut = client.compute(delayed_chunks[i, j])
-                    fut_meta[fut] = (idx, i, j)
-                    inflight.add(fut)
-                    return True
-
-                logger.info(
-                    "Parallel chunk write: %d chunks, %d worker(s), up to %d in flight",
-                    total_chunks, n_workers, max_inflight,
-                )
-                done = 0
-                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
-                    for _ in range(min(max_inflight, total_chunks)):
-                        if not _submit_next():
-                            break
-                    for fut in inflight:
-                        idx, i, j = fut_meta.pop(fut)
-                        try:
-                            chunk_data = fut.result()
-                            chunk_files.append(_persist_chunk(idx, i, j, chunk_data))
-                            del chunk_data
-                        except Exception as e:
-                            logger.error(f"Failed to process chunk {i},{j}: {e}")
-                            raise
-                        finally:
-                            del fut
-                        done += 1
-                        if done % 10 == 0:
-                            try:
-                                cp.get_default_memory_pool().free_all_blocks()
-                            except Exception:
-                                pass
-                        pbar.update(1)
-                        pbar.set_postfix({"saved": f"{len(chunk_files)}"})
-                        _submit_next()
-            else:
-                # Serial fallback (when no distributed client is available)
-                idx = 0
-                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
-                    for i in range(n_rows):
-                        for j in range(n_cols):
-                            try:
-                                chunk_data = delayed_chunks[i, j].compute()
-                                chunk_files.append(_persist_chunk(idx, i, j, chunk_data))
-                                del chunk_data
-                            except Exception as e:
-                                logger.error(f"Failed to process chunk {i},{j}: {e}")
-                                raise
-                            idx += 1
-                            if idx % 10 == 0:
-                                cp.get_default_memory_pool().free_all_blocks()
-                            pbar.update(1)
-                
-            # Consolidate via VRT -> single intermediate GeoTIFF -> overviews -> COG
-            if not chunk_files:
-                raise ValueError("No chunks were successfully processed")
-
-            logger.info(f"Creating VRT from {len(chunk_files)} chunks...")
-            vrt_file = Path(tmpdir) / "merged.vrt"
-            gdal.BuildVRT(str(vrt_file), [str(f) for f in chunk_files])
-
-            # GDAL progress callback
-            pbar = tqdm(total=100, desc="Consolidating", unit="%")
-            def gdal_progress_callback(complete, _message, _cb_data):
-                pbar.n = int(complete * 100)
-                pbar.refresh()
-                if complete >= 1.0:
-                    pbar.close()
-                return 1
-
-            # Reduce disk footprint: consolidate the chunks into one intermediate GeoTIFF,
-            # then free the chunks (= one full-resolution copy) and the VRT before the
-            # heavy overview/COG stage. Otherwise three large copies "chunks + intermediate
-            # + final COG" coexist on the same disk and the peak grows to ~3.66x
-            # (translating the VRT directly to COG is the same, since the driver makes an internal temp file).
-            # Deleting the chunks after consolidation keeps the peak at ~2.66x.
-            merged_tif = Path(tmpdir) / "merged_tmp.tif"
-            logger.info("Consolidating %d chunks into single GeoTIFF: %s",
-                        len(chunk_files), merged_tif)
-            consolidate_options = [
-                "TILED=YES",
-                "BLOCKXSIZE=512",
-                "BLOCKYSIZE=512",
-                "COMPRESS=ZSTD",
-                f"ZLEVEL={cog_options.get('LEVEL', '1')}",
-                "BIGTIFF=YES",
-                "NUM_THREADS=ALL_CPUS",
-            ]
-            if 'PREDICTOR' in cog_options:
-                consolidate_options.append(f"PREDICTOR={cog_options['PREDICTOR']}")
-
-            result = gdal.Translate(
-                str(merged_tif),
-                str(vrt_file),
-                format="GTiff",
-                creationOptions=consolidate_options,
-                callback=gdal_progress_callback,
-            )
-            if result is None:
-                raise ValueError("Chunk consolidation failed")
-            result = None
-
-            # Set NoData explicitly on the intermediate GeoTIFF so the (AVERAGE) overviews
-            # exclude NoData and the final COG inherits the nodata tag (prevents a black border).
-            # 0 for integer output, NaN for float.
-            _mds = gdal.Open(str(merged_tif), gdal.GA_Update)
-            if _mds is not None:
-                try:
-                    _mds.GetRasterBand(1).SetNoDataValue(
-                        float(output_nodata_for_dtype(data.dtype))
-                    )
-                finally:
-                    _mds = None
-
-            # The full-resolution data is now in merged_tmp.tif, so delete the chunks and VRT
-            # immediately to free disk before the heavy stage (overviews + COG).
-            freed = 0
-            for f in chunk_files:
-                try:
-                    freed += f.stat().st_size
-                    f.unlink()
-                except OSError:
-                    pass
             try:
-                vrt_file.unlink()
-            except OSError:
-                pass
-            n_done = len(chunk_files)
-            chunk_files.clear()
-            logger.info("Freed %s of chunk staging before COG build",
-                        _format_gib(freed))
+                if client is not None:
+                    try:
+                        n_workers = max(1, len(client.scheduler_info().get("workers", {})))
+                    except Exception:
+                        n_workers = 1
+                    # A few extra in-flight chunks keep the GPU worker(s) and the
+                    # writer thread busy at the same time (compute || write overlap).
+                    max_inflight = max(4, n_workers * 3)
+                    from distributed import as_completed as _as_completed
+                    coords_flat = [(i, j) for i in range(n_rows) for j in range(n_cols)]
+                    task_iter = iter(coords_flat)
+                    fut_meta = {}
+                    inflight = _as_completed()
 
-            # Single GeoTIFF -> in-place overviews -> COG (FORCE_USE_EXISTING)
-            logger.info("Converting consolidated GeoTIFF to COG format...")
-            build_cog_with_overviews(merged_tif, dst, cog_options)
+                    def _submit_next() -> bool:
+                        try:
+                            i, j = next(task_iter)
+                        except StopIteration:
+                            return False
+                        fut = client.compute(delayed_chunks[i, j])
+                        fut_meta[fut] = (i, j)
+                        inflight.add(fut)
+                        return True
 
-            # Free the intermediate GeoTIFF too (reserve room for the final output without waiting for TemporaryDirectory cleanup)
+                    logger.info(
+                        "Direct chunk write: %d chunks -> single BigTIFF, %d worker(s), up to %d in flight",
+                        total_chunks, n_workers, max_inflight,
+                    )
+                    done = 0
+                    with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                        for _ in range(min(max_inflight, total_chunks)):
+                            if not _submit_next():
+                                break
+                        for fut in inflight:
+                            i, j = fut_meta.pop(fut)
+                            try:
+                                arr = fut.result()
+                            finally:
+                                del fut
+                            if write_err:
+                                raise write_err["e"]
+                            write_q.put((arr, col_off[j], row_off[i]))
+                            del arr
+                            done += 1
+                            if done % 10 == 0:
+                                try:
+                                    cp.get_default_memory_pool().free_all_blocks()
+                                except Exception:
+                                    pass
+                            pbar.update(1)
+                            _submit_next()
+                else:
+                    # Serial fallback (no distributed client)
+                    with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                        for i in range(n_rows):
+                            for j in range(n_cols):
+                                arr = delayed_chunks[i, j].compute()
+                                if write_err:
+                                    raise write_err["e"]
+                                write_q.put((arr, col_off[j], row_off[i]))
+                                del arr
+                                pbar.update(1)
+                # Drain and stop the writer.
+                write_q.put(None)
+                write_q.join()
+                wt.join(timeout=120)
+                if write_err:
+                    raise write_err["e"]
+                out_band.FlushCache()
+                out_ds.FlushCache()
+            finally:
+                out_band = None
+                out_ds = None
+
+            # merged_tmp.tif now holds the full result in one tiled BigTIFF. Build
+            # the COG (overviews + COG layout) in a single CreateCopy via the COG
+            # driver; fall back to the gdaladdo+translate path on older GDAL.
+            logger.info("Building COG (overviews + layout) from single intermediate: %s", dst)
+            if not _build_cog_via_cog_driver(merged_tif, dst, cog_options):
+                build_cog_with_overviews(merged_tif, dst, cog_options)
             try:
                 merged_tif.unlink()
             except OSError:
                 pass
-
-            logger.info(f"Successfully created COG from {n_done} chunks")
+            logger.info("Successfully created COG (%d chunks, direct single-file write)", total_chunks)
 
 def _dask_worker_memory_limit_gb() -> Optional[float]:
     """Return the smallest connected Dask worker memory limit in GB.
@@ -823,6 +776,51 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
 ###############################################################################
 # 5. gdal_translate/gdaladdo fallback functions
 ###############################################################################
+
+def _build_cog_via_cog_driver(src: Path, dst: Path, cog_options: dict) -> bool:
+    """Build the final COG (overviews + COG layout) in ONE CreateCopy via GDAL's
+    COG driver.  Returns True on success, False if the driver is unavailable or
+    fails (the caller then falls back to ``build_cog_with_overviews``).  This
+    avoids the extra in-place ``gdaladdo`` + full-file re-``Translate`` of the
+    fallback path -- one fewer full read+write of the whole raster."""
+    try:
+        if gdal.GetDriverByName("COG") is None:
+            return False
+    except Exception:
+        return False
+    num_cpus = container_cpu_count()
+    opts = [
+        f"COMPRESS={cog_options.get('COMPRESS', 'ZSTD')}",
+        f"LEVEL={cog_options.get('LEVEL', '1')}",
+        f"OVERVIEW_COMPRESS={cog_options.get('OVERVIEW_COMPRESS', 'ZSTD')}",
+        f"BLOCKSIZE={cog_options.get('BLOCKSIZE', '512')}",
+        f"OVERVIEW_RESAMPLING={cog_options.get('OVERVIEW_RESAMPLING', 'AVERAGE')}",
+        "BIGTIFF=YES",
+        f"NUM_THREADS={num_cpus}",
+    ]
+    if 'PREDICTOR' in cog_options:
+        opts.append(f"PREDICTOR={cog_options['PREDICTOR']}")
+    try:
+        pbar = tqdm(total=100, desc="Building COG", unit="%")
+
+        def _cb(complete, _msg, _data):
+            pbar.n = int(complete * 100)
+            pbar.refresh()
+            if complete >= 1.0:
+                pbar.close()
+            return 1
+
+        res = gdal.Translate(
+            str(dst), str(src), format="COG", creationOptions=opts, callback=_cb,
+        )
+        if res is None:
+            return False
+        res = None
+        return True
+    except Exception as exc:
+        logger.warning("COG driver build failed (%s); falling back to gdaladdo+translate", exc)
+        return False
+
 
 def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
     """For older GDAL: build overviews on a temporary TIFF, then convert to COG."""
