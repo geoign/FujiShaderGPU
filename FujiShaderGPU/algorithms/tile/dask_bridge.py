@@ -85,7 +85,6 @@ def _direct_hillshade(block, params):
     pixel_size = p.get("pixel_size", 1.0)
     pixel_scale_x = p.get("pixel_scale_x", None)
     pixel_scale_y = p.get("pixel_scale_y", None)
-    geographic_mode = bool(p.get("is_geographic_dem", False))
     mode = str(p.get("mode", "local")).lower()
     radii = p.get("radii", [1])
     weights = p.get("weights", None)
@@ -106,7 +105,7 @@ def _direct_hillshade(block, params):
             compute_hillshade_spatial_block(
                 block, azimuth=azimuth, altitude=altitude, z_factor=z_factor,
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-                pixel_scale_y=pixel_scale_y, geographic_mode=geographic_mode,
+                pixel_scale_y=pixel_scale_y,
                 radius=float(radius),
             )
             for radius in radii
@@ -116,7 +115,7 @@ def _direct_hillshade(block, params):
     return compute_hillshade_block(
         block, azimuth=azimuth, altitude=altitude, z_factor=z_factor,
         pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-        pixel_scale_y=pixel_scale_y, geographic_mode=geographic_mode,
+        pixel_scale_y=pixel_scale_y,
     )
 
 
@@ -205,13 +204,12 @@ def _direct_specular(block, params):
     from .._base import Constants
     from .._impl_specular import compute_specular_block, compute_specular_spatial_block
 
-    rs = params.get("roughness_scale", 50.0)
-    sh = params.get("shininess", 20.0)
+    rs = params.get("roughness_scale", 20.0)
+    sh = params.get("shininess", 10.0)
     pixel_size = params.get("pixel_size", 1.0)
     psx = params.get("pixel_scale_x", None)
     psy = params.get("pixel_scale_y", None)
     rns = params.get("roughness_norm_scale", None)
-    geo = bool(params.get("is_geographic_dem", False))
     laz = params.get("light_azimuth", Constants.DEFAULT_AZIMUTH)
     lal = params.get("light_altitude", Constants.DEFAULT_ALTITUDE)
     if str(params.get("mode", "local")).lower() == "spatial":
@@ -220,7 +218,7 @@ def _direct_specular(block, params):
             compute_specular_spatial_block(
                 block, roughness_scale=rs, shininess=sh, pixel_size=pixel_size,
                 pixel_scale_x=psx, pixel_scale_y=psy,
-                roughness_norm_scale=rns, geographic_mode=geo,
+                roughness_norm_scale=rns,
                 light_azimuth=laz, light_altitude=lal, radius=float(radius),
             )
             for radius in radii
@@ -229,7 +227,7 @@ def _direct_specular(block, params):
     return compute_specular_block(
         block, roughness_scale=rs, shininess=sh, pixel_size=pixel_size,
         pixel_scale_x=psx, pixel_scale_y=psy, roughness_norm_scale=rns,
-        geographic_mode=geo, light_azimuth=laz, light_altitude=lal,
+        light_azimuth=laz, light_altitude=lal,
     )
 
 
@@ -375,10 +373,10 @@ def _direct_npr_edges(block, params):
 
 def _direct_multiscale_terrain(block, params):
     # The previous direct reimplementation ignored the unified --radii (read only
-    # "scales") and upper-clipped the normalized tail at OVERFLOW_LIMIT, whereas
-    # the Dask path resolves scales from radii, leaves the tail unclipped
-    # (cp.maximum(...,0)), and has a coarse-large-radius path.  Defer to the Dask
-    # implementation so the tile backend matches it exactly.
+    # "scales") and clipped the normalized tail, whereas the Dask path resolves
+    # scales from radii, leaves the tail unclipped (cp.maximum(...,0)), and has a
+    # coarse-large-radius path.  Defer to the Dask implementation so the tile
+    # backend matches it exactly.
     raise _FallbackToDask()
 
 

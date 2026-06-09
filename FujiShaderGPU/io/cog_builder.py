@@ -537,9 +537,21 @@ def _create_vrt_and_cog_external_cli(
             "-co", "OVERVIEWS=IGNORE_EXISTING",
             "-co", "OVERVIEW_RESAMPLING=AVERAGE",
             "-co", "OVERVIEW_COUNT=8",
-            vrt_path,
-            output_cog_path,
+            "-co", "ALIGNED_LEVELS=4",
         ]
+        # Match the internal backend: dtype-aware PREDICTOR improves ZSTD
+        # compression (float -> 3, integer -> 2; none for Byte).
+        try:
+            _ds = gdal.Open(vrt_path, gdal.GA_ReadOnly)
+            _dt = gdal.GetDataTypeName(_ds.GetRasterBand(1).DataType) if _ds else ""
+            _ds = None
+            if _dt in ("Float32", "Float64"):
+                cmd_cog.extend(["-co", "PREDICTOR=3"])
+            elif _dt in ("Int16", "Int32", "UInt16", "UInt32"):
+                cmd_cog.extend(["-co", "PREDICTOR=2"])
+        except Exception:
+            pass
+        cmd_cog.extend([vrt_path, output_cog_path])
         subprocess.run(cmd_cog, check=True, env=env)
         _ensure_output_nodata(output_cog_path, nodata)
         _assert_has_overviews(output_cog_path)

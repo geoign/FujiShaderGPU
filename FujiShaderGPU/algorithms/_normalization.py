@@ -15,7 +15,6 @@ import cupy as cp
 # just past +/-1 and stays informative (see OUTPUT_VALUE_RANGES for how int16/
 # uint8 reserve a little headroom for it).
 NORMAL_PERCENTILE = 99.0
-OVERFLOW_LIMIT = 1.5  # retained for backward-compat imports; no longer clipped
 
 
 # --- TopoUSM Fast ---
@@ -63,5 +62,4 @@ __all__ = [
     "topousm_fast_norm_func",
     "robust_unsigned_stretch_stat_func",
     "NORMAL_PERCENTILE",
-    "OVERFLOW_LIMIT",
 ]

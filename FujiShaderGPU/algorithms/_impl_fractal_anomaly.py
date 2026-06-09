@@ -184,15 +184,19 @@ def _fractal_feature_from_roughness(block, sigmas, *, radii, weights=None, norma
             result = (feature_out - mean_global) / std_global
         else:
             result = cp.zeros_like(feature_out)
+        # Despeckle in the NORMALIZED domain only: despeckle_threshold is
+        # calibrated for normalized magnitudes (~1.0).  The stats pre-pass
+        # (normalize=False) returns the raw feature untouched, so its threshold
+        # is never applied to a data-dependent raw scale.
+        thr = max(0.05, float(despeckle_threshold))
+        alpha_max = float(despeckle_alpha_max)
+        med = median_filter(result, size=3, mode='nearest')
+        thr_map = thr * (0.7 + 1.1 * alpha)
+        despeckle_mask = (
+            (cp.abs(result - med) > thr_map) & (alpha < alpha_max) & (relief_conf < 0.45))
+        result = cp.where(despeckle_mask, med, result)
     else:
         result = feature_out
-    thr = max(0.05, float(despeckle_threshold))
-    alpha_max = float(despeckle_alpha_max)
-    med = median_filter(result, size=3, mode='nearest')
-    thr_map = thr * (0.7 + 1.1 * alpha)
-    despeckle_mask = (
-        (cp.abs(result - med) > thr_map) & (alpha < alpha_max) & (relief_conf < 0.45))
-    result = cp.where(despeckle_mask, med, result)
     result = restore_nan(result, nan_mask)
     return result.astype(cp.float32)
 
@@ -217,7 +221,7 @@ def _fractal_combine_block(block, *roughness, radii, weights=None, normalize=Tru
 
 
 def fractal_stat_func(data):
-    """Compute robust center/scale: p80(abs(centered)) maps to +/-1."""
+    """Robust center/scale: p99(|centered|) (``NORMAL_PERCENTILE``) maps to +/-1."""
     valid_data = data[~cp.isnan(data)]
     if len(valid_data) > 0:
         center = float(cp.median(valid_data))
@@ -273,7 +277,6 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
                     {'radii': radii, 'normalize': False, 'smoothing_sigma': sm_sig,
                      'despeckle_threshold': ds_thr, 'despeckle_alpha_max': ds_am,
                      'detail_boost': db, 'weights': weights},
-                    downsample_factor=params.get('downsample_factor', None),
                     depth=stats_depth, algorithm_name='fractal_anomaly')
             else:
                 stats = (0.0, 0.5)
@@ -348,7 +351,7 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
 
     def get_default_params(self):
         return {
-            'radii': None, 'pixel_size': 1.0, 'downsample_factor': None,
+            'radii': None, 'pixel_size': 1.0,
             'smoothing_sigma': 1.2, 'despeckle_threshold': 0.35,
             'despeckle_alpha_max': 0.30, 'detail_boost': 0.35,
         }
@@ -410,29 +413,24 @@ def _compute_fractal_relief_stats(
             ys, xs = np.where(vmask)
             by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
             bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
-            ch_, cw_ = max(1, (by1 - by0) // grid), max(1, (bx1 - bx0) // grid)
-            for gy in range(grid):
-                for gx in range(grid):
-                    ccy = by0 + gy * ch_ + ch_ // 2
-                    ccx = bx0 + gx * cw_ + cw_ // 2
-                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
-                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
-                    tw, th = min(tile, W - wx0), min(tile, H - wy0)
-                    a = _dn(src.read(1, window=Window(wx0, wy0, tw, th),
-                                     out_dtype=np.float32, masked=True).filled(np.nan))
-                    if float(np.isfinite(a).mean()) < min_valid_frac:
-                        continue
-                    g = cp.asarray(a)
-                    sig = compute_roughness_multiscale(g, radii, window_mult=3, detrend=True)
-                    rough = cp.mean(sig, axis=2)
-                    m = int(min(margin, rough.shape[0] // 3, rough.shape[1] // 3))
-                    if m > 0:
-                        rough = rough[m:-m, m:-m]
-                    vals = rough[~cp.isnan(rough)]
-                    if vals.size:
-                        pooled.append(cp.asnumpy(vals))
-                    del g, sig, rough, vals
-                    cp.get_default_memory_pool().free_all_blocks()
+            from ._norm_stats import stratified_windows
+            for wy0, wx0, tw, th in stratified_windows(
+                    W, H, by0, by1, bx0, bx1, grid=grid, tile=tile):
+                a = _dn(src.read(1, window=Window(wx0, wy0, tw, th),
+                                 out_dtype=np.float32, masked=True).filled(np.nan))
+                if float(np.isfinite(a).mean()) < min_valid_frac:
+                    continue
+                g = cp.asarray(a)
+                sig = compute_roughness_multiscale(g, radii, window_mult=3, detrend=True)
+                rough = cp.mean(sig, axis=2)
+                m = int(min(margin, rough.shape[0] // 3, rough.shape[1] // 3))
+                if m > 0:
+                    rough = rough[m:-m, m:-m]
+                vals = rough[~cp.isnan(rough)]
+                if vals.size:
+                    pooled.append(cp.asnumpy(vals))
+                del g, sig, rough, vals
+                cp.get_default_memory_pool().free_all_blocks()
         if not pooled:
             return None
         allv = np.concatenate(pooled)

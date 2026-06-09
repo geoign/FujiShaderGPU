@@ -79,9 +79,10 @@ slow full-resolution reads).
     `_compute_fractal_relief_stats` (`_impl_fractal_anomaly.py`, global roughness
     p10/p75). `core/dask_processor.py` imports both from here.
 - `tile_shared.py`
-  - Tile-side base class (`TileAlgorithm`) and lightweight algorithms that delegate directly to shared kernels.
-  - Contains only: `TileAlgorithm`, `ScaleSpaceSurpriseAlgorithm`, `MultiLightUncertaintyAlgorithm`.
-  - Most tile algorithms import their implementation from `dask_shared.py` via `tile/dask_bridge.py`.
+  - Tile-side base class (`TileAlgorithm`) plus re-exports of
+    `ScaleSpaceSurpriseAlgorithm` / `MultiLightUncertaintyAlgorithm` (which are
+    bridge adapters in `tile/`, like every other tile algorithm).
+  - All tile algorithms import their implementation from `dask_shared.py` via `tile/dask_bridge.py`.
 - `common/kernels.py`
   - Shared CuPy kernels used by both Dask and Tile.
 - `common/spatial_mode.py`
@@ -91,15 +92,6 @@ slow full-resolution reads).
     profile normalized to 1.  Used by every radius-driven spatial algorithm
     (`RADII_DRIVEN_ALGOS`) on both backends; the orchestrators resolve it once
     from the full-raster short side and inject explicit `radii`/`weights`.
-  - Current bins:
-    - `<5`
-    - `5~25`
-    - `25~50`
-    - `50~250`
-    - `250~1250`
-    - `1250~5000`
-    - `>5000`
-  - Each bin defines default `radii` and `weights` used when user does not pass `--radii/--weights`.
 - `dask/*.py`
   - One file per Dask algorithm module.
 - `tile/*.py`
@@ -219,8 +211,10 @@ Otherwise output is written through COG flow.
 - **Output parity with Dask.** In `spatial` mode the bridge routes every algorithm
   except TopoUSM Fast through the Dask algorithm on the single tile (TopoUSM Fast keeps a bespoke
   direct path; `local` mode keeps the fast direct paths). Combined with the unified
-  overview large-radius field (§13.6) and shared full-resolution normalization stats
-  (§14), the integer outputs are pixel-identical to the Dask-CUDA backend.
+  overview large-radius field (§13.6), shared full-resolution normalization stats
+  (§14), identical raw-elevation + metric pixel-scale conventions (projected AND
+  geographic), and no tile-side post-normalization, the outputs match the
+  Dask-CUDA backend.
 - **Virtual filesystem (rclone/FUSE) safety.** Reading or writing on a cloud-mounted
   drive (e.g. Cloudflare R2 via an rclone FUSE mount) is supported: `utils/paths.py`'s
   `safe_abspath` avoids `Path.resolve()` (which raises `WinError 1005` on such mounts)
@@ -245,10 +239,14 @@ Otherwise output is written through COG flow.
   - I/O
   - environment/config
 - Geographic DEM approximation support:
-  - detect geographic CRS and center latitude
-  - convert pixel scales to metric `dx/dy`
-  - inject anisotropic scales (`pixel_scale_x`, `pixel_scale_y`) through processors into algorithm kernels
-  - Hillshade/Specular: `geographic_mode` for azimuth + polarity correction
+  - detect geographic CRS and center latitude (per-tile latitude on the tile backend)
+  - convert pixel scales to metric `dx/dy` and inject them as **real signed
+    meters per pixel** (`pixel_scale_x`, `pixel_scale_y`) on BOTH backends; the
+    DEM array itself is never rescaled, so elevation-based outputs keep their
+    physical magnitude and the shared normalization stats apply unchanged
+  - geotransform orientation is handled uniformly via the pixel-scale signs
+    (east/north derivative correction inside the kernels); geographic and
+    projected DEMs share the exact same shading formulas and tone scale
   - Openness/AO: per-direction physical distance with anisotropic pixel scales
 - Dynamic GPU optimization (`config/auto_tune.py`):
   - All performance parameters derived from VRAM at runtime — no static per-GPU presets required
@@ -527,10 +525,18 @@ shared helpers add to the block coordinates (`tile_origin` / `tile_full_shape` a
 tile, throttled to one worker, ~hours on a 19469×15478 raster) to a 160 px halo (1344 px
 tile, full worker count, minutes).
 
-Enabled for **projected DEMs only** (geographic DEMs use decimation-dependent local
-latitude scaling that a single global field cannot match — those fall back to the
+Enabled for **projected DEMs only** (geographic DEMs use per-tile local latitude
+scaling that a single global field cannot match — those fall back to the
 full-resolution per-tile path). Any failure to read/build the overview falls back
 transparently to the full-resolution radii path.
+
+Known limitation: the hybrid algorithms' final combine must run at depth 0
+(`array-location` is only the true global position under `map_blocks`), and that
+combine contains small-kernel operations (fractal: sigma-1.2 smoothing + 3x3
+median; saliency/surprise: a 1-px gradient).  On the Dask backend this can leave
+a faint, few-pixel-wide difference along chunk borders for those algorithms; the
+tile backend is unaffected (each tile carries its own halo and is trimmed after
+the combine).
 
 ### 13.7 Pipeline Input Assumption
 
@@ -581,12 +587,13 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
   the same `_compute_norm_stats_tiled`**, so the displayed contrast matches. The
   normalized float is **unclipped**, so the tail runs a
   little past `±1`.
-- **No double normalization.** Algorithms that apply their own display stretch inside
-  `.process()` (`apply_display_stretch_dask` in `ambient_occlusion` / `openness`, and
-  the internally-normalized TopoUSM Fast / multiscale_terrain / visual_saliency / fractal_anomaly)
-  are listed in `tile_processor.GLOBAL_STATS_NATIVE_ALGOS`, so the tile pipeline skips
-  its own post-normalization for them — otherwise routing them through the Dask path
-  would normalize twice and crush/blow the result.
+- **Normalization is owned by the algorithms.** Every display stretch /
+  normalization happens inside `.process()` (`apply_display_stretch_dask` in
+  `ambient_occlusion` / `openness`; internal normalization with the injected
+  global stats in TopoUSM Fast / multiscale_terrain / visual_saliency /
+  scale_space_surprise / fractal_anomaly), identically on both backends.  The
+  tile pipeline applies **no post-normalization of its own** — the old tile-only
+  generic p1–p99 stretch made the Windows output diverge from Dask.
 - Native value ranges (`OUTPUT_VALUE_RANGES`): slope `0..90`, AO/hillshade/openness
   `0..1` (physically bounded, no pre-stat), npr_edges `0.2..1.0`; the normalized set
   uses `±1.176` (signed) / `0..1.176` (unsigned), where `1.176 = 1/0.85` reserves
@@ -598,8 +605,11 @@ selects the encoding; `float32` is unchanged, byte-for-byte previous behavior.
   - `int16`: full `[-MAXPOS, +MAXPOS]`; `DN = 0` (value ≈ 0, i.e. flat ground)
     doubles as NoData — visually negligible.
   - `uint8`: value 0 centered at `128`, data in `[1, 255]`.
-- GDAL `scale`/`offset` are recorded (`value = scale·DN + offset`) for physical
-  recovery; `DN = 0` is NoData (undefined value).
+- Integer outputs are plain DN **display products**: no GDAL `scale`/`offset` is
+  embedded (QGIS would auto-unscale the band, and editing a finished COG in place
+  breaks its layout guarantee — GDAL 3.8+ refuses the update).  The DN↔value
+  mapping (`value = scale·DN + offset`) is logged by both backends and recorded
+  in the Dask COG attrs; `DN = 0` is NoData (undefined value).
 
 ### 14.3 Backend integration
 
@@ -612,9 +622,8 @@ the same registry so int outputs are consistent.
 - **Tile** (`tile_processor`): `quantize_array` (NumPy) runs per tile after
   `_format_algorithm_output`; tile profiles and the VRT/COG assembler inherit the
   integer dtype + NoData=0 from the tiles (data-driven, no extra plumbing).
-- After the COG is built, `apply_scale_offset` records the band scale/offset
-  (best-effort; non-critical).  Float-only display hints (e.g. TopoUSM Fast ±1) are skipped
-  for integer outputs.
+- The finished COG is never edited in place (no post-hoc scale/offset or display
+  hints — those edits break the COG layout and GDAL 3.8+ rejects them).
 
 Quantization is skipped (writes float32) when the algorithm changes the result
 shape (e.g. `agg=stack`) or when no range can be resolved.

@@ -2,89 +2,22 @@
 FujiShaderGPU/algorithms/_global_stats.py
 
 Global statistics utilities.
-Compute statistics and apply normalization on downsampled representative data.
+Compute statistics from a bounded central full-resolution window and apply
+shared normalization helpers.
 Module split out from dask_shared.py (Phase 1).
 """
 from __future__ import annotations
-from typing import Dict, Any, Tuple
+from typing import Any, Tuple
 import cupy as cp
 import dask.array as da
 
 from ._nan_utils import restore_nan
 
 
-def determine_optimal_downsample_factor(
-    data_shape: Tuple[int, int],
-    algorithm_name: str = None,
-    target_pixels: int = 500000,  # target pixel count (1000x1000)
-    min_factor: int = 5,
-    max_factor: int = 100,
-    algorithm_complexity: Dict[str, float] = None) -> int:
-    """
-    Determine the optimal downsample factor from data size and algorithm characteristics.
-
-    Parameters:
-    -----------
-    data_shape : Tuple[int, int]
-        Shape of the input data (height, width)
-    algorithm_name : str
-        Algorithm name (for complexity adjustment)
-    target_pixels : int
-        Target pixel count after downsampling
-    min_factor : int
-        Minimum downsample factor
-    max_factor : int
-        Maximum downsample factor
-    algorithm_complexity : Dict[str, float]
-        Per-algorithm complexity factors (defaults to a built-in dict)
-
-    Returns:
-    --------
-    int : the optimal downsample factor
-    """
-    # Algorithm complexity factors (higher = more expensive)
-    if algorithm_complexity is None:
-        algorithm_complexity = {
-            'topousm_fast': 1.2,                    # multiscale processing
-            'hillshade': 0.8,              # simple gradient computation
-            'slope': 0.8,                  # simple gradient computation
-            'specular': 1.5,               # roughness computation is heavy
-            'atmospheric_scattering': 0.9,
-            'multiscale_terrain': 1.5,     # multiscale processing
-            'curvature': 1.0,              # second derivative
-            'visual_saliency': 1.4,        # multiscale feature extraction
-            'npr_edges': 1.1,              # edge detection
-            'ambient_occlusion': 2.0,      # most expensive
-            'openness': 1.8,               # multi-direction search
-            'fractal_anomaly': 1.6,        # multiscale regression
-        }
-
-    # Current pixel count
-    current_pixels = data_shape[0] * data_shape[1]
-
-    # Base downsample factor (computed via square root)
-    base_factor = cp.sqrt(current_pixels / target_pixels).get()
-
-    # Adjust by algorithm complexity
-    complexity = algorithm_complexity.get(algorithm_name, 1.0)
-    adjusted_factor = base_factor * complexity
-
-    # Convert to int and clamp to range
-    downsample_factor = int(cp.clip(adjusted_factor, min_factor, max_factor))
-
-    # Reduce the factor when the data is small
-    if current_pixels < 1_000_000:  # under 1M pixels
-        downsample_factor = min(downsample_factor, 2)
-    elif current_pixels < 10_000_000:  # under 10M pixels
-        downsample_factor = min(downsample_factor, 4)
-    return downsample_factor
-
-
 def compute_global_stats(gpu_arr: da.Array,
                         stat_func: callable,
                         algorithm_func: callable,
                         algorithm_params: dict,
-                        downsample_factor: int = None,  # kept for backward compat (unused)
                         depth: int = None,
                         algorithm_name: str = None) -> Tuple[Any, ...]:
     """
@@ -223,7 +156,6 @@ def robust_unsigned_stretch_stat_func(values: cp.ndarray) -> Tuple[float, float]
 
 
 __all__ = [
-    "determine_optimal_downsample_factor",
     "compute_global_stats",
     "apply_global_normalization",
     "apply_display_stretch_dask",

@@ -582,23 +582,27 @@ def _downsample_nan_aware(block: cp.ndarray, factor: int) -> cp.ndarray:
     """
     if factor <= 1:
         return block
-    nan_mask = cp.isnan(block)
+    f = int(factor)
     h, w = block.shape[:2]
-    out_h = max(1, (int(h) + int(factor) - 1) // int(factor))
-    out_w = max(1, (int(w) + int(factor) - 1) // int(factor))
-    sy = out_h / max(1, h)
-    sx = out_w / max(1, w)
+    out_h = max(1, (int(h) + f - 1) // f)
+    out_w = max(1, (int(w) + f - 1) // f)
 
-    if not nan_mask.any():
-        work = block.astype(cp.float32, copy=False)
-        return zoom(work, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
-
-    # Valid-weighted decimation: average finite contributors only.
-    valid = (~nan_mask).astype(cp.float32)
-    filled0 = cp.where(nan_mask, cp.float32(0), block).astype(cp.float32)
-    num = zoom(filled0, zoom=(sy, sx), order=1, mode="nearest")
-    den = zoom(valid, zoom=(sy, sx), order=1, mode="nearest")
-    coarse = cp.where(den > 1e-6, num / cp.maximum(den, cp.float32(1e-6)),
+    # True block-mean (area-average) decimation over the finite contributors of
+    # each f x f cell.  The previous bilinear ``zoom`` only sampled a 2x2
+    # neighbourhood per output pixel, which aliases badly at factors >= 4 and was
+    # not the valid-weighted *mean* its docstring promised.  NaN padding keeps the
+    # ragged right/bottom edge out of the average.
+    work = block.astype(cp.float32, copy=False)
+    pad_h = out_h * f - int(h)
+    pad_w = out_w * f - int(w)
+    if pad_h or pad_w:
+        work = cp.pad(work, ((0, pad_h), (0, pad_w)),
+                      mode="constant", constant_values=cp.nan)
+    cells = work.reshape(out_h, f, out_w, f)
+    finite = cp.isfinite(cells)
+    cnt = finite.sum(axis=(1, 3), dtype=cp.float32)
+    total = cp.where(finite, cells, cp.float32(0)).sum(axis=(1, 3), dtype=cp.float32)
+    coarse = cp.where(cnt > 0, total / cp.maximum(cnt, cp.float32(1)),
                       cp.float32(cp.nan)).astype(cp.float32)
 
     # Fill only thin, well-enclosed coarse voids; preserve NaN over the large
@@ -798,8 +802,12 @@ def read_overview_coarse_dem(src_cog: str, *, sample_max: int = 2048):
     try:
         with rasterio.open(src_cog) as src:
             scale = max(src.width / sample_max, src.height / sample_max, 1.0)
-            sw = max(128, int(src.width / scale))
-            sh = max(128, int(src.height / scale))
+            # Derive both axes from the SAME scale (no per-axis floor): a floor
+            # on one axis would make the actual decimation anisotropic on very
+            # elongated rasters while callers scale radii/pixel sizes by the
+            # single returned ``decimation``.
+            sw = max(1, int(round(src.width / scale)))
+            sh = max(1, int(round(src.height / scale)))
             sample_ma = src.read(
                 1, out_shape=(sh, sw), resampling=Resampling.average,
                 out_dtype=np.float32, masked=True)

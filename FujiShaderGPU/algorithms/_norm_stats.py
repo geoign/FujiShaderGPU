@@ -47,6 +47,45 @@ _NORM_STAT_SPECS = {
 }
 
 
+def stratified_windows(
+    width: int,
+    height: int,
+    by0: int,
+    by1: int,
+    bx0: int,
+    bx1: int,
+    *,
+    grid: int = 3,
+    tile: int = 4096,
+) -> list:
+    """Unique full-resolution sample windows stratified over a bounding box.
+
+    Returns ``[(wy0, wx0, win_w, win_h), ...]`` for a ``grid x grid`` layout of
+    ``tile``-sized windows centred on the valid-data bounding box
+    ``[by0:by1, bx0:bx1]`` (raster size ``width x height``).  Duplicate windows
+    are dropped: on rasters smaller than ``grid*tile`` the grid cells collapse
+    onto (nearly) the same window, and pooling the same pixels ``grid**2`` times
+    is pure waste.  Shared by every stratified global-stats pre-pass
+    (display-range / npr gradient / fractal relief / specular roughness)."""
+    cell_h = max(1, (int(by1) - int(by0)) // int(grid))
+    cell_w = max(1, (int(bx1) - int(bx0)) // int(grid))
+    out = []
+    seen = set()
+    for gy in range(int(grid)):
+        for gx in range(int(grid)):
+            ccy = int(by0) + gy * cell_h + cell_h // 2
+            ccx = int(bx0) + gx * cell_w + cell_w // 2
+            wy0 = int(min(max(0, ccy - tile // 2), max(0, int(height) - tile)))
+            wx0 = int(min(max(0, ccx - tile // 2), max(0, int(width) - tile)))
+            tw, th = min(tile, int(width) - wx0), min(tile, int(height) - wy0)
+            key = (wy0, wx0, tw, th)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out
+
+
 def _norm_stat_max_scale(merged: dict) -> float:
     """Largest pixel-scale among the algorithm's radii/scales/kernel parameters."""
     vals = []
@@ -135,30 +174,23 @@ def _compute_norm_stats_tiled(
             by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
             bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
 
-            cell_h = max(1, (by1 - by0) // grid)
-            cell_w = max(1, (bx1 - bx0) // grid)
-            for gy in range(grid):
-                for gx in range(grid):
-                    ccy = by0 + gy * cell_h + cell_h // 2
-                    ccx = bx0 + gx * cell_w + cell_w // 2
-                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
-                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
-                    tw, th = min(tile, W - wx0), min(tile, H - wy0)
-                    a = _denodata(src.read(
-                        1, window=Window(wx0, wy0, tw, th),
-                        out_dtype=np.float32, masked=True).filled(np.nan))
-                    if float(np.isfinite(a).mean()) < min_valid_frac:
-                        continue
-                    g = cp.asarray(a)
-                    raw = block_func(g, **kw)
-                    m = int(min(margin, raw.shape[0] // 3, raw.shape[1] // 3))
-                    if m > 0:
-                        raw = raw[m:-m, m:-m]
-                    vals = raw[~cp.isnan(raw)]
-                    if vals.size:
-                        pooled.append(cp.asnumpy(vals))
-                    del g, raw, vals
-                    cp.get_default_memory_pool().free_all_blocks()
+            for wy0, wx0, tw, th in stratified_windows(
+                    W, H, by0, by1, bx0, bx1, grid=grid, tile=tile):
+                a = _denodata(src.read(
+                    1, window=Window(wx0, wy0, tw, th),
+                    out_dtype=np.float32, masked=True).filled(np.nan))
+                if float(np.isfinite(a).mean()) < min_valid_frac:
+                    continue
+                g = cp.asarray(a)
+                raw = block_func(g, **kw)
+                m = int(min(margin, raw.shape[0] // 3, raw.shape[1] // 3))
+                if m > 0:
+                    raw = raw[m:-m, m:-m]
+                vals = raw[~cp.isnan(raw)]
+                if vals.size:
+                    pooled.append(cp.asnumpy(vals))
+                del g, raw, vals
+                cp.get_default_memory_pool().free_all_blocks()
 
         if not pooled:
             return None
@@ -222,9 +254,7 @@ def inject_global_stats(src_cog: str, algorithm: str, params: dict, *, is_zarr: 
 
     if algorithm == "specular" and params.get("roughness_norm_scale") is None:
         from ._impl_specular import _compute_specular_roughness_scale
-        _rns = _compute_specular_roughness_scale(
-            src_cog, params, elevation_scale=float(params.get("elevation_scale", 1.0)),
-        )
+        _rns = _compute_specular_roughness_scale(src_cog, params)
         if _rns is not None:
             params["roughness_norm_scale"] = _rns
 
@@ -233,5 +263,5 @@ def inject_global_stats(src_cog: str, algorithm: str, params: dict, *, is_zarr: 
 
 __all__ = [
     "_NORM_STAT_SPECS", "_norm_stat_max_scale", "_compute_norm_stats_tiled",
-    "inject_global_stats",
+    "stratified_windows", "inject_global_stats",
 ]

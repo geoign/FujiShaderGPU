@@ -194,8 +194,10 @@ real terrain skews contrast and creates a halo at the data edge.
 - **COG** by default (`.tif`); **Zarr** when the output path ends in `.zarr`
   (Linux / Dask path).
 - `--output-dtype` keeps the GPU math in float32 and only changes the final encoding.
-  `int16` / `uint8` shrink the file (NoData = `0`) and record GDAL scale/offset so the
-  physical value is recoverable. → details in [ARCHITECTURE.md §14](ARCHITECTURE.md).
+  `int16` / `uint8` shrink the file (NoData = `0`); they are plain DN display
+  products (no GDAL scale/offset is embedded — the DN↔value mapping is logged and,
+  on the Dask path, recorded in the COG attributes).
+  → details in [ARCHITECTURE.md §14](ARCHITECTURE.md).
 
 ## Spatial mode in a nutshell
 

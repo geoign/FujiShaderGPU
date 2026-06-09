@@ -69,7 +69,7 @@ def _compress_saliency_feature(feature):
 
 
 def visual_saliency_stat_func(data):
-    """Global unsigned scale: p80 maps to +1."""
+    """Global unsigned scale: robust p99 (``NORMAL_PERCENTILE``) maps to +1."""
     valid_data = data[~cp.isnan(data)]
     if valid_data.size == 0:
         return (0.0, 1.0)
@@ -123,6 +123,9 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
         use_scales = [2.0, 4.0, 8.0, 16.0]
     # Per-scale weights (unified --weights); None -> equal averaging.
     wvec = resolve_block_weights(weights, len(use_scales))
+    # Compute every per-scale gaussian smooth once and reuse it: the previous
+    # per-(center, surround) recomputation ran each gaussian up to twice.
+    smooths = [gaussian_filter(work, sigma=s, mode='nearest') for s in use_scales]
     c_indices = [0, 1]
     deltas = [2, 3]
     intensity_maps = []
@@ -132,9 +135,7 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
             si = ci + d
             if si >= len(use_scales):
                 continue
-            c_map = gaussian_filter(work, sigma=use_scales[ci], mode='nearest')
-            s_map = gaussian_filter(work, sigma=use_scales[si], mode='nearest')
-            fm = cp.abs(c_map - s_map)
+            fm = cp.abs(smooths[ci] - smooths[si])
             intensity_maps.append(_compress_saliency_feature(fm))
             if wvec is not None:
                 intensity_w.append(float(wvec[ci]))
@@ -142,15 +143,14 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
     ori_maps = []
     ori_w = []
     orientations = [0.0, cp.pi / 4, cp.pi / 2, 3 * cp.pi / 4]
-    for j, sigma in enumerate(use_scales[:3]):
-        sm = gaussian_filter(work, sigma=sigma, mode='nearest')
-        step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
-        step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
-        if abs(step_y) < 1e-9:
-            step_y = float(pixel_size if pixel_size else 1.0)
-        if abs(step_x) < 1e-9:
-            step_x = float(pixel_size if pixel_size else 1.0)
-        gy, gx = cp.gradient(sm, step_y, step_x)
+    step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
+    step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
+    if abs(step_y) < 1e-9:
+        step_y = float(pixel_size if pixel_size else 1.0)
+    if abs(step_x) < 1e-9:
+        step_x = float(pixel_size if pixel_size else 1.0)
+    for j in range(min(3, len(use_scales))):
+        gy, gx = cp.gradient(smooths[j], step_y, step_x)
         mag = cp.sqrt(gx * gx + gy * gy) + 1e-8
         theta = cp.arctan2(gy, gx)
         for o in orientations:
@@ -272,7 +272,6 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
                      'pixel_scale_x': pixel_scale_x,
                      'pixel_scale_y': pixel_scale_y, 'normalize': False,
                      'weights': weights},
-                    downsample_factor=params.get('downsample_factor', None),
                     depth=min(int(max(use_scales) * 5), Constants.MAX_DEPTH))
             else:
                 stats = (0.0, 1.0)
@@ -323,7 +322,7 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
     def get_default_params(self):
         return {
             'scales': [2, 4, 8, 16], 'pixel_size': 1.0,
-            'downsample_factor': None, 'verbose': False,
+            'verbose': False,
         }
 
 

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
-                          threshold_low: float = 0.1, threshold_high: float = 0.3,
+                          threshold_low: float = 0.2, threshold_high: float = 0.5,
                           pixel_size: float = 1.0, grad_stats=None,
                           _return_grad: bool = False) -> cp.ndarray:
     """NPR-style outline extraction (simplified v2).
@@ -136,8 +136,13 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     mask = ((angle < 22.5) | (angle >= 157.5))
     nms = cp.where(mask & ((gradient_mag < shifted_pos) | (gradient_mag < shifted_neg)), 0, nms)
 
-    shifted_pos = cp.roll(cp.roll(gradient_mag, 1, axis=0), -1, axis=1)
-    shifted_neg = cp.roll(cp.roll(gradient_mag, -1, axis=0), 1, axis=1)
+    # 45deg bucket: with row-down (y-down) array coordinates an angle in
+    # [22.5, 67.5) means the gradient points along the MAIN diagonal
+    # (row+1, col+1), so suppress against those neighbours.  (The previous
+    # pairing compared the anti-diagonal -- a y-up-convention port artifact --
+    # which thinned diagonal edges along the wrong direction.)
+    shifted_pos = cp.roll(cp.roll(gradient_mag, -1, axis=0), -1, axis=1)
+    shifted_neg = cp.roll(cp.roll(gradient_mag, 1, axis=0), 1, axis=1)
     mask = ((angle >= 22.5) & (angle < 67.5))
     nms = cp.where(mask & ((gradient_mag < shifted_pos) | (gradient_mag < shifted_neg)), 0, nms)
 
@@ -146,8 +151,9 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     mask = ((angle >= 67.5) & (angle < 112.5))
     nms = cp.where(mask & ((gradient_mag < shifted_pos) | (gradient_mag < shifted_neg)), 0, nms)
 
-    shifted_pos = cp.roll(cp.roll(gradient_mag, -1, axis=0), -1, axis=1)
-    shifted_neg = cp.roll(cp.roll(gradient_mag, 1, axis=0), 1, axis=1)
+    # 135deg bucket: gradient along the ANTI-diagonal (row-1, col+1).
+    shifted_pos = cp.roll(cp.roll(gradient_mag, 1, axis=0), -1, axis=1)
+    shifted_neg = cp.roll(cp.roll(gradient_mag, -1, axis=0), 1, axis=1)
     mask = ((angle >= 112.5) & (angle < 157.5))
     nms = cp.where(mask & ((gradient_mag < shifted_pos) | (gradient_mag < shifted_neg)), 0, nms)
 
@@ -185,8 +191,8 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
     return result.astype(cp.float32)
 
 
-def compute_npr_edges_spatial_block(block, *, edge_sigma=1.0, threshold_low=0.1,
-                                    threshold_high=0.3, pixel_size=1.0,
+def compute_npr_edges_spatial_block(block, *, edge_sigma=1.0, threshold_low=0.2,
+                                    threshold_high=0.5, pixel_size=1.0,
                                     pixel_scale_x=None, pixel_scale_y=None,
                                     radius=4.0, grad_stats_map=None,
                                     _return_grad=False):
@@ -210,8 +216,8 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     def process(self, gpu_arr: da.Array, **params) -> da.Array:
         edge_sigma = params.get('edge_sigma', 1.0)
         pixel_size = params.get('pixel_size', 1.0)
-        threshold_low = params.get('threshold_low', 0.1)
-        threshold_high = params.get('threshold_high', 0.3)
+        threshold_low = params.get('threshold_low', 0.2)
+        threshold_high = params.get('threshold_high', 0.5)
         psx = params.get('pixel_scale_x', None)
         psy = params.get('pixel_scale_y', None)
         mode = str(params.get("mode", "local")).lower()
@@ -256,8 +262,8 @@ class NPREdgesAlgorithm(DaskAlgorithm):
     def get_default_params(self) -> dict:
         return {
             'edge_sigma': 1.0,
-            'threshold_low': 0.1,
-            'threshold_high': 0.3,
+            'threshold_low': 0.2,
+            'threshold_high': 0.5,
             'pixel_size': 1.0,
             'mode': 'local', 'radii': None, 'weights': None,
         }
@@ -293,13 +299,19 @@ def _compute_npr_grad_stats(
         return None
     pixel_size = float(params.get("pixel_size", 1.0))
     edge_sigma = float(params.get("edge_sigma", 1.0))
-    tl = float(params.get("threshold_low", 0.1))
-    th_ = float(params.get("threshold_high", 0.3))
+    tl = float(params.get("threshold_low", 0.2))
+    th_ = float(params.get("threshold_high", 0.5))
     low_res = classify_resolution(pixel_size) in ("low", "very_low", "ultra_low")
     try:
+        from ._norm_stats import stratified_windows
+
         margin = int(min(2 * max(small) + 16, max_tile // 4))
         tile = int(min(max_tile, max(2048, 4 * margin)))
-        tiles = []
+        # radius -> list of pooled host arrays.  One GPU tile is resident at a
+        # time (the radius loop runs inside the tile loop); the previous layout
+        # held every stratified tile on the device simultaneously (~600MB VRAM
+        # for nine 4096^2 tiles).
+        pools = {float(r): [] for r in small}
         with rasterio.open(src_cog) as src:
             W, H = src.width, src.height
             nodata = src.nodata
@@ -320,35 +332,29 @@ def _compute_npr_grad_stats(
             ys, xs = np.where(vmask)
             by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
             bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
-            ch_, cw_ = max(1, (by1 - by0) // grid), max(1, (bx1 - bx0) // grid)
-            for gy in range(grid):
-                for gx in range(grid):
-                    ccy = by0 + gy * ch_ + ch_ // 2
-                    ccx = bx0 + gx * cw_ + cw_ // 2
-                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
-                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
-                    tw, th2 = min(tile, W - wx0), min(tile, H - wy0)
-                    a = _dn(src.read(1, window=Window(wx0, wy0, tw, th2),
-                                     out_dtype=np.float32, masked=True).filled(np.nan))
-                    if float(np.isfinite(a).mean()) >= min_valid_frac:
-                        tiles.append(cp.asarray(a))
-        if not tiles:
-            return None
+            for wy0, wx0, tw, th2 in stratified_windows(
+                    W, H, by0, by1, bx0, bx1, grid=grid, tile=tile):
+                a = _dn(src.read(1, window=Window(wx0, wy0, tw, th2),
+                                 out_dtype=np.float32, masked=True).filled(np.nan))
+                if float(np.isfinite(a).mean()) < min_valid_frac:
+                    continue
+                g = cp.asarray(a)
+                for r in small:
+                    grad = compute_npr_edges_spatial_block(
+                        g, edge_sigma=edge_sigma, threshold_low=tl, threshold_high=th_,
+                        pixel_size=pixel_size, radius=r, _return_grad=True)
+                    m = int(min(int(2 * r + 16), grad.shape[0] // 3, grad.shape[1] // 3))
+                    if m > 0:
+                        grad = grad[m:-m, m:-m]
+                    v = grad[~cp.isnan(grad)]
+                    if v.size:
+                        pools[float(r)].append(cp.asnumpy(v))
+                    del grad, v
+                del g
+                cp.get_default_memory_pool().free_all_blocks()
         out = {}
         for r in small:
-            pool = []
-            for g in tiles:
-                grad = compute_npr_edges_spatial_block(
-                    g, edge_sigma=edge_sigma, threshold_low=tl, threshold_high=th_,
-                    pixel_size=pixel_size, radius=r, _return_grad=True)
-                m = int(min(int(2 * r + 16), grad.shape[0] // 3, grad.shape[1] // 3))
-                if m > 0:
-                    grad = grad[m:-m, m:-m]
-                v = grad[~cp.isnan(grad)]
-                if v.size:
-                    pool.append(cp.asnumpy(v))
-                del grad, v
-            cp.get_default_memory_pool().free_all_blocks()
+            pool = pools[float(r)]
             if not pool:
                 continue
             allv = np.concatenate(pool)
@@ -359,9 +365,6 @@ def _compute_npr_grad_stats(
                 base = float(np.percentile(allv, 50))
                 rng = float(np.percentile(allv, 90)) - base
             out[int(round(r))] = (base, rng, mean)
-        for g in tiles:
-            del g
-        cp.get_default_memory_pool().free_all_blocks()
         if not out:
             return None
         logger.info("npr_edges global gradient threshold computed for radii %s",

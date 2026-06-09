@@ -43,21 +43,13 @@ except ImportError:
     logging.warning("dask registry module not found. No algorithms available.")
 
 from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS, MULTISCALE_REQUIRED_ALGOS
-from ..algorithms._impl_fractal_anomaly import _compute_fractal_relief_stats
-from ..algorithms._impl_npr_edges import _compute_npr_grad_stats
-from ..algorithms._impl_specular import _compute_specular_roughness_scale
-from ..algorithms._norm_stats import (
-    _NORM_STAT_SPECS,
-    _compute_norm_stats_tiled,
-    inject_global_stats,
-)
+from ..algorithms._norm_stats import inject_global_stats
 from ..io.raster_info import metric_pixel_scales_from_metadata
 from ..io.output_encoding import (
     SUPPORTED_OUTPUT_DTYPES,
     output_nodata_for_dtype,
     resolve_output_range,
     quantize_params,
-    apply_scale_offset,
 )
 from ..config.auto_tune import compute_dask_chunk
 from ..utils.cpu import container_cpu_count
@@ -434,9 +426,6 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         # Create a temporary directory
         tmp_parent = _select_chunk_temp_parent(int(data.nbytes))
         with tempfile.TemporaryDirectory(dir=tmp_parent) as tmpdir:
-            # Process per chunk
-            chunk_files = []
-
             # Fall back to normal processing when not a Dask array
             if not hasattr(data.data, 'to_delayed'):
                 logger.info("Data is not chunked with Dask, falling back to regular processing")
@@ -454,7 +443,6 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             n_cols = int(delayed_chunks.shape[1])
             total_chunks = n_rows * n_cols
 
-            y_dim, x_dim = data.dims[0], data.dims[1]
             src_crs = data.rio.crs if hasattr(data, 'rio') else None
 
             # ---- Direct single-file windowed write (no per-chunk files / VRT) ----
@@ -895,8 +883,10 @@ def _compute_topousm_fast_overview_coarse_field(
     try:
         with rasterio.open(src_cog) as src:
             scale = max(src.width / sample_max, src.height / sample_max, 1.0)
-            sample_w = max(128, int(src.width / scale))
-            sample_h = max(128, int(src.height / scale))
+            # Both axes from the SAME scale (no per-axis floor) so the actual
+            # decimation stays isotropic on elongated rasters.
+            sample_w = max(1, int(round(src.width / scale)))
+            sample_h = max(1, int(round(src.height / scale)))
             sample_ma = src.read(
                 1, out_shape=(sample_h, sample_w), resampling=Resampling.average,
                 out_dtype=np.float32, masked=True,
@@ -937,12 +927,19 @@ def _quantize_block_cp(block, *, a_coef: float, b_coef: float,
 
 def _estimate_output_range(result_gpu: da.Array,
                            *, lo_pct: float = 1.0, hi_pct: float = 99.0,
-                           max_samples: int = 4_000_000):
-    """Robust [p1, p99] range from a strided sample (unbounded-output fallback)."""
+                           max_window: int = 4096):
+    """Robust [p1, p99] range from a bounded central window (unbounded-output fallback).
+
+    A strided sample (``arr[::step, ::step]``) looks cheap but forces every
+    chunk of the whole result graph to compute once just for this estimate --
+    effectively doubling the run.  A contiguous central window only computes the
+    chunks it overlaps."""
     try:
-        n = int(result_gpu.size)
-        step = max(1, int((n / float(max_samples)) ** 0.5))
-        sample = result_gpu[::step, ::step].compute()
+        h, w = (int(s) for s in result_gpu.shape[:2])
+        win = max(256, min(h, w, int(max_window)))
+        y0 = max(0, (h - win) // 2)
+        x0 = max(0, (w - win) // 2)
+        sample = result_gpu[y0:y0 + win, x0:x0 + win].compute()
         valid = sample[cp.isfinite(sample)]
         if valid.size == 0:
             return (0.0, 1.0)
@@ -1061,9 +1058,14 @@ def run_pipeline(
         dem: xr.DataArray = load_input_dataarray(src_cog, chunk)
 
         # Manual NoData override: replace matching cells with NaN (lazy, chunk-preserving).
-        if nodata_override is not None and np.isfinite(nodata_override):
-            dem = dem.where(dem != np.float32(nodata_override))
-            logger.info("Applied --nodata override: %s -> NaN", float(nodata_override))
+        if nodata_override is not None:
+            if np.isnan(nodata_override):
+                # NaN cells already propagate as NoData through every NaN-aware
+                # kernel; nothing to replace.
+                logger.info("--nodata nan: NaN is already treated as NoData; no replacement needed")
+            elif np.isfinite(nodata_override):
+                dem = dem.where(dem != np.float32(nodata_override))
+                logger.info("Applied --nodata override: %s -> NaN", float(nodata_override))
 
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
@@ -1090,18 +1092,14 @@ def run_pipeline(
         )
 
         # Inject anisotropic pixel scales (simple geographic DEM support).
+        # pixel_scale_x/y are REAL signed meters per pixel; the DEM array is
+        # never rescaled -- the same convention as the tile backend, so the
+        # shared (raw-elevation) normalization stats apply to both.
         px_m_x, px_m_y, pixel_size_m, is_geo, lat_center = _detect_metric_scales_from_dataarray(dem)
         params['pixel_size'] = float(pixel_size_m)
         params.setdefault('pixel_scale_x', float(px_m_x))
         params.setdefault('pixel_scale_y', float(px_m_y))
-        # Tile path parity: set is_geographic_dem and elevation_scale.
-        # Note: in the Dask path pixel_scale_x/y are raw meter values so
-        #   elevation_scale is NOT applied to the DEM array.  The field is
-        #   provided only for algorithm-level flag consistency with the tile
-        #   pipeline (where DEM is pre-scaled by elevation_scale).
         params.setdefault('is_geographic_dem', bool(is_geo))
-        params.setdefault('elevation_scale',
-                          float(1.0 / max(pixel_size_m, 1e-6)) if is_geo else 1.0)
         if is_geo:
             ratio = abs(px_m_y) / max(abs(px_m_x), 1e-9)
             logger.info(
@@ -1363,7 +1361,6 @@ def run_pipeline(
         # 6-3.5) Quantize the output dtype (float32 passes through). NaN (NoData) -> 0,
         # valid values are linearly stretched from the algorithm's native range to [1, levels].
         out_np_dtype = "float32"
-        out_scale_offset = None
         if output_dtype in ("int16", "uint8") and result_gpu.shape == gpu_arr.shape:
             value_range = resolve_output_range(
                 algorithm, params=params, override=output_range,
@@ -1381,12 +1378,11 @@ def run_pipeline(
             # Visualization integer outputs are written as plain DN rasters
             # (uint8: 0..255, int16: raw codes) with NoData=0 and NO GDAL
             # scale/offset metadata.  Embedding scale/offset makes QGIS auto-
-            # unscale the band and present it as Float32 over the physical range
-            # (e.g. TopoUSM Fast -1.5..1.5), which looks "quantized float with NoData=0"
-            # and is confusing for a display product.  The DN<->value mapping is
-            # still logged and recorded in the COG 'parameters'/value_range attrs
-            # for anyone who needs to recover physical units.
-            out_scale_offset = None
+            # unscale the band and present it as Float32 over the physical range,
+            # which looks "quantized float with NoData=0" and is confusing for a
+            # display product.  The DN<->value mapping is still logged and
+            # recorded in the COG 'parameters'/value_range attrs for anyone who
+            # needs to recover physical units.  Same policy as the tile backend.
             logger.info(
                 "Output dtype=%s (%s): range [%.6g, %.6g] -> DN [%d, %d], NoData=0 "
                 "(DN<->value mapping: value = %.6g*DN + %.6g; not embedded as scale/offset)",
@@ -1457,16 +1453,26 @@ def run_pipeline(
                 "data_type": "float32"
             }
         elif algorithm in ['topousm_fast', 'fractal_anomaly']:
-            # Signed terrain anomaly outputs map p80(abs(value)) to +/-1,
-            # with overflow preserved for strong extrema.
+            # Signed terrain anomaly outputs map the robust p99(|value|) to +/-1;
+            # the tail beyond +/-1 passes through unclipped.
             attrs = {
                 **dem.attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
-                "value_range": "-1.5 to +1.5",
+                "value_range": "~-1 to +1 (p99-normalized, tail unclipped)",
                 "normal_range": "-1 to +1",
-                "normal_percentile": "80",
+                "normal_percentile": "99",
+                "data_type": "float32"
+            }
+        elif algorithm == 'blur':
+            # Raw smoothed elevation -- same units as the input DEM.
+            attrs = {
+                **dem.attrs,
+                "algorithm": algorithm,
+                "parameters": str(params),
+                "processing": f"Dask-CUDA {algorithm.upper()}",
+                "value_range": "elevation (input units)",
                 "data_type": "float32"
             }
         elif algorithm in [
@@ -1479,16 +1485,16 @@ def run_pipeline(
             'scale_space_surprise',
             'multi_light_uncertainty',
         ]:
-            # Unsigned analysis outputs map p80(value) to +1,
-            # with overflow preserved for strong extrema.
+            # Unsigned analysis outputs map the robust p99 to +1; normalized
+            # outputs keep an unclipped tail past 1.
             attrs = {
                 **dem.attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
-                "value_range": "0 to 1.5",
+                "value_range": "~0 to 1 (p99-normalized, tail unclipped)",
                 "normal_range": "0 to 1",
-                "normal_percentile": "80",
+                "normal_percentile": "99",
                 "data_type": "float32"
             }
         else:
@@ -1527,9 +1533,6 @@ def run_pipeline(
             write_zarr_output(result_da, dst_path, show_progress=show_progress)
         else:
             write_cog_da_chunked(result_da, dst_path, show_progress=show_progress)
-            # Record DN->physical recovery (integer outputs only); non-critical.
-            if out_scale_offset is not None:
-                apply_scale_offset(str(dst_path), out_scale_offset[0], out_scale_offset[1])
         logger.info("Pipeline completed successfully!")
         gc.collect()
         

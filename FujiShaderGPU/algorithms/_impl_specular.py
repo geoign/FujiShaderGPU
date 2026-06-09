@@ -13,19 +13,20 @@ import cupy as cp
 from cupyx.scipy.ndimage import gaussian_filter, uniform_filter
 
 from ._base import Constants, DaskAlgorithm
-
-logger = logging.getLogger(__name__)
 from ._nan_utils import (
     handle_nan_for_gradient, restore_nan,
     _resolve_spatial_radii_weights,
     _combine_multiscale_dask, _smooth_for_radius,
     large_radius_threshold, coarsen_factor_for_shape, coarse_large_radius_response,
 )
+from ._norm_stats import stratified_windows
+
+logger = logging.getLogger(__name__)
 
 
-def compute_specular_block(block, *, roughness_scale=50.0, shininess=20.0,
+def compute_specular_block(block, *, roughness_scale=20.0, shininess=10.0,
                           pixel_size=1.0, pixel_scale_x=None, pixel_scale_y=None,
-                          roughness_norm_scale=None, geographic_mode=False,
+                          roughness_norm_scale=None,
                           light_azimuth=Constants.DEFAULT_AZIMUTH,
                           light_altitude=Constants.DEFAULT_ALTITUDE):
     """Specular reflection computation (simplified Cook-Torrance model)."""
@@ -76,8 +77,7 @@ def compute_specular_block(block, *, roughness_scale=50.0, shininess=20.0,
             roughness = cp.full_like(block, 0.5)
     else:
         roughness = cp.full_like(block, 0.5)
-    eff_az = float((light_azimuth + 180.0) % 360.0) if geographic_mode else float(light_azimuth)
-    light_az_rad = cp.radians(eff_az)
+    light_az_rad = cp.radians(float(light_azimuth))
     light_alt_rad = cp.radians(light_altitude)
     light_dir = cp.array([
         cp.sin(light_az_rad) * cp.cos(light_alt_rad),
@@ -108,17 +108,15 @@ def compute_specular_block(block, *, roughness_scale=50.0, shininess=20.0,
     result = cp.clip(result, 0, 1)
     result = 0.5 + 0.5 * cp.tanh((result - 0.5) / 0.82)
     result = 0.04 + 0.92 * result
-    if geographic_mode:
-        result = 1.0 - result
     result = cp.clip(result, 0, 1)
     result = restore_nan(result, nan_mask)
     return result.astype(cp.float32)
 
 
 def compute_specular_spatial_block(
-    block, *, roughness_scale=50.0, shininess=20.0, pixel_size=1.0,
+    block, *, roughness_scale=20.0, shininess=10.0, pixel_size=1.0,
     pixel_scale_x=None, pixel_scale_y=None, roughness_norm_scale=None,
-    geographic_mode=False, light_azimuth=Constants.DEFAULT_AZIMUTH,
+    light_azimuth=Constants.DEFAULT_AZIMUTH,
     light_altitude=Constants.DEFAULT_ALTITUDE, radius=4.0,
 ):
     smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="specular")
@@ -126,7 +124,6 @@ def compute_specular_spatial_block(
         smoothed, roughness_scale=roughness_scale, shininess=shininess,
         pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
         pixel_scale_y=pixel_scale_y, roughness_norm_scale=roughness_norm_scale,
-        geographic_mode=geographic_mode,
         light_azimuth=light_azimuth, light_altitude=light_altitude,
     )
 
@@ -134,13 +131,12 @@ def compute_specular_spatial_block(
 class SpecularAlgorithm(DaskAlgorithm):
     """Specular reflection algorithm."""
     def process(self, gpu_arr, **params):
-        rs = params.get('roughness_scale', 50.0)
-        sh = params.get('shininess', 20.0)
+        rs = params.get('roughness_scale', 20.0)
+        sh = params.get('shininess', 10.0)
         ps = params.get('pixel_size', 1.0)
         psx = params.get('pixel_scale_x', None)
         psy = params.get('pixel_scale_y', None)
         rns = params.get('roughness_norm_scale', None)
-        geo = bool(params.get('is_geographic_dem', False))
         laz = params.get('light_azimuth', Constants.DEFAULT_AZIMUTH)
         lal = params.get('light_altitude', Constants.DEFAULT_ALTITUDE)
         mode = str(params.get("mode", "local")).lower()
@@ -181,7 +177,7 @@ class SpecularAlgorithm(DaskAlgorithm):
                         coarse_dem=_ov_dem, coarse_decimation=_ov_decim,
                         tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
                         roughness_scale=rs_coarse, shininess=sh,
-                        roughness_norm_scale=rns, geographic_mode=geo,
+                        roughness_norm_scale=rns,
                         light_azimuth=laz, light_altitude=lal,
                     ))
                 else:
@@ -191,7 +187,7 @@ class SpecularAlgorithm(DaskAlgorithm):
                         meta=cp.empty((0, 0), dtype=cp.float32),
                         roughness_scale=rs, shininess=sh, pixel_size=ps,
                         pixel_scale_x=psx, pixel_scale_y=psy,
-                        roughness_norm_scale=rns, geographic_mode=geo,
+                        roughness_norm_scale=rns,
                         light_azimuth=laz, light_altitude=lal, radius=float(radius)))
             return _combine_multiscale_dask(responses, weights=weights, agg=agg)
         return gpu_arr.map_overlap(
@@ -199,7 +195,7 @@ class SpecularAlgorithm(DaskAlgorithm):
             dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
             roughness_scale=rs, shininess=sh, pixel_size=ps,
             pixel_scale_x=psx, pixel_scale_y=psy,
-            roughness_norm_scale=rns, geographic_mode=geo,
+            roughness_norm_scale=rns,
             light_azimuth=laz, light_altitude=lal)
 
     def get_default_params(self):
@@ -233,7 +229,6 @@ def _compute_specular_roughness_scale(
     src_cog: str,
     params: dict,
     *,
-    elevation_scale: float = 1.0,
     grid: int = 3,
     max_tile: int = 4096,
     min_valid_frac: float = 0.02,
@@ -245,10 +240,12 @@ def _compute_specular_roughness_scale(
     tile-boundary seams -- pronounced on large / geographic DEMs where terrain
     roughness varies strongly across the extent.  A single global p95 used as
     ``roughness_norm_scale`` makes the normalization identical for every tile.
-    Computed at full resolution (kernel = roughness_scale) so the magnitude
-    matches the per-block roughness.  Backend-neutral (rasterio + cupy) so the
-    Dask and tile pipelines can share one copy.  Returns ``None`` on failure
-    (caller falls back to the per-block p95)."""
+    Computed at full resolution (kernel = roughness_scale) on the **raw
+    elevation** -- both backends now feed raw elevation to the algorithms, so the
+    magnitude matches the per-block roughness on projected and geographic DEMs
+    alike.  Backend-neutral (rasterio + cupy) so the Dask and tile pipelines can
+    share one copy.  Returns ``None`` on failure (caller falls back to the
+    per-block p95)."""
     try:
         import rasterio
         from rasterio.windows import Window
@@ -256,7 +253,7 @@ def _compute_specular_roughness_scale(
     except Exception as exc:
         logger.warning("specular roughness-stats helpers unavailable: %s", exc)
         return None
-    kernel = max(3, int(float((params or {}).get("roughness_scale", 50.0))))
+    kernel = max(3, int(float((params or {}).get("roughness_scale", 20.0))))
     try:
         margin = int(min(kernel, max_tile // 4))
         tile = int(min(max_tile, max(2048, 4 * margin)))
@@ -281,35 +278,24 @@ def _compute_specular_roughness_scale(
             ys, xs = np.where(vmask)
             by0, by1 = int(ys.min()) * cov, min(H, (int(ys.max()) + 1) * cov)
             bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
-            ch_, cw_ = max(1, (by1 - by0) // grid), max(1, (bx1 - bx0) // grid)
-            for gy in range(grid):
-                for gx in range(grid):
-                    ccy = by0 + gy * ch_ + ch_ // 2
-                    ccx = bx0 + gx * cw_ + cw_ // 2
-                    wy0 = int(min(max(0, ccy - tile // 2), max(0, H - tile)))
-                    wx0 = int(min(max(0, ccx - tile // 2), max(0, W - tile)))
-                    tw, th = min(tile, W - wx0), min(tile, H - wy0)
-                    a = _dn(src.read(1, window=Window(wx0, wy0, tw, th),
-                                     out_dtype=np.float32, masked=True).filled(np.nan))
-                    if float(np.isfinite(a).mean()) < min_valid_frac:
-                        continue
-                    g = cp.asarray(a)
-                    if elevation_scale != 1.0:
-                        # Match the per-block roughness magnitude on backends that
-                        # pre-scale elevation (tile path multiplies the DEM by a
-                        # latitude-dependent elevation_scale before compute).
-                        g = g * cp.float32(elevation_scale)
-                    rough = _roughness_p95_block(g, kernel)
-                    m = int(min(margin, rough.shape[0] // 3, rough.shape[1] // 3))
-                    if m > 0:
-                        rough = rough[m:-m, m:-m]
-                    nm = cp.isnan(g[m:-m, m:-m]) if m > 0 else cp.isnan(g)
-                    vals = rough[~nm]
-                    vals = vals[vals > 0]
-                    if vals.size:
-                        pooled.append(cp.asnumpy(vals))
-                    del g, rough, vals
-                    cp.get_default_memory_pool().free_all_blocks()
+            for wy0, wx0, tw, th in stratified_windows(
+                    W, H, by0, by1, bx0, bx1, grid=grid, tile=tile):
+                a = _dn(src.read(1, window=Window(wx0, wy0, tw, th),
+                                 out_dtype=np.float32, masked=True).filled(np.nan))
+                if float(np.isfinite(a).mean()) < min_valid_frac:
+                    continue
+                g = cp.asarray(a)
+                rough = _roughness_p95_block(g, kernel)
+                m = int(min(margin, rough.shape[0] // 3, rough.shape[1] // 3))
+                if m > 0:
+                    rough = rough[m:-m, m:-m]
+                nm = cp.isnan(g[m:-m, m:-m]) if m > 0 else cp.isnan(g)
+                vals = rough[~nm]
+                vals = vals[vals > 0]
+                if vals.size:
+                    pooled.append(cp.asnumpy(vals))
+                del g, rough, vals
+                cp.get_default_memory_pool().free_all_blocks()
         if not pooled:
             return None
         p95 = float(np.percentile(np.concatenate(pooled), 95))

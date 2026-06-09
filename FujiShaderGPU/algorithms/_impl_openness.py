@@ -6,6 +6,7 @@ Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import cupy as cp
+import numpy as np
 import dask.array as da
 
 from ._base import Constants, DaskAlgorithm
@@ -16,7 +17,7 @@ from ._nan_utils import (
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
     large_radius_threshold, multiscale_response_fields,
 )
-from ._global_stats import apply_display_stretch_dask, robust_unsigned_stretch_stat_func
+from ._global_stats import apply_display_stretch_dask
 
 
 def compute_openness_vectorized(block: cp.ndarray, *,
@@ -46,14 +47,16 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     h, w = block.shape
     nan_mask = cp.isnan(block)
 
-    angles = cp.linspace(0, 2 * cp.pi, num_directions, endpoint=False)
-    directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
+    angles = np.linspace(0, 2 * np.pi, num_directions, endpoint=False)
+    directions = np.stack([np.cos(angles), np.sin(angles)], axis=1)
 
     # Per-azimuth horizon extreme initial value: -90deg so cp.maximum captures the
     # steepest rise (positive), +90deg so cp.minimum captures the steepest fall.
     init_val = -cp.pi/2 if openness_type == 'positive' else cp.pi/2
 
-    distances = cp.unique(cp.linspace(0.1, 1.0, 10) * max_distance).astype(int)
+    # Cast to int BEFORE dedup so e.g. max_distance=5 yields [1,2,3,4,5] instead
+    # of [1,1,2,2,3,3,4,4,5] (duplicate ray samples = pure wasted shifts).
+    distances = np.unique((np.linspace(0.1, 1.0, 10) * max_distance).astype(int))
     distances = distances[distances > 0]
 
     pad_value = Constants.NAN_FILL_VALUE_POSITIVE if openness_type == 'positive' else Constants.NAN_FILL_VALUE_NEGATIVE
@@ -64,6 +67,16 @@ def compute_openness_vectorized(block: cp.ndarray, *,
         _sx = float(pixel_size) if pixel_size else 1.0
     if _sy < 1e-9:
         _sy = float(pixel_size) if pixel_size else 1.0
+
+    # Pad ONCE with the maximum offset and take shifted views by slicing.  The
+    # previous per-(direction, distance) cp.pad allocated and copied a padded
+    # block for every sample (up to num_directions * len(distances) times).
+    D = int(max(distances)) if distances.size else 0
+    if D > 0:
+        if nan_mask.any():
+            padded_all = cp.pad(block, D, mode='constant', constant_values=pad_value)
+        else:
+            padded_all = cp.pad(block, D, mode='edge')
 
     # Accumulate the per-azimuth angle (zenith for positive, nadir for negative)
     # then divide by the number of azimuths that contributed a valid sample.
@@ -82,21 +95,8 @@ def compute_openness_vectorized(block: cp.ndarray, *,
             if offset_x == 0 and offset_y == 0:
                 continue
 
-            pad_left = max(0, -offset_x)
-            pad_right = max(0, offset_x)
-            pad_top = max(0, -offset_y)
-            pad_bottom = max(0, offset_y)
-
-            if nan_mask.any():
-                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)),
-                            mode='constant', constant_values=pad_value)
-            else:
-                padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)),
-                            mode='edge')
-
-            start_y = pad_top + offset_y
-            start_x = pad_left + offset_x
-            shifted = padded[start_y:start_y+h, start_x:start_x+w]
+            shifted = padded_all[D + offset_y:D + offset_y + h,
+                                 D + offset_x:D + offset_x + w]
 
             phys_dx = float(offset_x) * _sx
             phys_dy = float(offset_y) * _sy

@@ -44,10 +44,10 @@ PIPELINE_ARGS: List[ArgSpec] = [
              "visual_saliency need multiple scales, so local falls back to spatial with a warning")),
     (("--radii",), dict(
         type=str,
-        help="Explicit spatial radii (px), e.g. 4,16,64; when omitted, YAML is auto-selected by pixel size")),
+        help="Explicit spatial radii (px), e.g. 4,16,64; when omitted, geometric radii are auto-derived from the DEM short side")),
     (("--weights",), dict(
         type=str,
-        help="Spatial weights (e.g. 0.5,0.3,0.2); when omitted, YAML/equal weights are applied")),
+        help="Spatial weights (e.g. 0.5,0.3,0.2); when omitted, a 2**n near-weighted profile is applied")),
     (("--agg",), dict(
         choices=["mean", "min", "max", "sum", "stack"], default="mean",
         help="Aggregation method across scales (default: mean)")),
@@ -61,7 +61,7 @@ ALGORITHM_ARGS: List[ArgSpec] = [
     (("--z-factor",), dict(type=float, default=1.0, help="Vertical exaggeration (default: 1.0)")),
     (("--multiscale",), dict(action="store_true", help="Run multiscale Hillshade")),
     # Slope
-    (("--unit",), dict(choices=["degree", "percent", "radians"], default="degree", help="Slope unit (default: degree)")),
+    (("--unit",), dict(choices=["degree", "percent", "radian"], default="degree", help="Slope unit (default: degree)")),
     # Curvature
     (("--curvature-type",), dict(choices=["mean", "gaussian", "planform", "profile"], default="mean", help="Curvature type (default: mean)")),
     # Openness / Ambient Occlusion (shared analysis radius)
@@ -84,10 +84,6 @@ ALGORITHM_ARGS: List[ArgSpec] = [
     (("--blur-radius",), dict(type=float, default=16.0, help="Blur Gaussian sigma in pixels (default: 16.0; --radii first value overrides it)")),
     # Visual saliency
     (("--vs-scales",), dict(type=str, help="Visual saliency scales, comma-separated (e.g. 2,4,8,16)")),
-    (("--global-stats",), dict(
-        action=argparse.BooleanOptionalAction, default=True, dest="use_global_stats",
-        help="Use global statistics for algorithms that support them (default: enabled)")),
-    (("--downsample-factor",), dict(type=int, default=20, help="Downsample factor (default: 20)")),
     # NPR edges
     (("--edge-sigma",), dict(type=float, default=1.0, help="Edge-detection blur strength (default: 1.0)")),
     (("--threshold-low",), dict(type=float, default=0.2, help="Edge-detection lower threshold (default: 0.2)")),
@@ -274,8 +270,6 @@ def build_algo_params(args: argparse.Namespace) -> dict:
     elif algorithm == "visual_saliency":
         if getattr(args, "vs_scales_list", None):
             p["scales"] = args.vs_scales_list
-        p["use_global_stats"] = bool(getattr(args, "use_global_stats", True))
-        p["downsample_factor"] = args.downsample_factor
 
     elif algorithm == "npr_edges":
         p["edge_sigma"] = args.edge_sigma

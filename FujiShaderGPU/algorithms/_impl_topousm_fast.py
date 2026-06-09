@@ -261,7 +261,7 @@ def compute_topousm_fast_input_sample_stats(
         pixel_size=float(pixel_size),
     )
     stats = topousm_fast_stat_func(topousm_fast_sample)
-    logger.info("TopoUSM Fast global normalization stats estimated: abs_p80=%.6f", float(stats[0]))
+    logger.info("TopoUSM Fast global normalization stats estimated: abs_p99=%.6f", float(stats[0]))
     return stats
 
 

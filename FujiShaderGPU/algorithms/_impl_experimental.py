@@ -193,7 +193,6 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
                 compute_scale_space_surprise_block,
                 {'scales': scales, 'enhancement': enhancement, 'normalize': False,
                  'weights': weights},
-                downsample_factor=params.get('downsample_factor', None),
                 depth=min(int(max(1, cp.ceil(max(scales) * 4).item())) + 1, Constants.MAX_DEPTH),
                 algorithm_name='scale_space_surprise',
             )

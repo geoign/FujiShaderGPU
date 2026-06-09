@@ -43,11 +43,15 @@ def compute_curvature_block(block, *, curvature_type='mean', pixel_size=1.0,
     elif curvature_type == 'gaussian':
         curvature = (dxx * dyy - dxy**2) / cp.power(1 + dx**2 + dy**2, 2)
     elif curvature_type == 'planform':
-        curvature = (-2 * (dx**2 * dxx + 2 * dx * dy * dxy + dy**2 * dyy) /
+        # Plan (contour) curvature: kc = -(q^2*r - 2pqs + p^2*t) / (p^2+q^2)^(3/2)
+        # (zero where contours are straight, e.g. a uniform inclined plane).
+        curvature = (-(dy**2 * dxx - 2 * dx * dy * dxy + dx**2 * dyy) /
                     (cp.power(dx**2 + dy**2, 1.5) + 1e-10))
     else:  # profile
-        curvature = (-2 * (dx**2 * dyy - 2 * dx * dy * dxy + dy**2 * dxx) /
-                    ((dx**2 + dy**2) * cp.power(1 + dx**2 + dy**2, 0.5) + 1e-10))
+        # Profile curvature (along the gradient / slope line):
+        # kp = -(p^2*r + 2pqs + q^2*t) / ((p^2+q^2) * (1+p^2+q^2)^(3/2))
+        curvature = (-(dx**2 * dxx + 2 * dx * dy * dxy + dy**2 * dyy) /
+                    ((dx**2 + dy**2) * cp.power(1 + dx**2 + dy**2, 1.5) + 1e-10))
     curvature_normalized = cp.tanh(curvature * 100)
     result = (curvature_normalized + 1) / 2
     result = cp.power(result, Constants.DEFAULT_GAMMA)

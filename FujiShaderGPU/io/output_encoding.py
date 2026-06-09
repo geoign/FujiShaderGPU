@@ -13,8 +13,11 @@ the result can optionally be quantized to a compact integer COG:
           get maximum tonal resolution; ``DN = 0`` (== value ~0, i.e. flat ground)
           doubles as NoData -- visually negligible since it is the flat midtone.
         - ``uint8`` centres value 0 at ``128`` and spans ``[1, 255]`` (0 = NoData).
-- GDAL ``scale``/``offset`` are recorded (``value = scale*DN + offset``) so the
-  physical value is recoverable; for ``DN = 0`` (NoData) the value is undefined.
+- Integer outputs are plain DN **display products**: no GDAL ``scale``/``offset``
+  is embedded (QGIS would auto-unscale the band, and editing a finished COG in
+  place breaks its layout guarantee).  The DN<->value mapping
+  (``value = scale*DN + offset``) is logged by both backends and recorded in the
+  Dask COG attrs, so the physical value remains recoverable when needed.
 
 Compute stays float32 on the GPU; only the final encoding changes -- so the GPU
 math and its accuracy are unaffected, and ``float32`` output is byte-for-byte the
@@ -158,29 +161,5 @@ def quantize_array(arr, qp: Dict[str, float], dtype: str):
     dn = np.clip(dn, qp["dn_min"], qp["dn_max"])
     dn = np.where(np.isnan(a), 0.0, dn)
     return dn.astype(np.dtype(dtype))
-
-
-def apply_scale_offset(path: str, scale: float, offset: float) -> bool:
-    """Best-effort GDAL band scale/offset write (DN -> physical recovery).
-
-    Records ``value = scale*DN + offset`` on band 1 so a viewer can recover the
-    physical value from the integer codes.  Returns True on success; failures are
-    non-critical and swallowed by callers.  Shared by both backends so integer
-    outputs carry identical scale/offset metadata.
-    """
-    try:
-        from osgeo import gdal
-    except Exception:
-        return False
-    ds = gdal.Open(str(path), gdal.GA_Update)
-    if ds is None:
-        return False
-    try:
-        band = ds.GetRasterBand(1)
-        band.SetScale(float(scale))
-        band.SetOffset(float(offset))
-        return True
-    finally:
-        ds = None
 
 

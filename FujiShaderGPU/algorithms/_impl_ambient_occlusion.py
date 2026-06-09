@@ -6,6 +6,7 @@ Module split out from dask_shared.py (Phase 2).
 """
 from __future__ import annotations
 import cupy as cp
+import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
@@ -17,7 +18,7 @@ from ._nan_utils import (
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
     large_radius_threshold, multiscale_response_fields,
 )
-from ._global_stats import apply_display_stretch_dask, robust_unsigned_stretch_stat_func
+from ._global_stats import apply_display_stretch_dask
 
 
 def compute_ambient_occlusion_block(block: cp.ndarray, *,
@@ -42,10 +43,23 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     h, w = block.shape
     nan_mask = cp.isnan(block)
 
-    angles = cp.linspace(0, 2 * cp.pi, num_samples, endpoint=False)
-    directions = cp.stack([cp.cos(angles), cp.sin(angles)], axis=1)
+    angles = np.linspace(0, 2 * np.pi, num_samples, endpoint=False)
+    directions = np.stack([np.cos(angles), np.sin(angles)], axis=1)
 
-    r_factors = cp.array([0.25, 0.5, 0.75, 1.0])
+    r_factors = (0.25, 0.5, 0.75, 1.0)
+
+    _sx = abs(float(pixel_scale_x)) if pixel_scale_x is not None else float(pixel_size)
+    _sy = abs(float(pixel_scale_y)) if pixel_scale_y is not None else float(pixel_size)
+    if _sx < 1e-9:
+        _sx = float(pixel_size) if pixel_size else 1.0
+    if _sy < 1e-9:
+        _sy = float(pixel_size) if pixel_size else 1.0
+
+    # Pad ONCE with the maximum offset and take shifted views by slicing; the
+    # previous per-sample cp.pad allocated/copied a padded block for each of the
+    # num_samples * 4 ring samples.
+    D = max(1, int(round(float(radius))))
+    padded_all = cp.pad(block, D, mode='edge')
 
     occlusion_total = cp.zeros((h, w), dtype=cp.float32)
     sample_count = cp.zeros((h, w), dtype=cp.float32)
@@ -53,8 +67,8 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
     for r_factor in r_factors:
         r = radius * r_factor
 
-        dx_all = cp.round(r * directions[:, 0]).astype(int)
-        dy_all = cp.round(r * directions[:, 1]).astype(int)
+        dx_all = np.round(r * directions[:, 0]).astype(int)
+        dy_all = np.round(r * directions[:, 1]).astype(int)
 
         for i in range(num_samples):
             dx = int(dx_all[i])
@@ -63,28 +77,12 @@ def compute_ambient_occlusion_block(block: cp.ndarray, *,
             if dx == 0 and dy == 0:
                 continue
 
-            pad_left = max(0, -dx)
-            pad_right = max(0, dx)
-            pad_top = max(0, -dy)
-            pad_bottom = max(0, dy)
-
-            padded = cp.pad(block, ((pad_top, pad_bottom), (pad_left, pad_right)),
-                        mode='edge')
-
-            start_y = pad_top + dy
-            start_x = pad_left + dx
-            shifted = padded[start_y:start_y+h, start_x:start_x+w]
+            shifted = padded_all[D + dy:D + dy + h, D + dx:D + dx + w]
 
             height_diff = shifted - block
-            _sx = abs(float(pixel_scale_x)) if pixel_scale_x is not None else float(pixel_size)
-            _sy = abs(float(pixel_scale_y)) if pixel_scale_y is not None else float(pixel_size)
-            if _sx < 1e-9:
-                _sx = float(pixel_size) if pixel_size else 1.0
-            if _sy < 1e-9:
-                _sy = float(pixel_size) if pixel_size else 1.0
             phys_dx_ao = float(dx) * _sx
             phys_dy_ao = float(dy) * _sy
-            distance = max(float(cp.sqrt(phys_dx_ao ** 2 + phys_dy_ao ** 2)), 1e-9)
+            distance = max(float(np.hypot(phys_dx_ao, phys_dy_ao)), 1e-9)
             occlusion_angle = cp.arctan(height_diff / distance)
 
             max_angle = cp.pi / 4

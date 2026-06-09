@@ -155,7 +155,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
 
         norm_min, norm_scale = self._resolve_norm_stats(gpu_arr, scales, weights, params)
         if params.get('verbose', False):
-            logger.info("Multiscale Terrain global stats: min=%.3f, p80_scale=%.3f", norm_min, norm_scale)
+            logger.info("Multiscale Terrain global stats: min=%.3f, p99_scale=%.3f", norm_min, norm_scale)
 
         pixel_size = float(params.get('pixel_size', 1.0))
         psx = params.get('pixel_scale_x', None)
@@ -217,7 +217,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
     def get_default_params(self):
         return {
             'scales': [1, 10, 50, 100], 'weights': None,
-            'downsample_factor': None, 'verbose': False,
+            'verbose': False,
         }
 
 

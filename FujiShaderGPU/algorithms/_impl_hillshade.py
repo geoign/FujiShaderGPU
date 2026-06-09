@@ -20,8 +20,16 @@ from ._nan_utils import (
 def compute_hillshade_block(block, *, azimuth=Constants.DEFAULT_AZIMUTH,
                            altitude=Constants.DEFAULT_ALTITUDE, z_factor=1.0,
                            pixel_size=1.0, pixel_scale_x=None,
-                           pixel_scale_y=None, geographic_mode=False):
-    """Hillshade computation for a single block."""
+                           pixel_scale_y=None):
+    """Hillshade computation for a single block.
+
+    Geotransform orientation is handled uniformly through the signs of
+    ``pixel_scale_x`` / ``pixel_scale_y`` (east/north derivative correction), so
+    geographic and projected DEMs share the exact same formula and tone scale.
+    (The old ``geographic_mode`` azimuth-flip + ``1 - hillshade`` inversion was a
+    leftover workaround and produced a different, inverted tone on geographic
+    DEMs; it has been removed.)
+    """
     nan_mask = cp.isnan(block)
     altitude_rad = cp.radians(altitude)
     dy, dx, nan_mask = handle_nan_for_gradient(
@@ -34,17 +42,14 @@ def compute_hillshade_block(block, *, azimuth=Constants.DEFAULT_AZIMUTH,
     dz_d_north = dy * sign_y
     normal = cp.stack([-dz_d_east, -dz_d_north, cp.ones_like(dx)], axis=-1)
     normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
-    effective_azimuth = float((azimuth + 180.0) % 360.0) if geographic_mode else float(azimuth)
-    eff_az_rad = cp.radians(effective_azimuth)
+    az_rad = cp.radians(float(azimuth))
     light_dir = cp.array([
-        cp.sin(eff_az_rad) * cp.cos(altitude_rad),
-        cp.cos(eff_az_rad) * cp.cos(altitude_rad),
+        cp.sin(az_rad) * cp.cos(altitude_rad),
+        cp.cos(az_rad) * cp.cos(altitude_rad),
         cp.sin(altitude_rad),
     ])
     hillshade = cp.sum(normal * light_dir.reshape(1, 1, 3), axis=-1)
     hillshade = cp.clip(hillshade, 0.0, 1.0).astype(cp.float32)
-    if geographic_mode:
-        hillshade = 1.0 - hillshade
     hillshade = restore_nan(hillshade, nan_mask)
     return hillshade
 
@@ -53,12 +58,12 @@ def compute_hillshade_spatial_block(block, *, azimuth=Constants.DEFAULT_AZIMUTH,
                                    altitude=Constants.DEFAULT_ALTITUDE,
                                    z_factor=1.0, pixel_size=1.0,
                                    pixel_scale_x=None, pixel_scale_y=None,
-                                   geographic_mode=False, radius=4.0):
+                                   radius=4.0):
     smoothed = _smooth_for_radius(block, radius, pixel_size=pixel_size, algorithm_name="hillshade")
     return compute_hillshade_block(
         smoothed, azimuth=azimuth, altitude=altitude, z_factor=z_factor,
         pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-        pixel_scale_y=pixel_scale_y, geographic_mode=geographic_mode,
+        pixel_scale_y=pixel_scale_y,
     )
 
 
@@ -73,7 +78,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
         pixel_size = params.get('pixel_size', 1.0)
         pixel_scale_x = params.get('pixel_scale_x', None)
         pixel_scale_y = params.get('pixel_scale_y', None)
-        geographic_mode = bool(params.get('is_geographic_dem', False))
+        is_geo = bool(params.get('is_geographic_dem', False))
         multiscale = params.get('multiscale', False)
         radii = params.get('radii', [1])
         weights = params.get('weights', None)
@@ -97,11 +102,10 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 depth_for_scale=lambda rr: max(2, int(float(rr) * 2 + 1)),
                 is_large=lambda rr: int(round(float(rr))) > thr,
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-                pixel_scale_y=pixel_scale_y, is_geographic=geographic_mode,
+                pixel_scale_y=pixel_scale_y, is_geographic=is_geo,
                 coarse_dem=params.get("_overview_coarse_dem"),
                 coarse_decimation=params.get("_overview_decimation"), tile_origin=params.get("_tile_origin"), tile_full_shape=params.get("_tile_full_shape"),
-                azimuth=azimuth, altitude=altitude, z_factor=z_factor,
-                geographic_mode=geographic_mode)
+                azimuth=azimuth, altitude=altitude, z_factor=z_factor)
             stacked = da.stack(results, axis=0)
             if agg == "stack":
                 return stacked
@@ -131,7 +135,7 @@ class HillshadeAlgorithm(DaskAlgorithm):
                 dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
                 azimuth=azimuth, altitude=altitude, z_factor=z_factor,
                 pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
-                pixel_scale_y=pixel_scale_y, geographic_mode=geographic_mode,
+                pixel_scale_y=pixel_scale_y,
             )
 
     def get_default_params(self):

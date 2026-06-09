@@ -48,7 +48,6 @@ from ._nan_utils import (
 
 # --- _global_stats.py ---
 from ._global_stats import (
-    determine_optimal_downsample_factor,
     compute_global_stats,
     apply_global_normalization,
 )

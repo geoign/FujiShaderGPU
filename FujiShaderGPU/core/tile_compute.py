@@ -37,8 +37,12 @@ def _normalize_topousm_fast_radii_and_weights(
             radius = int(round(numeric / pixel_size))
         else:
             radius = int(round(numeric))
-        if radius < 2:
-            radius = 2
+        # Keep radius 1 as-is: --mode local injects radii=[1] and the Dask
+        # backend computes it as a sigma-1 gaussian; clamping it to 2 here made
+        # the tile output a radius-2 box mean -- a different kernel whose ~2x
+        # larger magnitude no longer matched the shared normalization stats.
+        if radius < 1:
+            radius = 1
         # NOTE: The previous hard cap (radius <= 256) that limited the per-tile
         # halo on the Windows/tile backend has been removed so user-specified
         # radii are honoured as-is.  Large radii enlarge the per-tile window and
@@ -81,14 +85,11 @@ def _normalize_topousm_fast_radii_and_weights(
 
 def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma: float, multiscale_mode: bool,
                        target_distances, weights, pixel_size: float, algo_params: Dict[str, Any]):
-    elevation_scale = float(algo_params.get("elevation_scale", 1.0) or 1.0)
-    if not math.isfinite(elevation_scale) or elevation_scale <= 0:
-        elevation_scale = 1.0
-    if abs(elevation_scale - 1.0) > 1e-9:
-        dem_in = dem_gpu * cp.float32(elevation_scale)
-    else:
-        dem_in = dem_gpu
-
+    # The DEM is fed to the algorithms as-is (raw elevation), exactly like the
+    # Dask backend: metric handling lives entirely in pixel_scale_x/y (signed
+    # meters per pixel).  The old elevation_scale pre-multiply scaled the
+    # output magnitude of elevation-based algorithms on geographic DEMs away
+    # from the shared (raw-elevation) normalization stats and washed them out.
     if algorithm == 'topousm_fast':
         radii, topousm_fast_weights = _normalize_topousm_fast_radii_and_weights(
             target_distances=target_distances,
@@ -105,7 +106,7 @@ def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma
             'sigma': sigma,
         }
         for key in (
-            "global_stats", "downsample_factor",
+            "global_stats",
             # Large-radius-from-overview fast path (set by process_dem_tiles /
             # process_single_tile); TopoUSMFastAlgorithm uses these instead of `radii`.
             "_topousm_fast_coarse_field", "_topousm_fast_small_radii", "_topousm_fast_small_weights",
@@ -113,17 +114,12 @@ def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma
         ):
             if key in algo_params and algo_params[key] is not None:
                 params[key] = algo_params[key]
-        return algo_instance.process(dem_in, **params)
+        return algo_instance.process(dem_gpu, **params)
 
-    if algorithm == 'scale_space_surprise':
-        # Avoid per-tile percentile normalization (causes seam artifacts).
-        # Tile pipeline will apply one global normalization pass afterwards.
-        params = {'sigma': sigma, 'pixel_size': pixel_size, **algo_params}
-        params['normalize'] = False
-        return algo_instance.process(dem_in, **params)
-
+    # scale_space_surprise normalizes internally with the injected global stats
+    # (seam-free), exactly like the Dask backend -- no tile-side special case.
     params = {'sigma': sigma, 'pixel_size': pixel_size, **algo_params}
-    return algo_instance.process(dem_in, **params)
+    return algo_instance.process(dem_gpu, **params)
 
 
 def apply_nodata_mask(result_gpu: cp.ndarray, mask_nodata, nodata):

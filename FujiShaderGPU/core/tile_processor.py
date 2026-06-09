@@ -22,10 +22,9 @@ from ..io.output_encoding import (
     resolve_output_range,
     quantize_params,
     quantize_array,
-    apply_scale_offset,
 )
-from ..algorithms._normalization import NORMAL_PERCENTILE, OVERFLOW_LIMIT
-from ..algorithms._norm_stats import _NORM_STAT_SPECS, _compute_norm_stats_tiled, inject_global_stats
+from ..algorithms._base import Constants
+from ..algorithms._norm_stats import inject_global_stats
 # Spatial radii/weights are auto-derived from the DEM short side via the shared
 # rule (single source of truth in algorithms.common.spatial_mode).
 from ..algorithms.common.spatial_mode import (
@@ -45,7 +44,7 @@ import cupy as cp
 from rasterio.windows import Window
 from rasterio.transform import Affine
 from rasterio.enums import Resampling
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -70,21 +69,11 @@ DEFAULT_ALGORITHMS = {
     "multi_light_uncertainty": "MultiLightUncertaintyAlgorithm",
 }
 
-GLOBAL_STATS_NATIVE_ALGOS = {
-    "topousm_fast",
-    "multiscale_terrain",
-    "visual_saliency",
-    "fractal_anomaly",
-    # ambient_occlusion / openness apply their own display stretch internally
-    # (apply_display_stretch_dask in .process()), so the tile pipeline must NOT
-    # normalize them again (double-normalization blew out / crushed the output).
-    "ambient_occlusion",
-    "openness",
-}
-# blur outputs raw smoothed elevation (same units as the input); the tile pipeline
-# must NOT apply its generic [0,1] display normalization to it.
-NO_NORMALIZATION_ALGOS = {"hillshade", "slope", "npr_edges", "blur"}
-SIGNED_NORMALIZATION_ALGOS = {"topousm_fast", "fractal_anomaly"}
+# NOTE: output normalization is owned entirely by the algorithms themselves
+# (internal normalization with globally injected stats via inject_global_stats),
+# identically on both backends.  The tile pipeline no longer applies any
+# post-normalization of its own (the old tile-only generic p1-p99 stretch made
+# Windows output diverge from the Dask backend).
 
 
 def _sanitize_spatial_radii_weights_for_tile(
@@ -112,7 +101,7 @@ def _sanitize_spatial_radii_weights_for_tile(
                 continue
             if fv <= 0:
                 continue
-            out_no_cap.append(max(2, int(round(fv))))
+            out_no_cap.append(max(1, int(round(fv))))
         if not out_no_cap:
             return None, weights, None
         return out_no_cap, weights, None
@@ -198,30 +187,6 @@ def _replace_nodata_with_nan(data: np.ndarray, nodata: Optional[float]) -> np.nd
     return np.where(mask, np.nan, data)
 
 
-def _is_global_stats_required(algorithm: str, mode: str) -> bool:
-    mode_norm = str(mode or "local").lower()
-    # Specular uses internal tone mapping + global roughness scale only.
-    # Disable generic global output normalization to avoid end clipping.
-    if algorithm == "specular":
-        return False
-    if mode_norm == "spatial":
-        return algorithm not in NO_NORMALIZATION_ALGOS
-    if mode_norm == "local":
-        return algorithm not in NO_NORMALIZATION_ALGOS
-    return False
-
-
-def _normalization_target_range(algorithm: str) -> str:
-    """Return output normalization policy: 'none' | 'unit' | 'signed'."""
-    if algorithm in NO_NORMALIZATION_ALGOS:
-        return "none"
-    if algorithm == "scale_space_surprise":
-        return "unit_surprise"
-    if algorithm in SIGNED_NORMALIZATION_ALGOS:
-        return "signed"
-    return "unit"
-
-
 def _required_padding_for_algorithm(
     algorithm: str,
     algo_params: dict,
@@ -247,7 +212,7 @@ def _required_padding_for_algorithm(
 
     required = max(32, base)
 
-    _MAX_DEPTH = 150  # keep in sync with algorithms._base.Constants.MAX_DEPTH
+    _MAX_DEPTH = int(Constants.MAX_DEPTH)
     _mode = str(algo_params.get("mode", "spatial")).lower()
     _is_geo = bool(algo_params.get("is_geographic_dem", False))
     # Overview path engaged for these runs (mirrors the injection gate); large
@@ -485,73 +450,6 @@ def _warn_if_compute_cost_high(
         )
 
 
-def _unsigned_p80_stats_np(data: np.ndarray) -> Optional[Tuple[float, float]]:
-    valid = data[np.isfinite(data)]
-    if valid.size == 0:
-        return None
-    lo = float(np.percentile(valid, 1.0))
-    scale = float(np.percentile(np.maximum(valid - lo, 0.0), NORMAL_PERCENTILE))
-    if not (np.isfinite(lo) and np.isfinite(scale)) or scale <= 1e-9:
-        return None
-    return (lo, scale)
-def _normalize_by_global_stats(
-    arr: np.ndarray,
-    stats: Union[Tuple[float, float], List[Tuple[float, float]], None],
-    target_range: str = "unit",
-) -> np.ndarray:
-    """Apply robust global normalization for tile consistency."""
-    if stats is None:
-        return arr
-
-    if arr.ndim == 2 and isinstance(stats, (tuple, list)) and len(stats) == 2 and not isinstance(stats[0], (tuple, list)):
-        lo, scale = float(stats[0]), float(stats[1])
-        src = arr.astype(np.float32, copy=False)
-        if target_range == "signed":
-            if np.isfinite(lo) and np.isfinite(scale) and scale > lo:
-                center = 0.5 * (lo + scale)
-                half = max(abs(scale - center), abs(lo - center), 1e-6)
-                out = (src - center) / half
-                return np.clip(out, -OVERFLOW_LIMIT, OVERFLOW_LIMIT).astype(np.float32, copy=False)
-            return arr
-        if np.isfinite(lo) and np.isfinite(scale) and scale > 1e-9:
-            out = np.clip((src - lo) / scale, 0.0, OVERFLOW_LIMIT)
-            if target_range == "unit_surprise":
-                return np.power(out, 1.0 / 2.0).astype(np.float32, copy=False)
-            return np.clip(out, 0.0, OVERFLOW_LIMIT).astype(np.float32, copy=False)
-        return arr
-
-    if arr.ndim == 2 and isinstance(stats, (tuple, list)) and len(stats) == 1:
-        scale = float(stats[0])
-        if np.isfinite(scale) and scale > 1e-9:
-            src = arr.astype(np.float32, copy=False)
-            if target_range == "signed":
-                return np.clip(src / scale, -OVERFLOW_LIMIT, OVERFLOW_LIMIT).astype(np.float32, copy=False)
-            return np.clip(src / scale, 0.0, OVERFLOW_LIMIT).astype(np.float32, copy=False)
-        return arr
-
-    if arr.ndim == 3 and isinstance(stats, (tuple, list)) and len(stats) == arr.shape[2]:
-        out = arr.astype(np.float32, copy=True)
-        for ch in range(arr.shape[2]):
-            st = stats[ch]
-            if not (isinstance(st, (tuple, list)) and len(st) == 2):
-                continue
-            lo, scale = float(st[0]), float(st[1])
-            if target_range == "signed":
-                if np.isfinite(lo) and np.isfinite(scale) and scale > lo:
-                    center = 0.5 * (lo + scale)
-                    half = max(abs(scale - center), abs(lo - center), 1e-6)
-                    out[:, :, ch] = np.clip(
-                        (out[:, :, ch] - center) / half,
-                        -OVERFLOW_LIMIT,
-                        OVERFLOW_LIMIT,
-                    )
-            elif np.isfinite(lo) and np.isfinite(scale) and scale > 1e-9:
-                out[:, :, ch] = np.clip((out[:, :, ch] - lo) / scale, 0.0, OVERFLOW_LIMIT)
-        return out
-
-    return arr
-
-
 def _compute_geotiff_tile_profile(
     base_profile: dict,
     core_w: int,
@@ -611,7 +509,6 @@ def _compute_topousm_fast_overview_coarse_field_tile(
     large_radii: List[int],
     large_weights: List[float],
     nodata: Optional[float],
-    elevation_scale: float = 1.0,
     sample_max: int = 2048,
 ):
     """Large-radius TopoUSM Fast coarse field (Sum w*mean) from the COG overview, for tiles.
@@ -631,8 +528,10 @@ def _compute_topousm_fast_overview_coarse_field_tile(
     try:
         with rasterio.open(input_cog_path, "r") as src:
             scale = max(src.width / sample_max, src.height / sample_max, 1.0)
-            sample_w = max(128, int(src.width / scale))
-            sample_h = max(128, int(src.height / scale))
+            # Both axes from the SAME scale (no per-axis floor) so the actual
+            # decimation stays isotropic on elongated rasters.
+            sample_w = max(1, int(round(src.width / scale)))
+            sample_h = max(1, int(round(src.height / scale)))
             sample_ma = src.read(
                 1, out_shape=(sample_h, sample_w), resampling=Resampling.average,
                 out_dtype=np.float32, masked=True,
@@ -642,7 +541,7 @@ def _compute_topousm_fast_overview_coarse_field_tile(
                 nodata = src.nodata
         if nodata is not None:
             sample = _replace_nodata_with_nan(sample, nodata)
-        coarse_dem = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
+        coarse_dem = cp.asarray(sample, dtype=cp.float32)
         field = compute_topousm_fast_large_coarse_field(
             coarse_dem, large_radii=large_radii, large_weights=large_weights,
             decimation=float(scale),
@@ -658,115 +557,24 @@ def _compute_topousm_fast_overview_coarse_field_tile(
 
 
 
-def _compute_generic_global_algorithm_stats(
-    input_cog_path: str,
-    nodata: Optional[float],
-    algorithm: str,
-    sigma: float,
-    multiscale_mode: bool,
-    pixel_size: float,
-    target_distances: Optional[List[float]],
-    weights: Optional[List[float]],
-    algo_params: dict,
-) -> Optional[Union[Tuple[float, float], List[Tuple[float, float]]]]:
-    """Compute robust global output stats by running the algorithm on a global overview sample."""
-    try:
-        with rasterio.open(input_cog_path, "r") as src:
-            sample_max = 2048
-            scale_factor = max(src.width / sample_max, src.height / sample_max, 1.0)
-            sample_w = max(128, int(src.width / scale_factor))
-            sample_h = max(128, int(src.height / scale_factor))
-            sample_ma = src.read(
-                1,
-                out_shape=(sample_h, sample_w),
-                resampling=Resampling.nearest,
-                out_dtype=np.float32,
-                masked=True,
-            )
-            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
-
-        if nodata is not None:
-            sample = _replace_nodata_with_nan(sample, nodata)
-
-        dem_gpu = cp.asarray(sample, dtype=cp.float32)
-        algo_instance = _load_algorithm(algorithm)
-        probe_params = dict(algo_params)
-        probe_params.pop("global_stats", None)
-        probe_result = run_tile_algorithm(
-            algo_instance=algo_instance,
-            algorithm=algorithm,
-            dem_gpu=dem_gpu,
-            sigma=sigma,
-            multiscale_mode=multiscale_mode,
-            target_distances=target_distances,
-            weights=weights,
-            pixel_size=float(pixel_size * scale_factor),
-            algo_params=probe_params,
-        )
-        result = cp.asnumpy(probe_result)
-        if result.ndim == 2:
-            return _unsigned_p80_stats_np(result)
-        if result.ndim == 3:
-            stats: List[Tuple[float, float]] = []
-            for ch in range(result.shape[2]):
-                st = _unsigned_p80_stats_np(result[:, :, ch])
-                if st is None:
-                    return None
-                stats.append(st)
-            return stats
-        return None
-    except Exception as exc:
-        logger.warning(
-            f"Failed to compute generic global stats for {algorithm}; "
-            f"fallback to algorithm-default normalization: {exc}"
-        )
-        return None
-
-
 def _format_algorithm_output(
     result_core: np.ndarray,
     algorithm: str,
-    algo_params: dict,
-    nodata: Optional[float],
-) -> Tuple[np.ndarray, Optional[float]]:
-    """Normalize dtype/band format per algorithm (all outputs float32)."""
+) -> Tuple[np.ndarray, float]:
+    """Normalize dtype/band format per algorithm (all outputs float32).
+
+    Every float tile output uses **NaN** as NoData -- the same policy as the
+    Dask backend (``output_nodata_for_dtype``) and the ``prepare`` command.
+    Keeping a numeric input sentinel (e.g. -9999) here was fragile: hillshade's
+    [0, 1] clip turned a -9999 fill into a *valid* black 0.0 pixel.
+    """
+    arr = result_core.astype(np.float32, copy=False)
     if algorithm == "hillshade":
-        arr = np.clip(result_core, 0.0, 1.0).astype(np.float32, copy=False)
-        # Keep hillshade as single-band float output with NaN nodata.
+        # Keep hillshade as single-band float output.
         if arr.ndim == 3:
             arr = arr[:, :, 0]
-        return arr, np.nan
-
-    if algorithm in SIGNED_NORMALIZATION_ALGOS:
-        # Signed outputs use 0 as valid signal; avoid nodata=0 collisions.
-        return result_core.astype(np.float32, copy=False), np.nan
-
-    if algorithm == "specular":
-        # Preserve detected/explicit nodata (e.g., -9999) in output metadata.
-        if nodata is None:
-            return result_core.astype(np.float32, copy=False), np.nan
-        return result_core.astype(np.float32, copy=False), nodata
-
-    return result_core.astype(np.float32, copy=False), nodata
-
-
-def _apply_output_display_hints(output_cog_path: str, algorithm: str) -> None:
-    """Attach lightweight display metadata to improve QGIS default rendering."""
-    if algorithm != "topousm_fast":
-        return
-
-    try:
-        with rasterio.open(output_cog_path, "r+") as ds:
-            if ds.count < 1:
-                return
-            ds.update_tags(
-                1,
-                STATISTICS_MINIMUM="-1.0",
-                STATISTICS_MAXIMUM="1.0",
-                STATISTICS_VALID_PERCENT="100",
-            )
-    except Exception as exc:
-        logger.warning(f"Failed to write display hints for {algorithm}: {exc}")
+        arr = np.clip(arr, 0.0, 1.0)
+    return arr, np.nan
 
 
 def _infer_nodata_zero_from_border(src: rasterio.io.DatasetReader) -> Optional[float]:
@@ -991,7 +799,11 @@ def process_single_tile(
                 tile_algo_params["_tile_origin"] = (int(win_y_off), int(win_x_off))
             if src_crs is not None and getattr(src_crs, "is_geographic", False):
                 try:
-                    # Use core tile center latitude for local meter conversion.
+                    # Use core tile center latitude for local meter conversion;
+                    # pixel_scale_x/y carry REAL signed meters per pixel (the same
+                    # convention as the Dask backend and the projected path), so
+                    # the DEM itself is never rescaled and elevation-based outputs
+                    # keep their physical magnitude against the shared stats.
                     core_window = Window(core_x, core_y, core_w, core_h)
                     b_left, b_bottom, b_right, b_top = rasterio.windows.bounds(core_window, src_transform)
                     lat_center_tile = 0.5 * (float(b_bottom) + float(b_top))
@@ -1003,24 +815,9 @@ def process_single_tile(
                     sy_deg = float(src_transform.e)
                     px_m_x = math.copysign(abs(sx_deg) * meters_per_degree_lon, sx_deg if sx_deg != 0 else 1.0)
                     px_m_y = math.copysign(abs(sy_deg) * meters_per_degree_lat, sy_deg if sy_deg != 0 else -1.0)
-                    px_m_mean = max(0.5 * (abs(px_m_x) + abs(px_m_y)), 1e-6)
 
-                    # Keep anisotropy in x/y while avoiding double meter conversion in gradient.
-                    tile_algo_params["pixel_scale_x"] = float(px_m_x / px_m_mean)
-                    tile_algo_params["pixel_scale_y"] = float(px_m_y / px_m_mean)
-                    tile_algo_params["elevation_scale"] = float(1.0 / px_m_mean)
-                    # specular's roughness is computed on elevation*elevation_scale,
-                    # which varies by tile latitude on geographic DEMs; the global
-                    # roughness_norm_scale (p95) was measured at the raster-mean
-                    # elevation_scale, so rescale it to THIS tile's scale -- else the
-                    # roughness magnitude shifts per tile against a fixed denominator
-                    # and reintroduces tile-boundary seams.
-                    if algorithm == "specular" and algo_params.get("roughness_norm_scale"):
-                        _g_es = float(algo_params.get("elevation_scale", 1.0)) or 1.0
-                        tile_algo_params["roughness_norm_scale"] = (
-                            float(algo_params["roughness_norm_scale"])
-                            * float(tile_algo_params["elevation_scale"]) / _g_es
-                        )
+                    tile_algo_params["pixel_scale_x"] = float(px_m_x)
+                    tile_algo_params["pixel_scale_y"] = float(px_m_y)
                 except Exception:
                     # Fallback to globally prepared params if local conversion fails.
                     pass
@@ -1037,9 +834,11 @@ def process_single_tile(
                 tile_algo_params,
             )
 
-            # Restore NoData (only when needed)
-            output_nodata_for_mask = np.nan if algorithm in SIGNED_NORMALIZATION_ALGOS else nodata
-            result_gpu = apply_nodata_mask(result_gpu, mask_nodata, output_nodata_for_mask)
+            # Restore NoData as NaN -- the uniform float NoData policy (matches
+            # the Dask backend; a numeric fill like -9999 would survive into
+            # post-processing, e.g. hillshade's [0,1] clip turned it into a
+            # valid black pixel).
+            result_gpu = apply_nodata_mask(result_gpu, mask_nodata, np.nan)
 
             # Crop on GPU before PCIe transfer; the padded halo is discarded.
             core_x_in_win = core_x - win_x_off
@@ -1062,29 +861,9 @@ def process_single_tile(
                 used_gb = cp.get_default_memory_pool().used_bytes() / (1024**3)
                 logger.debug(f"Tile ({ty}, {tx}) VRAM used: {used_gb:.2f} GB")
             del dem_gpu, result_gpu, result_core_gpu
-            if tile_algo_params.get("_apply_global_stats_post", False):
-                core_mask_nodata = None
-                if mask_nodata is not None:
-                    core_mask_nodata = mask_nodata[
-                        core_y_in_win : core_y_in_win + core_h,
-                        core_x_in_win : core_x_in_win + core_w,
-                    ]
-                result_core = _normalize_by_global_stats(
-                    result_core,
-                    tile_algo_params.get("global_stats"),
-                    target_range=tile_algo_params.get("_output_norm_range", "unit"),
-                )
-                if core_mask_nodata is not None:
-                    fill_val = output_nodata_for_mask
-                    if fill_val is None:
-                        fill_val = np.nan
-                    result_core = result_core.astype(np.float32, copy=False)
-                    result_core[core_mask_nodata] = np.float32(fill_val)
             result_core, output_nodata = _format_algorithm_output(
                 result_core=result_core,
                 algorithm=algorithm,
-                algo_params=tile_algo_params,
-                nodata=nodata,
             )
 
             # Output dtype quantization (int16/uint8): NaN (NoData) -> 0, valid values to [DN range].
@@ -1164,7 +943,6 @@ def process_dem_tiles(
         raise ValueError(
             f"Unsupported output_dtype={output_dtype!r}. Choose from {SUPPORTED_OUTPUT_DTYPES}."
         )
-    quantize_scale_offset = None
     if output_dtype in ("int16", "uint8"):
         _vr = resolve_output_range(algorithm, params=algo_params, override=output_range)
         if _vr is None:
@@ -1176,10 +954,12 @@ def process_dem_tiles(
             _qp = quantize_params(float(_vr[0]), float(_vr[1]), output_dtype)
             algo_params["_quantize_qp"] = _qp
             algo_params["_quantize_dtype"] = output_dtype
-            quantize_scale_offset = (_qp["scale"], _qp["offset"])
+            # Visualization integer outputs are plain DN rasters (NoData=0); the
+            # DN<->value mapping is logged but NOT embedded as GDAL scale/offset
+            # (QGIS would auto-unscale the band) -- same policy as the Dask backend.
             logger.info(
                 "Output dtype=%s (%s): range [%.6g, %.6g] -> DN [%d, %d], NoData=0 "
-                "(scale=%.6g, offset=%.6g)",
+                "(DN<->value mapping: value = %.6g*DN + %.6g; not embedded as scale/offset)",
                 output_dtype, "signed" if _qp["signed"] else "unsigned",
                 _vr[0], _vr[1], _qp["dn_min"], _qp["dn_max"], _qp["scale"], _qp["offset"],
             )
@@ -1312,7 +1092,7 @@ def process_dem_tiles(
     # tile-size-aware threshold; the large radii are taken from a single global
     # overview-derived coarse field (seam-free, no large per-tile halo), so the
     # tile padding only needs to cover the small radii.  Projected-only: on
-    # geographic DEMs each tile uses a local-latitude elevation_scale, which a
+    # geographic DEMs each tile uses local-latitude metric pixel scales, which a
     # single global field cannot match, so the optimization is skipped there.
     if algorithm == "topousm_fast":
         try:
@@ -1339,7 +1119,7 @@ def process_dem_tiles(
                     if _lr:
                         _field = _compute_topousm_fast_overview_coarse_field_tile(
                             input_cog_path, large_radii=_lr, large_weights=_lw,
-                            nodata=nodata_override, elevation_scale=1.0,
+                            nodata=nodata_override,
                         )
                         if _field is not None:
                             # Keep the full radii for the global normalization stat,
@@ -1548,7 +1328,7 @@ def process_dem_tiles(
             src_transform = src.transform
             src_crs = src.crs
             try:
-                px_m_x, px_m_y, px_m_mean, is_geo, lat_center = metric_pixel_scales_from_metadata(
+                px_m_x, px_m_y, _px_m_mean, is_geo, lat_center = metric_pixel_scales_from_metadata(
                     transform=src_transform,
                     crs=src_crs,
                     bounds=src.bounds,
@@ -1558,84 +1338,42 @@ def process_dem_tiles(
                 sign_y = 1.0 if float(src_transform.e) >= 0 else -1.0
                 px_m_x = sign_x * float(pixel_size)
                 px_m_y = sign_y * float(pixel_size)
-                px_m_mean = float(pixel_size)
                 is_geo = False
                 lat_center = None
 
-            # Inject anisotropic pixel scales for all algorithms.
-            elevation_scale = 1.0
+            # Inject anisotropic pixel scales for all algorithms.  REAL signed
+            # meters per pixel on both projected and geographic DEMs -- the same
+            # convention as the Dask backend.  The DEM itself is never rescaled
+            # (no elevation_scale): metric handling lives entirely in these
+            # scales, so elevation-based outputs keep their physical magnitude
+            # and the shared normalization stats (computed on raw elevation)
+            # stay correct on geographic DEMs.
+            algo_params["pixel_scale_x"] = float(px_m_x)
+            algo_params["pixel_scale_y"] = float(px_m_y)
+            algo_params["is_geographic_dem"] = bool(is_geo)
             if is_geo:
                 ratio = abs(px_m_y) / max(abs(px_m_x), 1e-9)
-                elevation_scale = 1.0 / max(float(px_m_mean), 1e-6)
-                # Geographic DEM:
-                # - scale z by mean meter/pixel
-                # - normalize x/y steps by the same mean to preserve dy/dx anisotropy
-                #   without applying meter conversion twice in gradients.
-                algo_params["pixel_scale_x"] = float(px_m_x / max(px_m_mean, 1e-6))
-                algo_params["pixel_scale_y"] = float(px_m_y / max(px_m_mean, 1e-6))
-                algo_params["elevation_scale"] = elevation_scale
                 logger.info(
                     "Geographic DEM approximation enabled: "
                     f"lat={lat_center:.3f}, dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m, "
-                    f"dy/dx={ratio:.4f}, z_scale={elevation_scale:.8f}"
+                    f"dy/dx={ratio:.4f}"
                 )
-                algo_params["is_geographic_dem"] = True
             else:
-                algo_params["pixel_scale_x"] = float(px_m_x)
-                algo_params["pixel_scale_y"] = float(px_m_y)
-                algo_params["elevation_scale"] = 1.0
-                algo_params["is_geographic_dem"] = False
                 logger.info(
                     f"Projected pixel scales: dx={abs(px_m_x):.3f}m, dy={abs(px_m_y):.3f}m"
                 )
 
             mode = str(algo_params.get("mode", "spatial")).lower()
-            global_stats_required = _is_global_stats_required(algorithm, mode)
-            if algorithm == "specular" and bool(algo_params.get("is_geographic_dem", False)):
-                # Geographic specular uses per-tile local meter scaling.
-                # A single center-lat global tone stat causes bias (flat areas darkening).
-                global_stats_required = False
-            output_norm_range = _normalization_target_range(algorithm)
 
             # Shared global-statistics injection -- single source of truth with the
             # dask backend (FujiShaderGPU/algorithms/_norm_stats.inject_global_stats).
             # Computes, in order, full-resolution, mode-independent and seam-free:
             # fractal relief -> robust display range (TopoUSM Fast / multiscale_terrain /
             # visual_saliency / scale_space_surprise / ambient_occlusion / openness /
-            # fractal_anomaly) -> npr_edges gradient -> specular roughness p95.  This
-            # replaces the previous per-algorithm DECIMATED-sample stats (which
-            # under-estimated radii/scale-driven magnitudes and diverged from the
-            # dask backend, and skipped geographic DEMs).
+            # fractal_anomaly) -> npr_edges gradient -> specular roughness p95.
+            # Output normalization itself is owned by the algorithms (identical on
+            # both backends); the tile pipeline applies no post-normalization.
             inject_global_stats(input_cog_path, algorithm, algo_params, is_zarr=False)
-
-
-            # Unified fallback: enforce global normalization for all required algorithms.
-            # Native global-stats algorithms normalize internally.
-            if global_stats_required:
-                if "global_stats" not in algo_params:
-                    generic_stats = _compute_generic_global_algorithm_stats(
-                        input_cog_path=input_cog_path,
-                        nodata=nodata,
-                        algorithm=algorithm,
-                        sigma=sigma,
-                        multiscale_mode=multiscale_mode,
-                        pixel_size=float(pixel_size),
-                        target_distances=target_distances,
-                        weights=weights,
-                        algo_params=algo_params,
-                    )
-                    if generic_stats is not None:
-                        algo_params["global_stats"] = generic_stats
-                        logger.info(f"{algorithm} global normalization stats fixed for all tiles.")
-
-                # Algorithms that already apply global stats internally should not be normalized twice.
-                algo_params["_apply_global_stats_post"] = (
-                    algorithm not in GLOBAL_STATS_NATIVE_ALGOS
-                    and isinstance(algo_params.get("global_stats"), (tuple, list))
-                )
-            else:
-                algo_params["_apply_global_stats_post"] = False
-            algo_params["_output_norm_range"] = output_norm_range
 
             # ----------------------------------------------------------------
             # Unified overview coarse source for the tile backend (mirrors the
@@ -1822,17 +1560,10 @@ def process_dem_tiles(
             gdal_bin_dir=gdal_bin_dir,
         )
         
-        # COG quality validation
+        # COG quality validation.  No post-hoc metadata edits: updating a COG
+        # in place (display hints / scale-offset) breaks its layout guarantee
+        # and GDAL 3.8+ refuses the update outright.
         _validate_cog_for_qgis(output_cog_path)
-        if quantize_scale_offset is None:
-            # Float output: apply float-oriented display hints (e.g. TopoUSM Fast -1/1).
-            _apply_output_display_hints(output_cog_path, algorithm)
-        else:
-            # Integer output: record GDAL scale/offset (DN -> physical recovery),
-            # matching the Dask backend so both write identical metadata.
-            apply_scale_offset(
-                output_cog_path, quantize_scale_offset[0], quantize_scale_offset[1]
-            )
 
     except Exception as e:
         if os.path.exists(tmp_tile_dir):

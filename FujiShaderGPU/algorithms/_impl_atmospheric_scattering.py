@@ -27,16 +27,28 @@ def compute_atmospheric_scattering_block(block, *, scattering_strength=0.5,
     dy, dx, nan_mask = handle_nan_for_gradient(
         block, scale=1, pixel_size=pixel_size,
         pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y)
-    slope = cp.sqrt(dx**2 + dy**2)
-    zenith_angle = cp.arctan(slope)
+    slope_mag = cp.sqrt(dx**2 + dy**2)        # tan of the slope angle
+    zenith_angle = cp.arctan(slope_mag)       # slope angle in radians
     air_mass = 1.0 / (cp.cos(zenith_angle) + 0.001)
     scattering = 1.0 - cp.exp(-scattering_strength * air_mass)
     ambient = 0.4 + 0.6 * scattering
+    # Lambertian hillshade term via the unit surface normal (sign-aware east/
+    # north handling, same convention as compute_hillshade_block).  The previous
+    # formulation passed the gradient *magnitude* (a tan value) to cos()/sin()
+    # as if it were an angle, which wrapped around on steep slopes.
+    sign_x = 1.0 if (pixel_scale_x is None or float(pixel_scale_x) >= 0.0) else -1.0
+    sign_y = 1.0 if (pixel_scale_y is None or float(pixel_scale_y) >= 0.0) else -1.0
+    dz_d_east = dx * sign_x
+    dz_d_north = dy * sign_y
+    inv_norm = cp.float32(1.0) / cp.sqrt(
+        dz_d_east * dz_d_east + dz_d_north * dz_d_north + cp.float32(1.0))
     azimuth_rad = cp.radians(Constants.DEFAULT_AZIMUTH)
     altitude_rad = cp.radians(Constants.DEFAULT_ALTITUDE)
-    aspect = cp.arctan2(-dy, dx)
-    hillshade = (cp.cos(altitude_rad) * cp.cos(slope) +
-                 cp.sin(altitude_rad) * cp.sin(slope) * cp.cos(aspect - azimuth_rad))
+    lx = cp.sin(azimuth_rad) * cp.cos(altitude_rad)
+    ly = cp.cos(azimuth_rad) * cp.cos(altitude_rad)
+    lz = cp.sin(altitude_rad)
+    hillshade = cp.clip(
+        (-dz_d_east * lx - dz_d_north * ly + lz) * inv_norm, 0.0, 1.0)
     result = ambient * 0.3 + hillshade * 0.7
     result = cp.clip(result, 0, 1)
     result = cp.power(result, Constants.DEFAULT_GAMMA)
