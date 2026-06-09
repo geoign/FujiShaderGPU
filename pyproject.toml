@@ -46,10 +46,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# GDAL Python bindings are intentionally not declared here.
-# Install the binding that exactly matches native libgdal, e.g.
-#   GDAL_VERSION=$(gdal-config --version)
-#   python -m pip install --no-build-isolation "GDAL==$GDAL_VERSION"
+# GDAL Python bindings (osgeo) are intentionally NOT declared here: the binding
+# must match the native libgdal, so install it separately first. See the
+# "Installing GDAL" section in README.md. In short:
+#   conda:  conda install -c conda-forge gdal          # easiest, Linux or Windows
+#   apt:    sudo apt-get install -y libgdal-dev gdal-bin
+#           CPLUS_INCLUDE_PATH=/usr/include/gdal pip install --no-build-isolation "GDAL==$(gdal-config --version)"
+# Verify with:  python -c "from osgeo import gdal; print(gdal.__version__)"
 # Linux/Dask-CUDA runtime environment
 linux = [
     "dask-cuda>=24.6",
