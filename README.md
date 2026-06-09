@@ -31,6 +31,19 @@ binding version must match the **native GDAL** library it is built against.
 `osgeo` directly, so the bindings must be installed separately — they coexist
 fine with rasterio's bundled copy.)
 
+**Quickest: let the bootstrapper do it.** The repo ships a standalone,
+stdlib-only installer that auto-detects your environment (conda / native GDAL /
+apt / Homebrew), installs the matching `osgeo` bindings, and verifies them:
+
+```bash
+python tools/install_gdal.py            # detect + install + verify
+python tools/install_gdal.py --dry-run  # just show what it would do
+python tools/install_gdal.py --yes      # don't prompt before apt/brew/conda
+```
+
+It needs no dependencies, so you can run it before installing FujiShaderGPU.
+If you prefer to do it by hand, the per-platform steps are below.
+
 The most reliable route on **either OS is conda**, which installs the native
 library and the matching bindings together:
 
