@@ -19,9 +19,9 @@ backend differs.
 
 - **An NVIDIA GPU with CUDA 12.x** (required — there is no CPU fallback)
 - **Python 3.10+**
-- **GDAL with its Python bindings** (`osgeo`) — installed separately; see
-  [Installing GDAL](#installing-gdal) below. This is the step people most often
-  get stuck on, so do it **first** and verify it before installing FujiShaderGPU.
+- **GDAL with its Python bindings** (`osgeo`) — installed separately and the step
+  people most often get stuck on. Do it **first**: if unsure, just run
+  `python tools/install_gdal.py` (see [Installing GDAL](#installing-gdal)).
 
 ## Installing GDAL
 
@@ -31,28 +31,39 @@ binding version must match the **native GDAL** library it is built against.
 `osgeo` directly, so the bindings must be installed separately — they coexist
 fine with rasterio's bundled copy.)
 
-**Quickest: let the bootstrapper do it.** The repo ships a standalone,
-stdlib-only installer that auto-detects your environment (conda / native GDAL /
-apt / Homebrew), installs the matching `osgeo` bindings, and verifies them:
+### Easy way — run the bootstrapper (recommended for most users)
+
+The repo ships a **standalone, stdlib-only** installer that auto-detects your
+environment (conda / native GDAL / apt / Homebrew), installs the matching
+`osgeo` bindings into your active Python, and verifies them. **If you are not
+sure what to do, just run this:**
 
 ```bash
-python tools/install_gdal.py            # detect + install + verify
-python tools/install_gdal.py --dry-run  # just show what it would do
-python tools/install_gdal.py --yes      # don't prompt before apt/brew/conda
+# from a clone of the repo:
+python tools/install_gdal.py
+
+# or, without cloning (fetch the script and run it):
+curl -fsSL https://raw.githubusercontent.com/geoign/FujiShaderGPU/main/tools/install_gdal.py -o install_gdal.py
+python install_gdal.py
 ```
 
-It needs no dependencies, so you can run it before installing FujiShaderGPU.
-If you prefer to do it by hand, the per-platform steps are below.
+It needs no dependencies, so run it **before** installing FujiShaderGPU. It is
+safe to re-run (it does nothing if GDAL already works). Flags:
+`--dry-run` (show what it would do), `--yes` (don't prompt before apt/brew/conda).
+On Windows without conda it prints what to do instead of guessing.
 
-The most reliable route on **either OS is conda**, which installs the native
-library and the matching bindings together:
+### Manual way — for advanced users
+
+Prefer to manage it yourself? Pick one:
+
+**conda (either OS, most reliable):**
 
 ```bash
 conda install -c conda-forge gdal
 # (do NOT also `pip install GDAL` in a conda env — conda already provides osgeo)
 ```
 
-### Linux (Debian/Ubuntu, without conda)
+**Linux (Debian/Ubuntu, without conda):**
 
 ```bash
 # 1) native GDAL + headers + the gdal-config helper
@@ -64,16 +75,13 @@ export CPLUS_INCLUDE_PATH=/usr/include/gdal C_INCLUDE_PATH=/usr/include/gdal
 pip install --no-build-isolation "GDAL==$(gdal-config --version)"
 ```
 
-### Windows (without conda)
+**Windows (without conda):** conda is strongly recommended; otherwise use
+**OSGeo4W** (<https://trac.osgeo.org/osgeo4w/>) — install the `gdal` and
+`python3-gdal` packages and run FujiShaderGPU from the OSGeo4W shell (QGIS users
+often already have this) — or a prebuilt **GDAL wheel** matching your Python and
+native GDAL.
 
-Conda (above) is strongly recommended. If you cannot use it:
-
-- **OSGeo4W** (<https://trac.osgeo.org/osgeo4w/>) — install the `gdal` and
-  `python3-gdal` packages, then run FujiShaderGPU from the OSGeo4W shell (or add
-  its Python to your `PATH`). QGIS users often already have this.
-- or a prebuilt **GDAL wheel** matching your Python version and native GDAL.
-
-### Verify GDAL before continuing
+### Verify (the bootstrapper does this for you)
 
 ```bash
 python -c "from osgeo import gdal; print('GDAL', gdal.__version__)"
