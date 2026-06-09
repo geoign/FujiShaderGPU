@@ -223,8 +223,14 @@ def get_cog_options(dtype: str) -> dict:
         "OVERVIEW_COMPRESS": "ZSTD",
         "OVERVIEW_RESAMPLING": "AVERAGE",
         "OVERVIEW_COUNT": "8",
+        # ALIGNED_LEVELS keeps overview block grids aligned with full-res tiles
+        # (matches the tile backend; better COG locality for partial reads).
+        "ALIGNED_LEVELS": "4",
         "BIGTIFF": "YES",
-        "NUM_THREADS": "ALL_CPUS",
+        # Container/cgroup-aware: GDAL's "ALL_CPUS" resolves to the host core
+        # count and ignores the CFS quota, oversubscribing throttled containers
+        # (matches the tile backend's _gdal_num_threads()).
+        "NUM_THREADS": str(container_cpu_count()),
     }
     
     # Set PREDICTOR according to data type
@@ -482,7 +488,7 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
             create_opts = [
                 "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
                 "COMPRESS=ZSTD", f"ZLEVEL={cog_options.get('LEVEL', '1')}",
-                "BIGTIFF=YES", "NUM_THREADS=ALL_CPUS",
+                "BIGTIFF=YES", f"NUM_THREADS={container_cpu_count()}",
             ]
             if 'PREDICTOR' in cog_options:
                 create_opts.append(f"PREDICTOR={cog_options['PREDICTOR']}")
@@ -795,6 +801,8 @@ def _build_cog_via_cog_driver(src: Path, dst: Path, cog_options: dict) -> bool:
         f"OVERVIEW_COMPRESS={cog_options.get('OVERVIEW_COMPRESS', 'ZSTD')}",
         f"BLOCKSIZE={cog_options.get('BLOCKSIZE', '512')}",
         f"OVERVIEW_RESAMPLING={cog_options.get('OVERVIEW_RESAMPLING', 'AVERAGE')}",
+        f"OVERVIEW_COUNT={cog_options.get('OVERVIEW_COUNT', '8')}",
+        f"ALIGNED_LEVELS={cog_options.get('ALIGNED_LEVELS', '4')}",
         "BIGTIFF=YES",
         f"NUM_THREADS={num_cpus}",
     ]
