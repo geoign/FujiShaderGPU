@@ -10,37 +10,26 @@ from osgeo import gdal
 from ..utils.cpu import container_cpu_count
 
 
-def _configure_gdal_ultra_performance(gpu_config: dict):
-    """Tune GDAL I/O options based on available system RAM."""
-    sys_info = gpu_config["system_info"]
-    cpu_memory_gb = int(sys_info["memory_gb"])
+def apply_gdal_io_config(cache_mb: int, *, dataset_pool_size: int = None, force: bool = True) -> None:
+    """Apply the shared, container-aware GDAL I/O tuning env used by BOTH backends.
 
-    if cpu_memory_gb >= 128:
-        cache_mb = 32768
-        dataset_pool_size = 5000
-    elif cpu_memory_gb >= 64:
-        cache_mb = 16384
-        dataset_pool_size = 3000
-    elif cpu_memory_gb >= 32:
-        cache_mb = 8192
-        dataset_pool_size = 2000
-    else:
-        cache_mb = 4096
-        dataset_pool_size = 1000
-
-    swath_multiplier = 1.0
+    Single source of truth so the dask and tile pipelines do not drift on GDAL
+    settings.  ``force=True`` overwrites existing env (tile pipeline); ``force=
+    False`` uses ``setdefault`` so a user-set env is respected (dask read path).
+    ``GDAL_NUM_THREADS`` is cgroup-aware (``ALL_CPUS`` ignores the CFS quota and
+    oversubscribes throttled containers)."""
+    cache_mb = int(max(256, cache_mb))
+    if dataset_pool_size is None:
+        dataset_pool_size = 2000 if cache_mb >= 8192 else 1000
     cache_bytes = cache_mb * 1024 * 1024
-
-    ultra_configs = {
+    opts = {
         "GDAL_CACHEMAX": str(cache_mb),
         "GDAL_MAX_DATASET_POOL_SIZE": str(dataset_pool_size),
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         "VSI_CACHE": "YES",
         "VSI_CACHE_SIZE": str(cache_bytes),
-        "GDAL_SWATH_SIZE": str(int(cache_mb * swath_multiplier)),
+        "GDAL_SWATH_SIZE": str(cache_mb),
         "GDAL_FORCE_CACHING": "YES",
-        # Container-aware: ALL_CPUS resolves to the host core count and ignores
-        # the CFS quota, oversubscribing a throttled container.
         "GDAL_NUM_THREADS": str(max(1, container_cpu_count())),
         "GDAL_HTTP_MULTIPLEX": "YES",
         "GDAL_HTTP_VERSION": "2",
@@ -48,10 +37,32 @@ def _configure_gdal_ultra_performance(gpu_config: dict):
         "GDAL_BAND_BLOCK_CACHE": "HASHSET",
         "GDAL_CACHEMAX_MEMORY_OPTIMIZATION": "YES",
     }
+    for key, value in opts.items():
+        if force:
+            os.environ[key] = value
+        else:
+            os.environ.setdefault(key, value)
+        try:
+            gdal.SetConfigOption(key, os.environ.get(key, value))
+        except Exception:
+            pass
 
-    for key, value in ultra_configs.items():
-        os.environ[key] = value
-        gdal.SetConfigOption(key, value)
+
+def _configure_gdal_ultra_performance(gpu_config: dict):
+    """Tune GDAL I/O options based on available system RAM (tile pipeline)."""
+    sys_info = gpu_config["system_info"]
+    cpu_memory_gb = int(sys_info["memory_gb"])
+
+    if cpu_memory_gb >= 128:
+        cache_mb, dataset_pool_size = 32768, 5000
+    elif cpu_memory_gb >= 64:
+        cache_mb, dataset_pool_size = 16384, 3000
+    elif cpu_memory_gb >= 32:
+        cache_mb, dataset_pool_size = 8192, 2000
+    else:
+        cache_mb, dataset_pool_size = 4096, 1000
+
+    apply_gdal_io_config(cache_mb, dataset_pool_size=dataset_pool_size, force=True)
 
     logging.getLogger(__name__).info(
         "GDAL settings applied: cache=%dMB, dataset_pool=%d, HTTP/2 enabled",

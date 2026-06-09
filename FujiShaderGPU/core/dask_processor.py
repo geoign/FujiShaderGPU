@@ -97,19 +97,10 @@ def _configure_gdal_read_performance() -> None:
     # GDAL interprets a bare integer < 100000 as megabytes.
     cache_mb = int(max(1024, min(16384, avail_gb * 1024 * 0.1)))
 
-    read_opts = {
-        "GDAL_NUM_THREADS": "ALL_CPUS",          # multi-threaded (de)compression
-        "GDAL_CACHEMAX": str(cache_mb),
-        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-        "VSI_CACHE": "YES",
-        "GDAL_BAND_BLOCK_CACHE": "HASHSET",
-    }
-    for key, value in read_opts.items():
-        os.environ.setdefault(key, value)
-        try:
-            gdal.SetConfigOption(key, os.environ.get(key, value))
-        except Exception:
-            pass
+    # Shared, container-aware GDAL I/O tuning (single source of truth with the
+    # tile backend). force=False -> respect any user-set GDAL env on the read path.
+    from ..config.gdal_config import apply_gdal_io_config
+    apply_gdal_io_config(cache_mb, force=False)
     logger.info(
         "GDAL read performance configured: NUM_THREADS=%s, CACHEMAX=%sMB",
         os.environ.get("GDAL_NUM_THREADS"),
