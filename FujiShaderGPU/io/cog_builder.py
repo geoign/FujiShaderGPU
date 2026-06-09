@@ -281,6 +281,16 @@ def _create_cog_ultra_fast(
         "COG source size: %d x %d, bands=%d",
         vrt_ds.RasterXSize, vrt_ds.RasterYSize, vrt_ds.RasterCount,
     )
+    # Match the dask backend: PREDICTOR improves ZSTD compression for typed data
+    # (float -> 3, integer -> 2; none for Byte/uint8 where it does not help).
+    try:
+        _dt = gdal.GetDataTypeName(vrt_ds.GetRasterBand(1).DataType)
+        if _dt in ("Float32", "Float64"):
+            cog_options.append("PREDICTOR=3")
+        elif _dt in ("Int16", "Int32", "UInt16", "UInt32"):
+            cog_options.append("PREDICTOR=2")
+    except Exception:
+        pass
     src_pixels = int(vrt_ds.RasterXSize) * int(vrt_ds.RasterYSize)
 
     # Python progress callbacks can dominate runtime on very large rasters because
