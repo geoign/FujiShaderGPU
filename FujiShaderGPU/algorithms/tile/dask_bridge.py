@@ -233,6 +233,23 @@ def _direct_specular(block, params):
     )
 
 
+def _apply_display_stretch_block(result, stats):
+    """Block-level robust ``[lo, lo+scale]`` -> ``[0, 1]`` contrast stretch (cupy),
+    mirroring ``_global_stats.apply_display_stretch_dask`` for the direct
+    (non-Dask) tile path.  ambient_occlusion / openness concentrate in a narrow
+    high band, so without this stretch the integer output is washed-out white.
+    No-op when stats are missing/degenerate."""
+    if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
+        return result
+    lo = float(stats[0])
+    scale = float(stats[1])
+    if not (scale > 1e-12):
+        return result
+    return cp.maximum(
+        (result - cp.float32(lo)) / cp.float32(scale), cp.float32(0.0)
+    ).astype(cp.float32)
+
+
 def _direct_ambient_occlusion(block, params):
     from .._impl_ambient_occlusion import (
         compute_ambient_occlusion_block,
@@ -256,11 +273,15 @@ def _direct_ambient_occlusion(block, params):
             )
             for r in radii
         ]
-        return _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
-    return compute_ambient_occlusion_block(
-        block, num_samples=ns, radius=radius, intensity=intensity,
-        pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
-    )
+        result = _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
+    else:
+        result = compute_ambient_occlusion_block(
+            block, num_samples=ns, radius=radius, intensity=intensity,
+            pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
+        )
+    # Apply the same data-driven contrast stretch the Dask .process() applies
+    # (the tile pipeline skips re-normalizing these "native" algorithms).
+    return _apply_display_stretch_block(result, params.get("global_stats"))
 
 
 def _direct_openness(block, params):
@@ -282,12 +303,14 @@ def _direct_openness(block, params):
             )
             for r in radii
         ]
-        return _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
-    return compute_openness_vectorized(
-        block, openness_type=openness_type, num_directions=nd,
-        max_distance=max_distance, pixel_size=pixel_size,
-        pixel_scale_x=psx, pixel_scale_y=psy,
-    )
+        result = _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
+    else:
+        result = compute_openness_vectorized(
+            block, openness_type=openness_type, num_directions=nd,
+            max_distance=max_distance, pixel_size=pixel_size,
+            pixel_scale_x=psx, pixel_scale_y=psy,
+        )
+    return _apply_display_stretch_block(result, params.get("global_stats"))
 
 
 def _direct_topousm_fast(block, params, algo):
