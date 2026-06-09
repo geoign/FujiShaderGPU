@@ -233,6 +233,7 @@ def _compute_specular_roughness_scale(
     src_cog: str,
     params: dict,
     *,
+    elevation_scale: float = 1.0,
     grid: int = 3,
     max_tile: int = 4096,
     min_valid_frac: float = 0.02,
@@ -293,6 +294,11 @@ def _compute_specular_roughness_scale(
                     if float(np.isfinite(a).mean()) < min_valid_frac:
                         continue
                     g = cp.asarray(a)
+                    if elevation_scale != 1.0:
+                        # Match the per-block roughness magnitude on backends that
+                        # pre-scale elevation (tile path multiplies the DEM by a
+                        # latitude-dependent elevation_scale before compute).
+                        g = g * cp.float32(elevation_scale)
                     rough = _roughness_p95_block(g, kernel)
                     m = int(min(margin, rough.shape[0] // 3, rough.shape[1] // 3))
                     if m > 0:

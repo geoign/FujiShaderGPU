@@ -1008,72 +1008,6 @@ def _compute_global_scale_space_surprise_stats(
         return None
 
 
-def _compute_global_specular_roughness_scale(
-    input_cog_path: str,
-    nodata: Optional[float],
-    roughness_scale: float,
-    elevation_scale: float = 1.0,
-) -> Optional[float]:
-    """Estimate a global roughness reference for tile-stable specular shading."""
-    try:
-        from cupyx.scipy.ndimage import uniform_filter
-    except Exception as exc:
-        logger.warning(f"Specular roughness helper unavailable: {exc}")
-        return None
-
-    try:
-        with rasterio.open(input_cog_path, "r") as src:
-            sample_max = 2048
-            scale_factor = max(src.width / sample_max, src.height / sample_max, 1.0)
-            sample_w = max(256, int(src.width / scale_factor))
-            sample_h = max(256, int(src.height / scale_factor))
-            sample_ma = src.read(
-                1,
-                out_shape=(sample_h, sample_w),
-                resampling=Resampling.nearest,
-                out_dtype=np.float32,
-                masked=True,
-            )
-            sample = sample_ma.filled(np.nan).astype(np.float32, copy=False)
-
-        if nodata is not None:
-            sample = _replace_nodata_with_nan(sample, nodata)
-
-        block = cp.asarray(sample, dtype=cp.float32) * cp.float32(elevation_scale)
-        nan_mask = cp.isnan(block)
-        if nan_mask.all():
-            return None
-
-        k = max(3, int(round(float(roughness_scale) / max(scale_factor, 1.0))))
-        if k % 2 == 0:
-            k += 1
-
-        if nan_mask.any():
-            filled = cp.where(nan_mask, 0, block)
-            valid = (~nan_mask).astype(cp.float32)
-            mean_values = uniform_filter(filled * valid, size=k, mode="constant")
-            mean_weights = uniform_filter(valid, size=k, mode="constant")
-            mean_filter = cp.where(mean_weights > 1e-6, mean_values / mean_weights, 0)
-            sq_values = uniform_filter((filled ** 2) * valid, size=k, mode="constant")
-            mean_sq_filter = cp.where(mean_weights > 1e-6, sq_values / mean_weights, 0)
-        else:
-            mean_filter = uniform_filter(block, size=k, mode="constant")
-            mean_sq_filter = uniform_filter(block ** 2, size=k, mode="constant")
-
-        roughness = cp.sqrt(cp.maximum(mean_sq_filter - mean_filter ** 2, 0))
-        valid_roughness = roughness[~nan_mask] if nan_mask.any() else roughness
-        if valid_roughness.size == 0:
-            return None
-
-        p95 = float(cp.percentile(valid_roughness, 95))
-        if not np.isfinite(p95) or p95 <= 1e-9:
-            return None
-        return p95
-    except Exception as exc:
-        logger.warning(f"Failed to compute global specular roughness scale: {exc}")
-        return None
-
-
 def _compute_generic_global_algorithm_stats(
     input_cog_path: str,
     nodata: Optional[float],
@@ -2117,10 +2051,13 @@ def process_dem_tiles(
                         f"min={global_sss_stats[0]:.6f}, p80_scale={global_sss_stats[1]:.6f}"
                     )
             elif algorithm == "specular":
-                global_roughness_scale = _compute_global_specular_roughness_scale(
-                    input_cog_path=input_cog_path,
-                    nodata=nodata,
-                    roughness_scale=float(algo_params.get("roughness_scale", 50.0)),
+                # Shared full-resolution roughness p95 (same implementation as the
+                # dask backend); elevation_scale matches the per-tile DEM scaling so
+                # the global denominator has the right magnitude.
+                from ..algorithms._impl_specular import _compute_specular_roughness_scale
+                global_roughness_scale = _compute_specular_roughness_scale(
+                    input_cog_path,
+                    algo_params,
                     elevation_scale=float(algo_params.get("elevation_scale", 1.0)),
                 )
                 if global_roughness_scale is not None:
