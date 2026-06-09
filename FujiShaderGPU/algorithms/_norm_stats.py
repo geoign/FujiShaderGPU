@@ -177,4 +177,61 @@ def _compute_norm_stats_tiled(
         return None
 
 
-__all__ = ["_NORM_STAT_SPECS", "_norm_stat_max_scale", "_compute_norm_stats_tiled"]
+def inject_global_stats(src_cog: str, algorithm: str, params: dict, *, is_zarr: bool = False) -> dict:
+    """Compute and inject every per-algorithm GLOBAL normalization statistic into
+    ``params`` (in place), in the correct order and at full resolution.
+
+    Single source of truth shared by the Dask and tile backends so their global
+    statistics cannot drift.  All steps are mode-independent (they run for both
+    ``local`` and ``spatial``) and seam-free (global, not per-tile).  No-op for
+    Zarr inputs.  Order matters:
+
+    1. fractal_anomaly relief (p10/p75) BEFORE the norm-stats pre-pass, so the
+       pre-pass feature distribution matches the main pass (correct median
+       centering; otherwise the result is biased bright on high-relief DEMs).
+    2. generic robust display range for the normalized algorithms (TopoUSM Fast /
+       fractal_anomaly / scale_space_surprise / visual_saliency /
+       multiscale_terrain / ambient_occlusion / openness) from stratified
+       full-resolution tiles.
+    3. npr_edges global per-radius gradient threshold.
+    4. specular global roughness p95.
+    """
+    if is_zarr:
+        return params
+
+    if (
+        algorithm == "fractal_anomaly"
+        and params.get("relief_p10") is None
+        and params.get("relief_p75") is None
+    ):
+        from ._impl_fractal_anomaly import _compute_fractal_relief_stats
+        _relief = _compute_fractal_relief_stats(src_cog, params)
+        if _relief is not None:
+            params["relief_p10"], params["relief_p75"] = _relief
+
+    if algorithm in _NORM_STAT_SPECS and "global_stats" not in params:
+        _ns = _compute_norm_stats_tiled(src_cog, algorithm, params)
+        if _ns is not None:
+            params["global_stats"] = _ns
+
+    if algorithm == "npr_edges" and "_npr_grad_stats" not in params:
+        from ._impl_npr_edges import _compute_npr_grad_stats
+        _ngs = _compute_npr_grad_stats(src_cog, params)
+        if _ngs:
+            params["_npr_grad_stats"] = _ngs
+
+    if algorithm == "specular" and params.get("roughness_norm_scale") is None:
+        from ._impl_specular import _compute_specular_roughness_scale
+        _rns = _compute_specular_roughness_scale(
+            src_cog, params, elevation_scale=float(params.get("elevation_scale", 1.0)),
+        )
+        if _rns is not None:
+            params["roughness_norm_scale"] = _rns
+
+    return params
+
+
+__all__ = [
+    "_NORM_STAT_SPECS", "_norm_stat_max_scale", "_compute_norm_stats_tiled",
+    "inject_global_stats",
+]

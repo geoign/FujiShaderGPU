@@ -49,6 +49,7 @@ from ..algorithms._impl_specular import _compute_specular_roughness_scale
 from ..algorithms._norm_stats import (
     _NORM_STAT_SPECS,
     _compute_norm_stats_tiled,
+    inject_global_stats,
 )
 from ..io.raster_info import metric_pixel_scales_from_metadata
 from ..io.output_encoding import (
@@ -1187,69 +1188,12 @@ def run_pipeline(
                     algorithm, _dem_short_side, _auto_r,
                 )
 
-        # fractal_anomaly's relief_conf uses a per-block roughness percentile that
-        # varies tile-to-tile (visible tile-boundary seams).  Inject a global
-        # roughness p10/p75 so it is consistent across the whole raster.
-        # NOTE: this MUST run before the norm-stats pre-pass below.  The pre-pass
-        # runs the algorithm's raw block (with these params) to estimate the
-        # display center/scale; if relief_p10/p75 are absent there, the pre-pass
-        # falls back to a per-tile relief_conf while the main pass uses the global
-        # one, so the additive relief terms shift the feature distribution between
-        # the two passes.  The pre-pass center (median) then mismatches the main
-        # pass, biasing the output toward the bright end (worse on high-relief
-        # DEMs where the global relief_conf saturates high).  Computing relief
-        # first makes both passes consistent.
-        if (
-            algorithm == "fractal_anomaly"
-            and params.get("relief_p10") is None
-            and params.get("relief_p75") is None
-            and not is_zarr_path(src_cog)
-        ):
-            _relief = _compute_fractal_relief_stats(src_cog, params)
-            if _relief is not None:
-                params["relief_p10"], params["relief_p75"] = _relief
-
-        # Normalized algorithms (TopoUSM Fast/fractal_anomaly/scale_space_surprise/
-        # visual_saliency/multiscale_terrain): derive the display range
-        # (-1..1 / 0..1) from a robust p99 of the algorithm's own FULL-RESOLUTION
-        # output, pooled over tiles stratified across the whole valid extent.
-        # Full resolution keeps scale-sensitive magnitudes correct (radii/kernel
-        # are not decimated); pooling the whole extent is robust to off-center
-        # data and dilutes singular outliers (e.g. a volcano summit) into the
-        # unclipped >1 tail rather than letting them set the scale.
-        if (
-            algorithm in _NORM_STAT_SPECS
-            and "global_stats" not in params
-            and not is_zarr_path(src_cog)
-        ):
-            _norm_stats = _compute_norm_stats_tiled(src_cog, algorithm, params)
-            if _norm_stats is not None:
-                params["global_stats"] = _norm_stats
-
-        # npr_edges thresholds edges against a per-block gradient distribution
-        # (tile-boundary seams).  Inject a global per-radius gradient threshold so
-        # the small (full-res) radii are consistent across tiles.
-        if (
-            algorithm == "npr_edges"
-            and "_npr_grad_stats" not in params
-            and not is_zarr_path(src_cog)
-        ):
-            _ngs = _compute_npr_grad_stats(src_cog, params)
-            if _ngs:
-                params["_npr_grad_stats"] = _ngs
-
-        # specular normalizes roughness by a per-block p95 (tile-boundary seams,
-        # pronounced on large / geographic DEMs where roughness varies across the
-        # extent).  Inject a single global roughness p95 so every tile uses the
-        # same denominator -- the same fix the tile backend already applies.
-        if (
-            algorithm == "specular"
-            and params.get("roughness_norm_scale") is None
-            and not is_zarr_path(src_cog)
-        ):
-            _rns = _compute_specular_roughness_scale(src_cog, params)
-            if _rns is not None:
-                params["roughness_norm_scale"] = _rns
+        # Compute + inject every per-algorithm global normalization statistic
+        # (fractal relief -> robust display range -> npr gradient -> specular
+        # roughness, in that order) via the shared backend-neutral helper, so the
+        # dask and tile pipelines cannot drift on these.  All steps are full-res,
+        # global (seam-free) and mode-independent.
+        inject_global_stats(src_cog, algorithm, params, is_zarr=is_zarr_path(src_cog))
 
         # Unified coarse source: read ONE decimated overview of the DEM and share it
         # across every algorithm's large-radius path (the coarse-overview combine is
