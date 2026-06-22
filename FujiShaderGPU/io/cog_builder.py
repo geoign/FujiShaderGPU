@@ -14,14 +14,11 @@ from typing import List, Optional
 
 from osgeo import gdal
 
-from ..config.gdal_config import _configure_gdal_ultra_performance
+from ..config.gdal_config import _configure_gdal_ultra_performance, gdal_local_no_exceptions
 from ..utils.cpu import container_cpu_count
 from ..utils.memory import container_memory_available_gb
 
 logger = logging.getLogger(__name__)
-
-# Keep current non-exception behavior and silence GDAL 4.0 future warning.
-gdal.DontUseExceptions()
 
 
 def _gdal_num_threads() -> str:
@@ -223,7 +220,15 @@ def _create_vrt_ultra_fast(
         srcNodata=nodata,
         VRTNodata=nodata,
     )
-    gdal.BuildVRT(vrt_path, tile_files, options=vrt_options)
+    vrt_ds = gdal.BuildVRT(vrt_path, tile_files, options=vrt_options)
+    if vrt_ds is None:
+        raise RuntimeError(
+            f"gdal.BuildVRT failed to create VRT: {vrt_path} "
+            f"({len(tile_files)} tiles)"
+        )
+    # Drop the handle so the VRT is flushed/closed before it is read back (avoids
+    # stale/locked-file issues on Windows in particular).
+    vrt_ds = None
     logger.info("Python VRT: %.1fs", time.time() - start)
 
 
@@ -564,6 +569,7 @@ def _create_vrt_and_cog_external_cli(
             os.remove(file_list_path)
 
 
+@gdal_local_no_exceptions()
 def _build_vrt_and_cog_ultra_fast(
     tmp_tile_dir: str,
     output_cog_path: str,
@@ -571,7 +577,12 @@ def _build_vrt_and_cog_ultra_fast(
     backend: str = "internal",
     gdal_bin_dir: Optional[str] = None,
 ) -> None:
-    """Build VRT from tile outputs and convert to COG."""
+    """Build VRT from tile outputs and convert to COG.
+
+    The GDAL Python calls below check ``None`` return values rather than catching
+    exceptions, so this entry point opts into GDAL's non-exception mode locally
+    (restored on exit) instead of mutating the policy globally at import time.
+    """
     logger.info("=== Fast COG generation start ===")
     _configure_gdal_ultra_performance(gpu_config)
 

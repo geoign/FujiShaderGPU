@@ -962,9 +962,17 @@ def run_pipeline(
     chunk: Optional[int] = None,
     show_progress: bool = True,
     auto_radii: bool = True,
+    pixel_size: Optional[float] = None,
     **algo_params
 ):
-    """Improved main pipeline."""
+    """Improved main pipeline.
+
+    ``pixel_size`` (metres) overrides the value detected from the DEM metadata.
+    ``None`` (the default) keeps auto-detection.  An explicit value is applied
+    isotropically to both axis scales -- algorithms read ``pixel_scale_x/y`` and
+    only fall back to ``pixel_size`` when those are unset, so both must be set for
+    the override to actually take effect.
+    """
     # Check the algorithm
     if algorithm not in ALGORITHMS:
         raise ValueError(f"Unknown algorithm: {algorithm}. Available: {list(ALGORITHMS.keys())}")
@@ -1096,10 +1104,27 @@ def run_pipeline(
         # never rescaled -- the same convention as the tile backend, so the
         # shared (raw-elevation) normalization stats apply to both.
         px_m_x, px_m_y, pixel_size_m, is_geo, lat_center = _detect_metric_scales_from_dataarray(dem)
-        params['pixel_size'] = float(pixel_size_m)
-        params.setdefault('pixel_scale_x', float(px_m_x))
-        params.setdefault('pixel_scale_y', float(px_m_y))
-        params.setdefault('is_geographic_dem', bool(is_geo))
+        if pixel_size is not None:
+            # Explicit --pixel-size overrides the metadata-detected scale: treat each
+            # pixel as this many metres isotropically (keeping the detected axis signs
+            # so grid orientation is preserved), and drop the geographic-anisotropy
+            # approximation.  Both pixel_scale_x/y must be set, not just pixel_size,
+            # because the algorithms read the per-axis scales first.
+            p = float(pixel_size)
+            px_m_x = p if px_m_x >= 0 else -p
+            px_m_y = p if px_m_y >= 0 else -p
+            pixel_size_m = p
+            is_geo = False
+            logger.info("Pixel size overridden by --pixel-size: %.6gm (isotropic)", p)
+            params['pixel_size'] = float(pixel_size_m)
+            params['pixel_scale_x'] = float(px_m_x)
+            params['pixel_scale_y'] = float(px_m_y)
+            params['is_geographic_dem'] = False
+        else:
+            params['pixel_size'] = float(pixel_size_m)
+            params.setdefault('pixel_scale_x', float(px_m_x))
+            params.setdefault('pixel_scale_y', float(px_m_y))
+            params.setdefault('is_geographic_dem', bool(is_geo))
         if is_geo:
             ratio = abs(px_m_y) / max(abs(px_m_x), 1e-9)
             logger.info(

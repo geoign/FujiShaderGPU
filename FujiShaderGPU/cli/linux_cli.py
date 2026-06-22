@@ -74,6 +74,18 @@ writes them out as Cloud-Optimized GeoTIFF."""
             self.logger.info(f"User-specified pixel size: {args.pixel_size}m")
             return
 
+        # Zarr stores are not openable via rasterio/GDAL the way the Dask pipeline
+        # reads them (xarray/rioxarray); probing with rasterio.open() here would
+        # raise. run_pipeline detects the pixel size from the xarray metadata, so
+        # leave args.pixel_size as None (auto-detect downstream).
+        from ..core.dask_io import is_zarr_path
+        if is_zarr_path(input_path):
+            self.logger.info(
+                "Zarr input: pixel size will be auto-detected from xarray/rioxarray "
+                "metadata in run_pipeline."
+            )
+            return
+
         with rasterio.open(input_path) as src:
             if src.crs and src.crs.is_geographic:
                 # Geographic CRS (lat/lon): convert degrees to meters at center latitude.
@@ -148,6 +160,7 @@ writes them out as Cloud-Optimized GeoTIFF."""
                 nodata_override=parse_nodata_override(getattr(args, "nodata", None)),
                 output_dtype=getattr(args, "output_dtype", "float32"),
                 output_range=parse_output_range(getattr(args, "output_range", None)),
+                pixel_size=getattr(args, "pixel_size", None),
                 **algo_params,
             )
         except Exception as e:

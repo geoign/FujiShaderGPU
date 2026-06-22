@@ -4,10 +4,36 @@ FujiShaderGPU/config/gdal_config.py
 
 import logging
 import os
+from contextlib import contextmanager
 
 from osgeo import gdal
 
 from ..utils.cpu import container_cpu_count
+
+
+@contextmanager
+def gdal_local_no_exceptions():
+    """Temporarily select GDAL's non-exception (None-returning) mode, restoring the
+    caller's prior policy on exit.
+
+    FujiShaderGPU's GDAL helpers check return values (``None`` on failure) rather
+    than catching exceptions, and GDAL 4.0 emits a FutureWarning unless the policy
+    is chosen explicitly.  Selecting it *globally at import time* (the previous
+    ``gdal.DontUseExceptions()`` at module scope) silently changed GDAL's behaviour
+    for any application that merely imported FujiShaderGPU.  Each GDAL entry point
+    instead opts in locally via this context manager (usable as a decorator), so
+    importing the package no longer mutates process-wide GDAL state.
+    """
+    get_use = getattr(gdal, "GetUseExceptions", None)
+    prev = bool(get_use()) if callable(get_use) else False
+    gdal.DontUseExceptions()
+    try:
+        yield
+    finally:
+        if prev:
+            gdal.UseExceptions()
+        else:
+            gdal.DontUseExceptions()
 
 
 def apply_gdal_io_config(cache_mb: int, *, dataset_pool_size: int = None, force: bool = True) -> None:

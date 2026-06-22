@@ -7,12 +7,12 @@ import os
 
 from osgeo import gdal
 
-# Suppress GDAL 4.0 future warnings while keeping current non-exception behavior
-gdal.DontUseExceptions()
+from ..config.gdal_config import gdal_local_no_exceptions
 
 logger = logging.getLogger(__name__)
 
 
+@gdal_local_no_exceptions()
 def _validate_cog_for_qgis(cog_path: str):
     """
     QGIS-optimization COG validation.

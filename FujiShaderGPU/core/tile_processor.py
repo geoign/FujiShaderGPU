@@ -37,6 +37,7 @@ import math
 import glob
 import shutil
 import tempfile
+import uuid
 from pathlib import Path
 import rasterio
 import numpy as np
@@ -644,6 +645,27 @@ def _warn_implicit_nodata_candidates(
         logger.debug(f"Implicit nodata candidate scan skipped: {exc}")
 
 
+def _is_dangerous_tmp_path(path: Path) -> bool:
+    """True if *path* must never be used as a scratch tile directory.
+
+    The current working directory (``--tmp-dir .``), the user home, and any
+    filesystem root / drive anchor (e.g. ``C:\\`` or ``/``) are never legitimate
+    dedicated temp dirs.  Earlier this function unconditionally ``rmtree``-d the
+    resolved tmp dir, so pointing ``--tmp-dir`` at one of these (or any directory
+    that already held data) could destroy the user's files; refuse them outright.
+    """
+    p = safe_abspath(path)
+    if p == p.parent:  # filesystem root or drive anchor (C:\, /)
+        return True
+    sentinels: List[Path] = []
+    for getter in (Path.cwd, Path.home):
+        try:
+            sentinels.append(safe_abspath(getter()))
+        except Exception:
+            pass
+    return p in sentinels
+
+
 def _resolve_writable_tmp_dir(
     requested_tmp_dir: str,
     output_cog_path: str,
@@ -653,6 +675,10 @@ def _resolve_writable_tmp_dir(
 
     For default relative `tiles_tmp`, prefer output directory, then input directory,
     and finally fall back to system temp.
+
+    Never deletes pre-existing content: dangerous targets (cwd/home/root) are
+    refused, and an existing *non-empty* directory is preserved by creating a fresh
+    unique run subdirectory inside it instead of wiping it.
     """
     requested = Path(requested_tmp_dir)
     candidates: List[Path] = []
@@ -675,15 +701,32 @@ def _resolve_writable_tmp_dir(
 
     last_error: Optional[Exception] = None
     for candidate in candidates:
+        candidate = safe_abspath(candidate)
+        if _is_dangerous_tmp_path(candidate):
+            logger.warning(
+                "Refusing to use '%s' as a temp tile directory: cwd/home/root are "
+                "never used as scratch space (their contents would be at risk).",
+                candidate,
+            )
+            continue
         try:
+            target = candidate
             if candidate.exists():
-                if candidate.is_dir():
-                    shutil.rmtree(candidate)
-                else:
-                    candidate.unlink()
-            candidate.mkdir(parents=True, exist_ok=False)
-            logger.info(f"Temporary tile directory: {candidate}")
-            return str(candidate)
+                if not candidate.is_dir():
+                    # A file already occupies the path; never delete a user file --
+                    # fall through to the next candidate (e.g. system temp).
+                    logger.warning(
+                        "Tmp dir candidate '%s' exists and is not a directory; skipping.",
+                        candidate,
+                    )
+                    continue
+                if any(candidate.iterdir()):
+                    # Existing, non-empty directory: do NOT wipe it. Use a fresh,
+                    # unique run subdirectory so pre-existing content is preserved.
+                    target = candidate / f"fsg_{uuid.uuid4().hex[:12]}"
+            target.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Temporary tile directory: {target}")
+            return str(target)
         except Exception as exc:
             last_error = exc
             logger.warning(f"Cannot prepare tmp dir '{candidate}': {exc}")

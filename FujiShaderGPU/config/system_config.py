@@ -10,15 +10,13 @@ from typing import List, Optional
 import cupy as cp
 from osgeo import gdal
 
+from ..config.gdal_config import gdal_local_no_exceptions
 from ..config.gpu_config_manager import _gpu_config_manager
 from ..config.auto_tune import auto_tune
 from ..utils.memory import container_memory_total_gb
 from ..utils.cpu import container_cpu_count
 
 logger = logging.getLogger(__name__)
-
-# Keep current non-exception behavior and silence GDAL 4.0 future warning.
-gdal.DontUseExceptions()
 
 
 def get_gpu_config(
@@ -129,6 +127,7 @@ def detect_optimal_system_config() -> dict:
     return config
 
 
+@gdal_local_no_exceptions()
 def check_gdal_environment():
     """
     GDAL environment check (QGIS-optimization aware)

@@ -17,7 +17,15 @@ from ._nan_utils import (
     _radius_to_downsample_factor, _downsample_nan_aware, _upsample_to_shape,
     large_radius_threshold, multiscale_response_fields,
 )
-from ._global_stats import apply_display_stretch_dask
+# robust_unsigned_stretch_stat_func is re-exported here (not used directly in this
+# module) so the global-stats pre-pass can resolve it via getattr on this module --
+# see _norm_stats._NORM_STAT_SPECS, the same convention _impl_topousm_fast uses for
+# topousm_fast_stat_func. Without it the getattr raised AttributeError, the stats
+# were silently skipped, and the [p1,p99]->[0,1] display stretch never ran.
+from ._global_stats import (  # noqa: F401  (re-export for _NORM_STAT_SPECS)
+    apply_display_stretch_dask,
+    robust_unsigned_stretch_stat_func,
+)
 
 
 def compute_openness_vectorized(block: cp.ndarray, *,

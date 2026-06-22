@@ -1,13 +1,22 @@
 """Public algorithm package exports."""
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 __all__ = []
 
-# Dask registry (canonical algorithm names)
+# Dask registry (canonical algorithm names).
+# The catch stays broad because the backends pull in optional, environment-
+# specific deps (cupy/CUDA, dask) that can fail in ways other than ImportError;
+# importing the package must still succeed and expose whatever *did* load. But it
+# now logs the cause instead of swallowing it silently (a typo'd import or a
+# circular import used to look like "the name just doesn't exist").
 try:
     from .dask_registry import ALGORITHMS, DaskAlgorithm  # noqa: F401
     __all__.extend(["ALGORITHMS", "DaskAlgorithm"])
-except Exception:
-    pass
+except Exception as exc:
+    logger.warning("FujiShaderGPU: Dask algorithm registry unavailable: %s", exc)
 
 # Tile-side classes (same canonical names as Dask)
 try:
@@ -46,5 +55,5 @@ try:
         "ScaleSpaceSurpriseAlgorithm",
         "MultiLightUncertaintyAlgorithm",
     ])
-except Exception:
-    pass
+except Exception as exc:
+    logger.warning("FujiShaderGPU: tile algorithm classes unavailable: %s", exc)
