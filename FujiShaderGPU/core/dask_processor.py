@@ -630,6 +630,53 @@ def _dask_worker_memory_limit_gb() -> Optional[float]:
     return None
 
 
+def _persist_budget_gb(cluster, client) -> float:
+    """Resource-aware cap (GB) on the result size worth ``persist``-ing.
+
+    ``client.persist`` holds the ENTIRE result resident across the cluster.  It
+    only pays off when the result fits in the workers' on-device (GPU) headroom
+    -- ``device_memory_limit`` minus the eager RMM pool.  Beyond that it spills
+    to host RAM with no speed benefit and, on a single-GPU worker, drives the
+    nanny memory-terminate loop (worker killed by signal 9, tasks recomputed
+    forever) that OOM-failed a 13.9 GB global GEBCO run on a 20 GB-VRAM A4500.
+
+    So size the budget from the real per-worker GPU headroom x worker count
+    (0.85 safety margin), clamped by host RAM so a spilling persist can never
+    overflow the box either.  Falls back to a live free-VRAM probe, then a
+    conservative floor, when the cluster did not publish its memory facts.
+    Replaces the previous hardcoded 20 GB threshold, which implicitly assumed a
+    large-VRAM GPU and abundant host RAM.
+    """
+    try:
+        n_workers = max(1, len(client.scheduler_info().get("workers", {})))
+    except Exception:
+        n_workers = 1
+
+    gpu_headroom_gb = None
+    mem = getattr(cluster, "_fujishader_mem", None)
+    if isinstance(mem, dict):
+        device_limit = float(mem.get("device_limit_gb", 0.0) or 0.0)
+        rmm_pool = float(mem.get("rmm_pool_gb", 0.0) or 0.0)
+        gpu_headroom_gb = max(0.0, device_limit - rmm_pool)
+    if not gpu_headroom_gb or gpu_headroom_gb <= 0.0:
+        # Workers share the physical GPU, so free VRAM in this process already
+        # reflects VRAM minus the RMM pools the workers eagerly reserved.
+        try:
+            free_b, _ = cp.cuda.runtime.memGetInfo()
+            gpu_headroom_gb = (free_b / (1024**3)) * 0.8
+        except Exception:
+            gpu_headroom_gb = 2.0
+
+    budget_gb = n_workers * gpu_headroom_gb * 0.85
+
+    worker_limit_gb = _dask_worker_memory_limit_gb()
+    if worker_limit_gb is not None:
+        # Even if it spills, a persisted result must not swamp host RAM.
+        budget_gb = min(budget_gb, n_workers * worker_limit_gb * 0.40)
+
+    return max(1.0, budget_gb)
+
+
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """Write COG (auto-selected by available memory)."""
     total_gb = data.nbytes / (1024**3)
@@ -1436,19 +1483,31 @@ def run_pipeline(
 
         # Run the computation with progress display
         # ---------- Compute trigger after the GPU->CPU conversion ----------
-        # When it exceeds 20 GB, skip persist and let
-        # write_cog_da_chunked() stream-compute it.
+        # Persist keeps the whole result resident in cluster memory (fast only
+        # while it fits the workers' on-device GPU headroom).  Above that budget,
+        # skip persist and let write_cog_da_chunked() stream-compute each tile --
+        # persisting a result too big to stay on-device spills to host RAM and,
+        # on a single-GPU worker, OOM-kills the nanny in a recompute loop.  The
+        # budget is sized from the real per-worker GPU headroom + host RAM, not a
+        # fixed threshold (which assumed a large-VRAM GPU / abundant host RAM).
         total_gb = result_cpu.nbytes / (1024**3)
-        if total_gb <= 20:
+        persist_budget_gb = _persist_budget_gb(cluster, client)
+        if total_gb <= persist_budget_gb:
             if show_progress:
-                logger.info("Persisting small dataset for faster workflow")
+                logger.info(
+                    "Persisting result (%.1f GB <= %.1f GB budget) for faster workflow",
+                    total_gb, persist_budget_gb,
+                )
                 result_cpu = client.persist(result_cpu, optimize_graph=True)
                 progress(result_cpu, interval='1s')
             else:
                 result_cpu = result_cpu.persist()
         else:
-            logger.info(f"Large dataset ({total_gb:.1f} GB) - skip persist; "
-                        "chunked writer will stream-compute each tile")
+            logger.info(
+                "Large dataset (%.1f GB > %.1f GB persist budget) - skip persist; "
+                "chunked writer will stream-compute each tile",
+                total_gb, persist_budget_gb,
+            )
     
         # 6-5) xarray wrap (improved: simplified coordinate construction)
         # 6-5) xarray wrap (coordinate construction)

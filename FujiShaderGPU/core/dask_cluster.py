@@ -101,5 +101,20 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         logger.info("dask-cuda does not support enable_cudf_spill; using default spilling")
         cluster = LocalCUDACluster(**cluster_kwargs)
 
+    # Expose the computed GPU memory budget so downstream persist/gather
+    # decisions (dask_processor) can size themselves to the real per-worker
+    # on-device headroom (device_limit minus the eager RMM pool) instead of a
+    # hardcoded threshold -- the fix for single-GPU-worker host-RAM OOM when
+    # persisting a result too large to stay resident on the device.
+    try:
+        cluster._fujishader_mem = {
+            "gpu_memory_gb": float(gpu_memory_gb),
+            "device_limit_gb": float(device_limit_gb),
+            "rmm_pool_gb": float(rmm_size),
+            "rmm_max_gb": float(rmm_max_gb),
+        }
+    except Exception:
+        pass
+
     client = Client(cluster)
     return cluster, client
