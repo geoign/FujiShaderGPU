@@ -35,7 +35,6 @@ from ..utils.paths import safe_abspath
 import os
 import math
 import glob
-import shutil
 import tempfile
 import uuid
 from pathlib import Path
@@ -68,6 +67,12 @@ DEFAULT_ALGORITHMS = {
     "fractal_anomaly": "FractalAnomalyAlgorithm",
     "scale_space_surprise": "ScaleSpaceSurpriseAlgorithm",
     "multi_light_uncertainty": "MultiLightUncertaintyAlgorithm",
+    "structure_tensor": "StructureTensorAlgorithm",
+    "frangi": "FrangiAlgorithm",
+    "lic": "LICAlgorithm",
+    "phase_congruency": "PhaseCongruencyAlgorithm",
+    "tv_decomposition": "TVDecompositionAlgorithm",
+    "scale_drift": "ScaleDriftAlgorithm",
 }
 
 # NOTE: output normalization is owned entirely by the algorithms themselves
@@ -301,6 +306,36 @@ def _required_padding_for_algorithm(
         # Gaussian of sigma = r/2 whose 4-sigma kernel needs ~2r of halo; +16
         # covers feature smoothing and the size-3 median.
         required = max(required, int(max_radius * 2 + 16))
+    elif algorithm == "lic":
+        # Streamline integration: length steps of ~1 px each way + vector-field
+        # smoothing support.
+        from ..algorithms._impl_lic import LIC_MAX_LENGTH
+        length = min(int(algo_params.get("length", 20) or 20), LIC_MAX_LENGTH)
+        flow_sigma = float(algo_params.get("flow_sigma", 1.5) or 1.5)
+        required = max(required, int(length + 4 * flow_sigma + 4))
+    elif algorithm == "phase_congruency":
+        # FFT wraparound decays over ~lambda; 2*lambda_max of halo makes the
+        # tile core seam-free.  Wavelengths are clamped to PC_MAX_WAVELENGTH.
+        from ..algorithms._impl_phase_congruency import resolve_pc_wavelengths
+        scales = resolve_pc_wavelengths(algo_params.get("radii"))
+        required = max(required, int(2 * max(scales)) + 16)
+    elif algorithm == "tv_decomposition":
+        # Primal-dual TV information travels ~1 px/iteration.
+        from ..algorithms._impl_tv_decomposition import TV_MAX_ITERATIONS
+        iters = min(int(algo_params.get("iterations", 120) or 120),
+                    TV_MAX_ITERATIONS)
+        required = max(required, int(iters + 4))
+    elif algorithm == "scale_drift":
+        # Gaussian levels (4*sigma) for the small scales + the Lucas-Kanade
+        # window / divergence halo of the combine stage.  Large scales come
+        # from the overview fields (MAX_DEPTH split, mirroring the compute).
+        from ..algorithms._impl_scale_drift import DRIFT_WINDOW_CAP
+        scales = _unified_radii([2.0, 4.0, 8.0, 16.0, 32.0])
+        small = [s for s in scales
+                 if int(max(1, round(s * 4))) + 1 <= _MAX_DEPTH] or [min(scales)]
+        required = max(
+            required,
+            int(math.ceil(max(small) * 4.0)) + int(4 * DRIFT_WINDOW_CAP) + 8)
 
     spatial_algorithms = {
         "hillshade",
@@ -312,6 +347,9 @@ def _required_padding_for_algorithm(
         "openness",
         "multi_light_uncertainty",
         "npr_edges",
+        # sigma = radius/2 Gaussian support -> the same 2R + margin rule.
+        "structure_tensor",
+        "frangi",
     }
     if _mode == "spatial" and algorithm in spatial_algorithms:
         radii = algo_params.get("radii")
@@ -1101,6 +1139,8 @@ def process_dem_tiles(
         "ambient_occlusion",
         "openness",
         "multi_light_uncertainty",
+        "structure_tensor",
+        "frangi",
     }
     if mode_norm == "spatial" and algorithm in spatial_algorithms:
         # Radii are normally injected above from the DEM short side; this is a

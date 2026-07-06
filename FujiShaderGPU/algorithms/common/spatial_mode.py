@@ -36,6 +36,8 @@ RADII_DRIVEN_ALGOS = frozenset({
     "openness",
     "multi_light_uncertainty",
     "npr_edges",
+    "structure_tensor",
+    "frangi",
 })
 
 # Algorithms whose result is undefined at a single scale (fractal dimension needs a
@@ -46,6 +48,8 @@ MULTISCALE_REQUIRED_ALGOS = frozenset({
     "fractal_anomaly",
     "scale_space_surprise",
     "visual_saliency",
+    "scale_drift",      # drift needs >= 2 scale levels
+    "phase_congruency",  # needs a wavelength bank
 })
 
 # Canonical single-pixel "local" profile shared by both backends.

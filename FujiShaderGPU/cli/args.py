@@ -96,6 +96,37 @@ ALGORITHM_ARGS: List[ArgSpec] = [
     # Multi-light uncertainty
     (("--ml-azimuths",), dict(type=str, help="Multi-light azimuths, comma-separated (e.g. 315,45,135,225)")),
     (("--uncertainty-weight",), dict(type=float, default=0.7, help="Multi-light uncertainty weight (default: 0.7)")),
+    # Structure tensor
+    (("--st-output",), dict(
+        choices=["coherence", "orientation", "fabric"], default="coherence",
+        help="Structure tensor output: coherence (anisotropy strength), orientation "
+             "(strike angle, 0-1 = 0-180deg), fabric (directional lighting vs --azimuth) "
+             "(default: coherence)")),
+    (("--derivative-sigma",), dict(type=float, default=1.0, help="Gaussian derivative scale in pixels for structure_tensor (default: 1.0)")),
+    # Frangi / phase congruency (shared feature selector)
+    (("--feature-type",), dict(
+        choices=["both", "ridge", "valley", "edge"], default="both",
+        help="Feature polarity for frangi/phase_congruency: both (signed, 0.5-centered), "
+             "ridge, valley, edge (phase_congruency only) (default: both)")),
+    (("--frangi-beta",), dict(type=float, default=0.5, help="Frangi blobness sensitivity beta (default: 0.5)")),
+    # LIC
+    (("--lic-length",), dict(type=int, default=20, help="LIC streamline half-length in pixels (default: 20, max 120)")),
+    (("--lic-field",), dict(choices=["flow", "contour"], default="flow", help="LIC vector field: flow (down the gradient) or contour (along contours) (default: flow)")),
+    (("--lic-composite",), dict(choices=["hillshade", "none"], default="hillshade", help="Multiply the LIC texture with a hillshade (default: hillshade)")),
+    (("--lic-sigma",), dict(type=float, default=1.5, help="Vector-field smoothing sigma for LIC (default: 1.5)")),
+    # Phase congruency
+    (("--sigma-onf",), dict(type=float, default=0.55, help="log-Gabor bandwidth ratio for phase_congruency (default: 0.55)")),
+    (("--pc-k",), dict(type=float, default=2.0, help="Phase congruency noise threshold factor k (default: 2.0)")),
+    # TV decomposition
+    (("--tv-scale",), dict(type=float, default=32.0, help="TV structure scale: features smaller than this diameter (px) go to texture (default: 32; --radii first value overrides it)")),
+    (("--tv-iterations",), dict(type=int, default=120, help="TV primal-dual iterations (default: 120, max 140)")),
+    (("--tv-fidelity",), dict(choices=["l1", "l2"], default="l1", help="TV fidelity term: l1 (contrast-independent scale, default) or l2 (ROF)")),
+    (("--tv-component",), dict(choices=["texture", "structure"], default="texture", help="TV output component (default: texture)")),
+    # Scale drift
+    (("--drift-output",), dict(
+        choices=["magnitude", "direction", "divergence"], default="magnitude",
+        help="Scale-drift output: magnitude (asymmetry strength), direction "
+             "(angle, 0-1 = 0-360deg), divergence (default: magnitude)")),
     # Generic
     (("--intensity",), dict(type=float, default=1.0, help="Effect intensity (default: 1.0, used by several algorithms)")),
 ]
@@ -291,6 +322,37 @@ def build_algo_params(args: argparse.Namespace) -> dict:
         p["altitude"] = args.altitude
         p["z_factor"] = args.z_factor
         p["uncertainty_weight"] = args.uncertainty_weight
+
+    elif algorithm == "structure_tensor":
+        p["st_output"] = args.st_output
+        p["derivative_sigma"] = args.derivative_sigma
+        p["azimuth"] = args.azimuth
+
+    elif algorithm == "frangi":
+        p["feature_type"] = args.feature_type
+        p["beta"] = args.frangi_beta
+
+    elif algorithm == "lic":
+        p["length"] = args.lic_length
+        p["lic_field"] = args.lic_field
+        p["composite"] = args.lic_composite
+        p["flow_sigma"] = args.lic_sigma
+        p["azimuth"] = args.azimuth
+        p["altitude"] = args.altitude
+
+    elif algorithm == "phase_congruency":
+        p["feature_type"] = args.feature_type
+        p["sigma_onf"] = args.sigma_onf
+        p["noise_k"] = args.pc_k
+
+    elif algorithm == "tv_decomposition":
+        p["tv_scale"] = args.tv_scale
+        p["iterations"] = args.tv_iterations
+        p["fidelity"] = args.tv_fidelity
+        p["component"] = args.tv_component
+
+    elif algorithm == "scale_drift":
+        p["drift_output"] = args.drift_output
 
     return p
 

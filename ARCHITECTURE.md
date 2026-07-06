@@ -72,6 +72,12 @@ slow full-resolution reads).
   - `_impl_openness.py` — Topographic Openness (Yokoyama et al. 2002; directional mean of per-azimuth horizon angles, positive/negative)
   - `_impl_fractal_anomaly.py` — Fractal Anomaly (FujiShaderGPU-original composite; core = standard fractal-surface roughness-vs-scale log-log regression / Hurst exponent, anomaly feature is bespoke)
   - `_impl_experimental.py` — Scale-Space Surprise (FujiShaderGPU-original Σ|DoG| cross-scale measure on standard Gaussian scale-space; NOT Bayesian Surprise) + Multi-Light Uncertainty
+  - `_impl_structure_tensor.py` — Structure Tensor Fabric (Bigün & Granlund 1987; Weickert-coherence + strike orientation via double-angle vector averaging; outputs coherence / orientation / fabric). Also hosts the shared Gaussian-derivative + NaN-fill helpers used by frangi / scale_drift / lic.
+  - `_impl_frangi.py` — Frangi Vesselness (Frangi et al. 1998; scale-normalized Hessian eigenvalue ridge/valley network filter; global energy scale `c` from the stats prepass)
+  - `_impl_lic.py` — Line Integral Convolution (Cabral & Leedom 1993; flow/contour streamline texture; noise = elevation-value hash so tiles and backends are seam-free by construction; default hillshade composite)
+  - `_impl_phase_congruency.py` — Phase Congruency relief (Kovesi 1999 via the monogenic signal, Felsberg & Sommer 2001; amplitude-invariant feature detection; per-block FFT with 2·λ halo, wavelengths clamped to ≤64 px — larger scales are a future overview-path extension)
+  - `_impl_tv_decomposition.py` — TV structure–texture decomposition (ROF 1992 / TV-L1 Chan & Esedoglu 2005, Chambolle–Pock 2011 primal-dual; halo = iterations so tiles are exactly chunk-independent; halo-free texture around scarps)
+  - `_impl_scale_drift.py` — Scale-Drift Field (FujiShaderGPU-original: Lucas–Kanade drift between adjacent Gaussian scale-space levels = vector version of scale_space_surprise; outputs magnitude / direction / divergence)
   - Some `_impl_*` modules also host **backend-neutral global-stat helpers** that
     both pipelines import (so they are not duplicated, and the Windows tile path does
     not import the Dask-only `core/dask_processor.py`): `_compute_npr_grad_stats`
@@ -171,8 +177,36 @@ Registered in `algorithms/dask_registry.py` (and `dask_shared.py` ALGORITHMS):
 - `fractal_anomaly`
 - `scale_space_surprise`
 - `multi_light_uncertainty`
+- `structure_tensor`
+- `frangi`
+- `lic`
+- `phase_congruency`
+- `tv_decomposition`
+- `scale_drift`
 
 These names are also the canonical CLI names for the tile backend.
+
+Notes on the 2026-07 batch (`structure_tensor` … `scale_drift`):
+
+- All six are single-band float32 products (like every other algorithm).
+  Direction-carrying outputs are exposed as selectable single-band modes
+  (`--st-output orientation` / `--drift-output direction`, angle mapped to
+  [0, 1)); an HSV/RGB composite is deferred until the Dask COG writer grows
+  multi-band support (the tile writer already handles HxWxC).
+- `structure_tensor` / `frangi` are radius-driven spatial algorithms
+  (`RADII_DRIVEN_ALGOS`): auto radii, `--weights`, and the unified
+  overview large-radius path all apply. `scale_drift` / `phase_congruency`
+  are intrinsically multi-scale (`MULTISCALE_REQUIRED_ALGOS`, local mode
+  falls back to spatial); `lic` / `tv_decomposition` are mode-independent.
+- Bounded-halo designs: `lic` length ≤ 120 px, `phase_congruency`
+  wavelengths ≤ 64 px, `tv_decomposition` iterations ≤ 140 — each keeps its
+  per-tile halo inside `Constants.MAX_DEPTH` (see
+  `_required_padding_for_algorithm`), so the tile output is seam-free
+  (verified: tiled vs single-tile runs differ only at the per-block NaN-fill
+  ring around NoData, the same behavior as the older algorithms).
+- Global statistics (`_NORM_STAT_SPECS`): display stretch for
+  structure_tensor / scale_drift, Frangi `c`, phase-congruency noise median,
+  and the TV texture tanh scale are all computed once, backend-neutrally.
 
 ## 5. Zarr Support
 

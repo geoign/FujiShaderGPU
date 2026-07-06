@@ -17,6 +17,12 @@ from .dask.openness import OpennessAlgorithm
 from .dask.fractal_anomaly import FractalAnomalyAlgorithm
 from .dask.scale_space_surprise import ScaleSpaceSurpriseAlgorithm
 from .dask.multi_light_uncertainty import MultiLightUncertaintyAlgorithm
+from .dask.structure_tensor import StructureTensorAlgorithm
+from .dask.frangi import FrangiAlgorithm
+from .dask.lic import LICAlgorithm
+from .dask.phase_congruency import PhaseCongruencyAlgorithm
+from .dask.tv_decomposition import TVDecompositionAlgorithm
+from .dask.scale_drift import ScaleDriftAlgorithm
 
 ALGORITHMS = {
     'topousm_fast': TopoUSMFastAlgorithm(),
@@ -34,6 +40,12 @@ ALGORITHMS = {
     'fractal_anomaly': FractalAnomalyAlgorithm(),
     'scale_space_surprise': ScaleSpaceSurpriseAlgorithm(),
     'multi_light_uncertainty': MultiLightUncertaintyAlgorithm(),
+    'structure_tensor': StructureTensorAlgorithm(),
+    'frangi': FrangiAlgorithm(),
+    'lic': LICAlgorithm(),
+    'phase_congruency': PhaseCongruencyAlgorithm(),
+    'tv_decomposition': TVDecompositionAlgorithm(),
+    'scale_drift': ScaleDriftAlgorithm(),
 }
 
 __all__ = ["ALGORITHMS", "DaskAlgorithm"]

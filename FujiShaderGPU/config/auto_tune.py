@@ -33,6 +33,13 @@ ALGORITHM_COMPLEXITY: Dict[str, float] = {
     "fractal_anomaly": 1.6,
     "openness": 1.8,
     "ambient_occlusion": 2.0,
+    # 2026-07 additions.
+    "structure_tensor": 1.4,   # 3 tensor fields x scales (two component passes)
+    "frangi": 1.3,             # 3 Hessian fields per scale
+    "lic": 1.5,                # position grids + per-step interpolation buffers
+    "phase_congruency": 2.0,   # complex FFT spectra x per-scale triplets
+    "tv_decomposition": 1.4,   # primal + dual + relaxation buffers
+    "scale_drift": 1.6,        # per-scale levels + 5 LK moment fields
 }
 
 # ---------------------------------------------------------------------------

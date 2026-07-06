@@ -30,6 +30,7 @@ def test_multiscale_required_algos_are_excluded_from_radii_driven():
     # undefined at one scale; they fall back to spatial instead.
     assert MULTISCALE_REQUIRED_ALGOS == {
         "fractal_anomaly", "scale_space_surprise", "visual_saliency",
+        "scale_drift", "phase_congruency",
     }
     assert MULTISCALE_REQUIRED_ALGOS.isdisjoint(RADII_DRIVEN_ALGOS)
 

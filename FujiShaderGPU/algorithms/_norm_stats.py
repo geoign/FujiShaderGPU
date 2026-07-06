@@ -44,6 +44,20 @@ _NORM_STAT_SPECS = {
                          "robust_unsigned_stretch_stat_func"),
     "openness": ("_impl_openness", "compute_openness_vectorized",
                 "robust_unsigned_stretch_stat_func"),
+    # New (2026-07) algorithms.  The "raw" block output feeding each stat:
+    # structure_tensor / scale_drift -> the selected output field itself;
+    # frangi -> the Hessian structure energy S (stat = global c);
+    # phase_congruency -> the smallest-scale amplitude (stat = noise median);
+    # tv_decomposition -> the signed texture v (stat = p90 |v| tanh scale).
+    "structure_tensor": ("_impl_structure_tensor",
+                        "compute_structure_tensor_block", "st_stretch_stat_func"),
+    "frangi": ("_impl_frangi", "compute_frangi_block", "frangi_c_stat_func"),
+    "phase_congruency": ("_impl_phase_congruency",
+                        "compute_phase_congruency_block", "pc_noise_stat_func"),
+    "tv_decomposition": ("_impl_tv_decomposition",
+                        "compute_tv_texture_block", "tv_texture_stat_func"),
+    "scale_drift": ("_impl_scale_drift",
+                   "compute_scale_drift_block", "drift_stretch_stat_func"),
 }
 
 

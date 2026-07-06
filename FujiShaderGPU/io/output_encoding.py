@@ -60,6 +60,16 @@ OUTPUT_VALUE_RANGES: Dict[str, Tuple[float, float]] = {
     "npr_edges": (0.2, 1.0),
     # Physical: slope in degrees spans [0, 90] (default unit).
     "slope": (0.0, 90.0),
+    # New (2026-07) algorithms.  All display outputs are [0, 1]-based;
+    # the stretched ones get integer headroom for the unclipped robust tail.
+    # Mode-dependent exceptions (orientation/direction/structure) are handled
+    # in resolve_output_range below.
+    "structure_tensor": (0.0, _NORM_HEADROOM),
+    "frangi": (0.0, 1.0),
+    "lic": (0.0, 1.0),
+    "phase_congruency": (0.0, 1.0),
+    "tv_decomposition": (0.0, 1.0),
+    "scale_drift": (0.0, _NORM_HEADROOM),
 }
 
 SUPPORTED_OUTPUT_DTYPES = ("float32", "int16", "uint8")
@@ -99,6 +109,18 @@ def resolve_output_range(
             return (0.0, float(np.pi / 2.0))
         if unit != "degree":
             return None  # 'percent' is unbounded -> estimate from data
+    if params is not None:
+        # Mode-dependent ranges of the 2026-07 algorithms.
+        if algo == "structure_tensor" and \
+                str(params.get("st_output", "coherence")).lower() == "orientation":
+            return (0.0, 1.0)  # exact angle band, no stretch headroom
+        if algo == "scale_drift" and \
+                str(params.get("drift_output", "magnitude")).lower() in (
+                    "direction", "divergence"):
+            return (0.0, 1.0)
+        if algo == "tv_decomposition" and \
+                str(params.get("component", "texture")).lower() == "structure":
+            return None  # raw elevation surface -> estimate from data
     return OUTPUT_VALUE_RANGES.get(algo)
 
 

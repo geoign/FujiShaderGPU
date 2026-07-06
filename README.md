@@ -130,6 +130,7 @@ Choose one with `--algorithm <name>` (default: `topousm_fast`):
 topousm_fast   hillshade   slope   specular   atmospheric_scattering   multiscale_terrain
 blur   curvature   visual_saliency   npr_edges   ambient_occlusion   openness
 fractal_anomaly   scale_space_surprise   multi_light_uncertainty
+structure_tensor   frangi   lic   phase_congruency   tv_decomposition   scale_drift
 ```
 
 > 📖 What each algorithm does — and how to tune it — is documented on its own page
@@ -167,6 +168,24 @@ fujishadergpu dem.tif out.tif --algorithm topousm_fast --output-dtype uint8
 
 # Zarr output (Linux / Dask path)
 fujishadergpu dem.tif out.zarr --algorithm scale_space_surprise
+
+# Terrain fabric orientation (structure tensor; strike as [0,180)deg -> [0,1])
+fujishadergpu dem.tif out.tif --algorithm structure_tensor --st-output orientation
+
+# Valley (drainage) network via Frangi vesselness (--agg max = canonical detector)
+fujishadergpu dem.tif out.tif --algorithm frangi --feature-type valley --agg max
+
+# Brushed flow-texture relief (LIC x hillshade composite)
+fujishadergpu dem.tif out.tif --algorithm lic
+
+# Amplitude-invariant micro-relief (phase congruency; finds decimetre scarps)
+fujishadergpu dem.tif out.tif --algorithm phase_congruency
+
+# Halo-free fine texture via TV decomposition (features < 32 px -> texture band)
+fujishadergpu dem.tif out.tif --algorithm tv_decomposition --tv-scale 32
+
+# Terrain asymmetry (original Scale-Drift Field)
+fujishadergpu dem.tif out.tif --algorithm scale_drift
 ```
 
 ## Preparing input
