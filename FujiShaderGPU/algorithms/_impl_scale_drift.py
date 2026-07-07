@@ -83,7 +83,14 @@ def _drift_smooth_block(block, *, scale, pixel_size=1.0, pixel_scale_x=None,
 
 
 def _drift_vector(smooths, scales, pair_w):
-    """Pair-weighted mean drift vector (Dx, Dy) from Gaussian levels."""
+    """Pair-weighted mean drift vector (Dx, Dy) from Gaussian levels.
+
+    Memory-lean: each pair's intermediates are freed as soon as they are
+    consumed so the block's peak stays near a handful of full-size arrays.
+    The naive version held ~15-20 simultaneous full-block arrays and ran a
+    20 GB-VRAM GPU out of RMM pool on the global GEBCO combine; freeing eagerly
+    (plus the smaller auto-tuned chunk for this algorithm) keeps it in budget.
+    """
     shape = smooths[0].shape
     dx_acc = cp.zeros(shape, dtype=cp.float32)
     dy_acc = cp.zeros(shape, dtype=cp.float32)
@@ -91,25 +98,33 @@ def _drift_vector(smooths, scales, pair_w):
     for i in range(n_pairs):
         lo, hi = smooths[i], smooths[i + 1]
         it = hi - lo
-        gy, gx = cp.gradient(0.5 * (lo + hi))
+        gy, gx = cp.gradient(lo + hi)   # gradient(0.5*(lo+hi)) = 0.5*gradient(lo+hi)
+        gx *= cp.float32(0.5)
+        gy *= cp.float32(0.5)
         w_sig = min(max(1.5, float(scales[i])), DRIFT_WINDOW_CAP)
         jxx = gaussian_filter(gx * gx, sigma=w_sig, mode='nearest')
         jyy = gaussian_filter(gy * gy, sigma=w_sig, mode='nearest')
         jxy = gaussian_filter(gx * gy, sigma=w_sig, mode='nearest')
         bx = gaussian_filter(gx * it, sigma=w_sig, mode='nearest')
         by = gaussian_filter(gy * it, sigma=w_sig, mode='nearest')
+        del gx, gy, it
         # Tikhonov damping keeps flats (rank-deficient J) at drift ~0.
         delta = cp.float32(1e-3) * (jxx + jyy) + cp.float32(1e-12)
         a11 = jxx + delta
         a22 = jyy + delta
+        del jxx, jyy, delta
         det = a11 * a22 - jxy * jxy
         inv_det = 1.0 / det
-        dxi = -(a22 * bx - jxy * by) * inv_det
-        dyi = -(a11 * by - jxy * bx) * inv_det
+        del det
         gap = cp.float32(max(1e-6, float(scales[i + 1]) - float(scales[i])))
         w = cp.float32(pair_w[i]) if pair_w is not None else cp.float32(1.0 / n_pairs)
-        dx_acc += w * dxi / gap
-        dy_acc += w * dyi / gap
+        wg = w / gap
+        dxi = -(a22 * bx - jxy * by) * inv_det
+        dx_acc += wg * dxi
+        del dxi, a22
+        dyi = -(a11 * by - jxy * bx) * inv_det
+        dy_acc += wg * dyi
+        del dyi, a11, jxy, bx, by, inv_det
     return dx_acc, dy_acc
 
 

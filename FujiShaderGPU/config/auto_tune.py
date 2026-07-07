@@ -39,7 +39,12 @@ ALGORITHM_COMPLEXITY: Dict[str, float] = {
     "lic": 1.5,                # position grids + per-step interpolation buffers
     "phase_congruency": 2.0,   # complex FFT spectra x per-scale triplets
     "tv_decomposition": 1.4,   # primal + dual + relaxation buffers
-    "scale_drift": 1.6,        # per-scale levels + 5 LK moment fields
+    # scale_drift's combine block holds every per-scale Gaussian level AND the
+    # per-pair Lucas-Kanade moment fields at once -- the heaviest per-block
+    # footprint of the batch.  It OOM'd the RMM pool at the shared 1280 chunk on
+    # a 20 GB-VRAM GPU; a higher complexity shrinks its chunk for headroom (the
+    # block itself now also frees intermediates eagerly, see _impl_scale_drift).
+    "scale_drift": 2.6,
 }
 
 # ---------------------------------------------------------------------------

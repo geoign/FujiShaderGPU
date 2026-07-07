@@ -635,17 +635,27 @@ def _persist_budget_gb(cluster, client) -> float:
 
     ``client.persist`` holds the ENTIRE result resident across the cluster.  It
     only pays off when the result fits in the workers' on-device (GPU) headroom
-    -- ``device_memory_limit`` minus the eager RMM pool.  Beyond that it spills
-    to host RAM with no speed benefit and, on a single-GPU worker, drives the
-    nanny memory-terminate loop (worker killed by signal 9, tasks recomputed
-    forever) that OOM-failed a 13.9 GB global GEBCO run on a 20 GB-VRAM A4500.
+    -- ``device_memory_limit`` minus the room the RMM pool can claim.  Beyond
+    that it spills to host RAM with no speed benefit and, on a single-GPU worker,
+    drives the nanny memory-terminate loop (worker killed by signal 9, tasks
+    recomputed forever) that OOM-failed a 13.9 GB global GEBCO run on a
+    20 GB-VRAM A4500.
 
-    So size the budget from the real per-worker GPU headroom x worker count
-    (0.85 safety margin), clamped by host RAM so a spilling persist can never
-    overflow the box either.  Falls back to a live free-VRAM probe, then a
-    conservative floor, when the cluster did not publish its memory facts.
-    Replaces the previous hardcoded 20 GB threshold, which implicitly assumed a
-    large-VRAM GPU and abundant host RAM.
+    The headroom subtracts the pool's MAXIMUM growth size (``rmm_max``), not its
+    eager size: the pool grows to ``rmm_max`` while chunks compute and competes
+    with persisted data for the same device budget.  Sizing from the eager pool
+    over-estimated the headroom, so raising ``--memory-fraction`` (which both
+    enlarges the pool and, via the eager figure, inflated this budget) flipped a
+    heavy 3.5 GB result back into the persist path and re-triggered a HOST-RAM
+    terminate loop -- the GPU/host OOM whack-a-mole.  ``rmm_max`` makes the
+    budget correctly conservative: persist only when device memory is spare even
+    after the pool is fully grown.
+
+    Result: heavy global products stream tile-by-tile (seam-free, bounded RAM);
+    only genuinely small results on spare-VRAM boxes still persist for speed.
+    Clamped by host RAM so a spilling persist can never overflow the box either.
+    Falls back to a live free-VRAM probe, then a conservative floor, when the
+    cluster did not publish its memory facts.
     """
     try:
         n_workers = max(1, len(client.scheduler_info().get("workers", {})))
@@ -656,8 +666,12 @@ def _persist_budget_gb(cluster, client) -> float:
     mem = getattr(cluster, "_fujishader_mem", None)
     if isinstance(mem, dict):
         device_limit = float(mem.get("device_limit_gb", 0.0) or 0.0)
-        rmm_pool = float(mem.get("rmm_pool_gb", 0.0) or 0.0)
-        gpu_headroom_gb = max(0.0, device_limit - rmm_pool)
+        # Use the pool's MAX growth, not its eager size: the pool expands to
+        # rmm_max during compute and competes with persisted data for the device.
+        rmm_claim = float(mem.get("rmm_max_gb", 0.0) or 0.0)
+        if rmm_claim <= 0.0:
+            rmm_claim = float(mem.get("rmm_pool_gb", 0.0) or 0.0)
+        gpu_headroom_gb = max(0.0, device_limit - rmm_claim)
     if not gpu_headroom_gb or gpu_headroom_gb <= 0.0:
         # Workers share the physical GPU, so free VRAM in this process already
         # reflects VRAM minus the RMM pools the workers eagerly reserved.
