@@ -637,7 +637,12 @@ def _format_algorithm_output(
 
 
 def _infer_nodata_zero_from_border(src: rasterio.io.DatasetReader) -> Optional[float]:
-    """Infer nodata=0 when metadata is missing and border is mostly zeros."""
+    """Infer nodata=0 from a bounded, decimated border sample.
+
+    Avoids full-resolution border reads on large rasters and warns at the call
+    site before applying the heuristic because coastal/sea-level DEMs can contain
+    legitimate zeros.
+    """
     if src.nodata is not None:
         return src.nodata
 
@@ -646,17 +651,34 @@ def _infer_nodata_zero_from_border(src: rasterio.io.DatasetReader) -> Optional[f
     if bw <= 0:
         return None
 
-    top = src.read(1, window=Window(0, 0, w, bw), out_dtype=np.float32)
-    bottom = src.read(1, window=Window(0, h - bw, w, bw), out_dtype=np.float32)
-    left = src.read(1, window=Window(0, 0, bw, h), out_dtype=np.float32)
-    right = src.read(1, window=Window(w - bw, 0, bw, h), out_dtype=np.float32)
+    max_edge = 2048
+
+    def _read_edge(window, out_h, out_w):
+        return src.read(
+            1,
+            window=window,
+            out_shape=(max(1, int(out_h)), max(1, int(out_w))),
+            out_dtype=np.float32,
+            masked=False,
+            resampling=Resampling.nearest,
+        )
+
+    top_w = min(max_edge, w)
+    side_h = min(max_edge, h)
+    top = _read_edge(Window(0, 0, w, bw), min(bw, max_edge), top_w)
+    bottom = _read_edge(Window(0, h - bw, w, bw), min(bw, max_edge), top_w)
+    left = _read_edge(Window(0, 0, bw, h), side_h, min(bw, max_edge))
+    right = _read_edge(Window(w - bw, 0, bw, h), side_h, min(bw, max_edge))
     border = np.concatenate([top.ravel(), bottom.ravel(), left.ravel(), right.ravel()])
 
     if border.size == 0:
         return None
 
-    zero_ratio = float(np.count_nonzero(border == 0.0) / border.size)
-    nonzero_present = np.any(border != 0.0)
+    finite = border[np.isfinite(border)]
+    if finite.size == 0:
+        return None
+    zero_ratio = float(np.count_nonzero(finite == 0.0) / finite.size)
+    nonzero_present = np.any(finite != 0.0)
     if zero_ratio >= 0.6 or (zero_ratio >= 0.3 and nonzero_present):
         return 0.0
     return None
@@ -1434,7 +1456,10 @@ def process_dem_tiles(
                 inferred = _infer_nodata_zero_from_border(src)
                 if inferred is not None:
                     nodata = inferred
-                    logger.info("NoData metadata missing; inferred nodata=0 from raster border.")
+                    logger.warning(
+                        "NoData metadata missing; inferred nodata=0 from a decimated raster border sample. "
+                        "If 0 is valid elevation (e.g. sea level), pass --nodata explicitly."
+                    )
                 else:
                     _warn_implicit_nodata_candidates(src, threshold_ratio=0.01)
             src_transform = src.transform

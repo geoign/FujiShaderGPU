@@ -101,7 +101,7 @@ def stratified_windows(
 
 
 def _norm_stat_max_scale(merged: dict) -> float:
-    """Largest pixel-scale among the algorithm's radii/scales/kernel parameters."""
+    """Largest user-facing pixel scale/radius among algorithm parameters."""
     vals = []
     for key in ("radii", "scales"):
         v = merged.get(key)
@@ -110,7 +110,51 @@ def _norm_stat_max_scale(merged: dict) -> float:
     ks = merged.get("kernel_size")
     if ks:
         vals.append(float(ks))
+    # Algorithm-specific implicit supports used by stats block functions.
+    if str(merged.get("component", "texture")).lower() == "texture" and merged.get("tv_scale"):
+        vals.append(float(merged.get("tv_scale")))
+    if merged.get("iterations"):
+        vals.append(float(merged.get("iterations")))
+    if merged.get("max_distance"):
+        vals.append(float(merged.get("max_distance")))
     return max(vals) if vals else 16.0
+
+
+def _norm_stat_halo_pixels(algorithm: str, merged: dict) -> int:
+    """Conservative full-resolution footprint halo for norm-stat sample windows."""
+    max_scale = float(_norm_stat_max_scale(merged))
+    algo = str(algorithm)
+    if algo == "topousm_fast":
+        return int(max_scale + 16)
+    if algo == "fractal_anomaly":
+        return int(2 * max_scale + 16)
+    if algo == "visual_saliency":
+        return int(5 * max_scale)
+    if algo in {"scale_space_surprise", "multiscale_terrain"}:
+        return int(4 * max_scale + 4)
+    if algo in {"structure_tensor", "frangi"}:
+        sigma_d = float(merged.get("derivative_sigma", 1.0) or 1.0)
+        return int(2 * max_scale + 4 * sigma_d + 8)
+    if algo == "phase_congruency":
+        return int(2 * max_scale + 16)
+    if algo == "tv_decomposition":
+        return int(float(merged.get("iterations", 120) or 120) + 4)
+    if algo == "scale_drift":
+        return int(4 * max_scale + 104)
+    if algo in {"ambient_occlusion", "openness"}:
+        return int(max_scale + 16)
+    return int(max_scale + 16)
+
+
+def _norm_stats_unused_for_mode(algorithm: str, merged: dict) -> bool:
+    """True when the algorithm/output mode does not consume global_stats."""
+    if algorithm == "structure_tensor" and str(merged.get("st_output", "coherence")).lower() == "orientation":
+        return True
+    if algorithm == "scale_drift" and str(merged.get("drift_output", "magnitude")).lower() == "direction":
+        return True
+    if algorithm == "tv_decomposition" and str(merged.get("component", "texture")).lower() == "structure":
+        return True
+    return False
 
 
 def _compute_norm_stats_tiled(
@@ -159,6 +203,9 @@ def _compute_norm_stats_tiled(
             merged["radii"] = list(merged["_topousm_fast_full_radii"])
             if merged.get("_topousm_fast_full_weights"):
                 merged["weights"] = list(merged["_topousm_fast_full_weights"])
+        if _norm_stats_unused_for_mode(algorithm, merged):
+            logger.info("Skipping %s norm stats: selected output mode does not consume global_stats", algorithm)
+            return None
     except Exception as exc:
         logger.warning("Tiled norm-stats helpers unavailable for %s: %s", algorithm, exc)
         return None
@@ -170,9 +217,13 @@ def _compute_norm_stats_tiled(
         kw = {k: merged[k] for k in list(merged) if k in accepted and merged[k] is not None}
         if "normalize" in accepted:
             kw["normalize"] = False
-        max_scale = _norm_stat_max_scale(merged)
-        margin = int(min(max_scale, max_tile // 4))
-        tile = int(min(max_tile, max(2048, 4 * margin)))
+        halo = max(1, int(_norm_stat_halo_pixels(algorithm, merged)))
+        # The valid interior after trimming must still contain pixels, so choose
+        # a window that comfortably contains the footprint.  For huge radii this
+        # may exceed 4096; that is intentional (audit N-3/M-20) and bounded by
+        # raster dimensions later.
+        margin = int(max(1, min(halo, max_tile)))
+        tile = int(max(2048, 4 * margin))
 
         pooled = []
         with rasterio.open(src_cog) as src:
@@ -199,7 +250,7 @@ def _compute_norm_stats_tiled(
             bx0, bx1 = int(xs.min()) * cov, min(W, (int(xs.max()) + 1) * cov)
 
             for wy0, wx0, tw, th in stratified_windows(
-                    W, H, by0, by1, bx0, bx1, grid=grid, tile=tile):
+                    W, H, by0, by1, bx0, bx1, grid=grid, tile=min(tile, max(W, H))):
                 a = _denodata(src.read(
                     1, window=Window(wx0, wy0, tw, th),
                     out_dtype=np.float32, masked=True).filled(np.nan))

@@ -223,6 +223,22 @@ def coarsen_factor_for_shape(shape, coarse_max: int = 2048) -> int:
     return 1 << int(np.ceil(np.log2(longest / float(coarse_max))))
 
 
+def _resolve_scattered(value):
+    """Return a concrete value from a distributed Future-like object if needed."""
+    if hasattr(value, "result") and callable(getattr(value, "result")):
+        return value.result()
+    return value
+
+
+def _scatter_if_client(value):
+    """Scatter a bulky concrete value when a distributed client is active."""
+    try:
+        from distributed import get_client
+        return get_client().scatter(value, broadcast=True, hash=False)
+    except Exception:
+        return value
+
+
 def _bilinear_sample_coarse(
     coarse: cp.ndarray,
     r0: int, r1: int, c0: int, c1: int,
@@ -240,6 +256,7 @@ def _bilinear_sample_coarse(
     """
     from cupyx.scipy.ndimage import map_coordinates
 
+    coarse = _resolve_scattered(coarse)
     ch, cw = coarse.shape
     h = int(r1 - r0)
     w = int(c1 - c0)
@@ -340,7 +357,9 @@ def coarse_large_radius_response(
         if pixel_scale_y is not None:
             kw["pixel_scale_y"] = float(pixel_scale_y) * fac
         # The overview is the whole (small) array -> run the block once, no halo.
-        coarse_resp = block_fn(coarse_dem, **kw).astype(cp.float32)
+        # Scatter the resulting coarse response so the large CuPy array is not
+        # serialized into every downstream map_blocks task.
+        coarse_resp = _scatter_if_client(block_fn(coarse_dem, **kw).astype(cp.float32))
         upsampled = gpu_arr.map_blocks(
             _upsample_coarse_response_block,
             dtype=cp.float32,
@@ -544,13 +563,12 @@ def _radius_to_downsample_factor(
     }
     algo_factor = float(algo_factor_map.get(str(algorithm_name), 1.0))
 
+    # Deterministic across tile/Dask and ragged edge chunks: do not derive the
+    # approximation factor from the current block shape.  A shape-dependent
+    # factor made identical radii use different downsample approximations on
+    # Dask edge chunks and tile backends.  Keep the calibration anchored to the
+    # nominal 1 Mpix workload used by the original heuristic.
     block_factor = 1.0
-    if block_shape is not None and len(block_shape) >= 2:
-        h = max(1, int(block_shape[0]))
-        w = max(1, int(block_shape[1]))
-        block_pixels = float(h * w)
-        # Mild scaling by block area to avoid over-aggressive shrink on small chunks.
-        block_factor = max(1.0, (block_pixels / 1_000_000.0) ** 0.5)
 
     # 0.5m should be somewhat more aggressive than 1m.
     resolution_factor = max(1.0, 1.0 / px)
@@ -764,6 +782,7 @@ def hybrid_multiscale_response_combine(
     full_h, full_w = int(full_shape[0]), int(full_shape[1])
     min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
     chunk_cap = max(1, int(min_chunk) - 1)
+    large_fields = _resolve_scattered(large_fields)
     large_keys = {int(round(float(s))) for s in large_fields.keys()}
     scales_f = [float(s) for s in scales]
     small_scales = [s for s in scales_f if int(round(s)) not in large_keys]
@@ -863,6 +882,8 @@ __all__ = [
     "_normalize_spatial_radii",
     "_resolve_spatial_radii_weights",
     "_combine_multiscale_dask",
+    "_resolve_scattered",
+    "_scatter_if_client",
     "_smooth_for_radius",
     "_radius_to_downsample_factor",
     "_downsample_nan_aware",

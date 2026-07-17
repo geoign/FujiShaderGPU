@@ -40,15 +40,15 @@ def compute_hillshade_block(block, *, azimuth=Constants.DEFAULT_AZIMUTH,
     sign_y = 1.0 if (pixel_scale_y is None or float(pixel_scale_y) >= 0.0) else -1.0
     dz_d_east = dx * sign_x
     dz_d_north = dy * sign_y
-    normal = cp.stack([-dz_d_east, -dz_d_north, cp.ones_like(dx)], axis=-1)
-    normal = normal / cp.linalg.norm(normal, axis=-1, keepdims=True)
+    # Stack-free normal dot product.  The previous HxWx3 normal array tripled
+    # peak VRAM for hillshade blocks; this is algebraically identical to
+    # dot(normalized([-dz/dx, -dz/dy, 1]), light_dir).
+    norm = cp.sqrt(dz_d_east * dz_d_east + dz_d_north * dz_d_north + cp.float32(1.0))
     az_rad = cp.radians(float(azimuth))
-    light_dir = cp.array([
-        cp.sin(az_rad) * cp.cos(altitude_rad),
-        cp.cos(az_rad) * cp.cos(altitude_rad),
-        cp.sin(altitude_rad),
-    ])
-    hillshade = cp.sum(normal * light_dir.reshape(1, 1, 3), axis=-1)
+    lx = cp.sin(az_rad) * cp.cos(altitude_rad)
+    ly = cp.cos(az_rad) * cp.cos(altitude_rad)
+    lz = cp.sin(altitude_rad)
+    hillshade = ((-dz_d_east * lx) + (-dz_d_north * ly) + lz) / norm
     hillshade = cp.clip(hillshade, 0.0, 1.0).astype(cp.float32)
     hillshade = restore_nan(hillshade, nan_mask)
     return hillshade

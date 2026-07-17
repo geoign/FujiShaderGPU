@@ -25,7 +25,6 @@ from typing import List, Tuple, Optional
 from osgeo import gdal
 import cupy as cp
 import dask.array as da
-from dask import config as dask_config
 from dask.callbacks import Callback
 from dask.diagnostics import ProgressBar
 from dask.distributed import progress
@@ -87,8 +86,11 @@ def _configure_gdal_read_performance() -> None:
         avail_gb = container_memory_available_gb()
     except Exception:
         avail_gb = 8.0
-    # GDAL interprets a bare integer < 100000 as megabytes.
-    cache_mb = int(max(1024, min(16384, avail_gb * 1024 * 0.1)))
+    # Keep worker-inherited GDAL cache within the cgroup budget.  The old
+    # unconditional 1024MB lower bound let each worker claim a large block cache
+    # even in small containers.  Use a modest floor and cap by a fraction of
+    # available RAM (per process; worker count is not known before cluster start).
+    cache_mb = int(max(64, min(2048, avail_gb * 1024 * 0.05)))
 
     # Shared, container-aware GDAL I/O tuning (single source of truth with the
     # tile backend). force=False -> respect any user-set GDAL env on the read path.
@@ -399,209 +401,191 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         except Exception:
             pass
 
-    # Check free DRAM and enable prefetch (container-aware, not host RAM)
-    available_ram_gb = container_memory_available_gb()
+    # Do not mutate Dask worker memory thresholds here.  Changing
+    # distributed.worker.memory.* after the cluster is already running does not
+    # reliably update workers/nannies and the previous values even inverted the
+    # spill/pause order.  Cluster-level memory policy is configured before worker
+    # startup in dask_cluster.make_cluster().
 
-    if available_ram_gb > 20:  # when more than 20GB is free
-        logger.info(f"Enabling chunk prefetching (available DRAM: {available_ram_gb:.1f}GB)")
-        
-        # Set Dask scheduler hints.  NOTE: keep blockwise fusion ON (the dask
-        # default).  Disabling it (optimization.fuse.active=False) leaves every
-        # intermediate as a separate task whose GPU result lingers until all
-        # consumers finish; for deep graphs (e.g. visual_saliency / fractal_anomaly
-        # combine 6 per-scale fields) this makes device memory grow monotonically
-        # to tens of GB and exhaust the RMM pool.  Fusion frees per-block
-        # intermediates immediately, bounding peak VRAM.
-        prefetch_config = {
-            "distributed.worker.memory.pause": 0.90,  # allow up to 90% memory usage
-            "distributed.worker.memory.spill": 0.95,  # spill at 95%
-        }
-    else:
-        logger.info(f"Prefetching disabled (available DRAM: {available_ram_gb:.1f}GB < 20GB)")
-        prefetch_config = {}
-    
-    # Apply prefetch settings and run chunk processing
-    with dask_config.set(prefetch_config):
+    # Create a temporary directory
+    tmp_parent = _select_chunk_temp_parent(int(data.nbytes))
+    with tempfile.TemporaryDirectory(dir=tmp_parent) as tmpdir:
+        # Fall back to normal processing when not a Dask array
+        if not hasattr(data.data, 'to_delayed'):
+            logger.info("Data is not chunked with Dask, falling back to regular processing")
+            _write_cog_da_original(data, dst, show_progress)
+            return
 
-        # Create a temporary directory
-        tmp_parent = _select_chunk_temp_parent(int(data.nbytes))
-        with tempfile.TemporaryDirectory(dir=tmp_parent) as tmpdir:
-            # Fall back to normal processing when not a Dask array
-            if not hasattr(data.data, 'to_delayed'):
-                logger.info("Data is not chunked with Dask, falling back to regular processing")
-                _write_cog_da_original(data, dst, show_progress)
-                return
+        # Validate chunk information
+        if not hasattr(data, 'chunks') or data.chunks is None:
+            logger.warning("No chunk information found, falling back to regular processing")
+            _write_cog_da_original(data, dst, show_progress)
+            return
 
-            # Validate chunk information
-            if not hasattr(data, 'chunks') or data.chunks is None:
-                logger.warning("No chunk information found, falling back to regular processing")
-                _write_cog_da_original(data, dst, show_progress)
-                return
+        delayed_chunks = data.data.to_delayed()
+        n_rows = int(delayed_chunks.shape[0])
+        n_cols = int(delayed_chunks.shape[1])
+        total_chunks = n_rows * n_cols
 
-            delayed_chunks = data.data.to_delayed()
-            n_rows = int(delayed_chunks.shape[0])
-            n_cols = int(delayed_chunks.shape[1])
-            total_chunks = n_rows * n_cols
+        src_crs = data.rio.crs if hasattr(data, 'rio') else None
 
-            src_crs = data.rio.crs if hasattr(data, 'rio') else None
+        # ---- Direct single-file windowed write (no per-chunk files / VRT) ----
+        # Each computed chunk is written straight into ONE pre-created tiled
+        # BigTIFF via a windowed WriteArray, with cluster compute overlapped
+        # against the disk write through a dedicated writer thread.  This drops
+        # the old per-chunk-TIFF + VRT + consolidation-Translate stage (a full
+        # extra read+write of the whole raster) and lets the GPU keep computing
+        # while finished tiles are compressed/written -- a large win on huge
+        # rasters where that staging dominated wall-clock and disk I/O.
+        from osgeo import gdal_array
+        import queue as _queue
+        import threading as _threading
 
-            # ---- Direct single-file windowed write (no per-chunk files / VRT) ----
-            # Each computed chunk is written straight into ONE pre-created tiled
-            # BigTIFF via a windowed WriteArray, with cluster compute overlapped
-            # against the disk write through a dedicated writer thread.  This drops
-            # the old per-chunk-TIFF + VRT + consolidation-Translate stage (a full
-            # extra read+write of the whole raster) and lets the GPU keep computing
-            # while finished tiles are compressed/written -- a large win on huge
-            # rasters where that staging dominated wall-clock and disk I/O.
-            from osgeo import gdal_array
-            import queue as _queue
-            import threading as _threading
+        H = int(sum(data.chunks[0]))
+        W = int(sum(data.chunks[1]))
+        gdal_dtype = gdal_array.NumericTypeCodeToGDALTypeCode(np.dtype(data.dtype).type)
+        nodata_val = float(output_nodata_for_dtype(data.dtype))
+        row_off = [int(sum(data.chunks[0][:i])) for i in range(n_rows)]
+        col_off = [int(sum(data.chunks[1][:j])) for j in range(n_cols)]
 
-            H = int(sum(data.chunks[0]))
-            W = int(sum(data.chunks[1]))
-            gdal_dtype = gdal_array.NumericTypeCodeToGDALTypeCode(np.dtype(data.dtype).type)
-            nodata_val = float(output_nodata_for_dtype(data.dtype))
-            row_off = [int(sum(data.chunks[0][:i])) for i in range(n_rows)]
-            col_off = [int(sum(data.chunks[1][:j])) for j in range(n_cols)]
+        merged_tif = Path(tmpdir) / "merged_tmp.tif"
+        create_opts = [
+            "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
+            "COMPRESS=ZSTD", f"ZLEVEL={cog_options.get('LEVEL', '1')}",
+            "BIGTIFF=YES", f"NUM_THREADS={container_cpu_count()}",
+        ]
+        if 'PREDICTOR' in cog_options:
+            create_opts.append(f"PREDICTOR={cog_options['PREDICTOR']}")
+        out_ds = gdal.GetDriverByName("GTiff").Create(
+            str(merged_tif), W, H, 1, gdal_dtype, options=create_opts,
+        )
+        if out_ds is None:
+            raise ValueError("Failed to create intermediate GeoTIFF for chunked write")
+        try:
+            out_ds.SetGeoTransform(data.rio.transform().to_gdal())
+        except Exception as exc:
+            logger.warning("Could not set geotransform on chunked output: %s", exc)
+        try:
+            if src_crs is not None:
+                out_ds.SetProjection(src_crs.to_wkt())
+        except Exception as exc:
+            logger.warning("Could not set projection on chunked output: %s", exc)
+        out_band = out_ds.GetRasterBand(1)
+        out_band.SetNoDataValue(nodata_val)
 
-            merged_tif = Path(tmpdir) / "merged_tmp.tif"
-            create_opts = [
-                "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512",
-                "COMPRESS=ZSTD", f"ZLEVEL={cog_options.get('LEVEL', '1')}",
-                "BIGTIFF=YES", f"NUM_THREADS={container_cpu_count()}",
-            ]
-            if 'PREDICTOR' in cog_options:
-                create_opts.append(f"PREDICTOR={cog_options['PREDICTOR']}")
-            out_ds = gdal.GetDriverByName("GTiff").Create(
-                str(merged_tif), W, H, 1, gdal_dtype, options=create_opts,
-            )
-            if out_ds is None:
-                raise ValueError("Failed to create intermediate GeoTIFF for chunked write")
-            try:
-                out_ds.SetGeoTransform(data.rio.transform().to_gdal())
-            except Exception as exc:
-                logger.warning("Could not set geotransform on chunked output: %s", exc)
-            try:
-                if src_crs is not None:
-                    out_ds.SetProjection(src_crs.to_wkt())
-            except Exception as exc:
-                logger.warning("Could not set projection on chunked output: %s", exc)
-            out_band = out_ds.GetRasterBand(1)
-            out_band.SetNoDataValue(nodata_val)
+        # Single writer thread (GDAL dataset writes must be serialized); the
+        # bounded queue back-pressures compute so host RAM stays low.
+        write_q = _queue.Queue(maxsize=8)
+        write_err = {}
 
-            # Single writer thread (GDAL dataset writes must be serialized); the
-            # bounded queue back-pressures compute so host RAM stays low.
-            write_q = _queue.Queue(maxsize=8)
-            write_err = {}
+        def _writer():
+            while True:
+                item = write_q.get()
+                try:
+                    if item is None:
+                        break
+                    arr, xoff, yoff = item
+                    out_band.WriteArray(np.ascontiguousarray(arr), xoff, yoff)
+                except Exception as exc:  # surface in the main thread
+                    write_err.setdefault("e", exc)
+                finally:
+                    write_q.task_done()
 
-            def _writer():
-                while True:
-                    item = write_q.get()
-                    try:
-                        if item is None:
-                            break
-                        arr, xoff, yoff = item
-                        out_band.WriteArray(np.ascontiguousarray(arr), xoff, yoff)
-                    except Exception as exc:  # surface in the main thread
-                        write_err.setdefault("e", exc)
-                    finally:
-                        write_q.task_done()
+        wt = _threading.Thread(target=_writer, name="cog-writer", daemon=True)
+        wt.start()
 
-            wt = _threading.Thread(target=_writer, name="cog-writer", daemon=True)
-            wt.start()
-
+        client = None
+        try:
+            client = get_client()
+        except Exception:
             client = None
-            try:
-                client = get_client()
-            except Exception:
-                client = None
 
-            try:
-                if client is not None:
+        try:
+            if client is not None:
+                try:
+                    n_workers = max(1, len(client.scheduler_info().get("workers", {})))
+                except Exception:
+                    n_workers = 1
+                # A few extra in-flight chunks keep the GPU worker(s) and the
+                # writer thread busy at the same time (compute || write overlap).
+                max_inflight = max(4, n_workers * 3)
+                from distributed import as_completed as _as_completed
+                coords_flat = [(i, j) for i in range(n_rows) for j in range(n_cols)]
+                task_iter = iter(coords_flat)
+                fut_meta = {}
+                inflight = _as_completed()
+
+                def _submit_next() -> bool:
                     try:
-                        n_workers = max(1, len(client.scheduler_info().get("workers", {})))
-                    except Exception:
-                        n_workers = 1
-                    # A few extra in-flight chunks keep the GPU worker(s) and the
-                    # writer thread busy at the same time (compute || write overlap).
-                    max_inflight = max(4, n_workers * 3)
-                    from distributed import as_completed as _as_completed
-                    coords_flat = [(i, j) for i in range(n_rows) for j in range(n_cols)]
-                    task_iter = iter(coords_flat)
-                    fut_meta = {}
-                    inflight = _as_completed()
+                        i, j = next(task_iter)
+                    except StopIteration:
+                        return False
+                    fut = client.compute(delayed_chunks[i, j])
+                    fut_meta[fut] = (i, j)
+                    inflight.add(fut)
+                    return True
 
-                    def _submit_next() -> bool:
+                logger.info(
+                    "Direct chunk write: %d chunks -> single BigTIFF, %d worker(s), up to %d in flight",
+                    total_chunks, n_workers, max_inflight,
+                )
+                done = 0
+                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                    for _ in range(min(max_inflight, total_chunks)):
+                        if not _submit_next():
+                            break
+                    for fut in inflight:
+                        i, j = fut_meta.pop(fut)
                         try:
-                            i, j = next(task_iter)
-                        except StopIteration:
-                            return False
-                        fut = client.compute(delayed_chunks[i, j])
-                        fut_meta[fut] = (i, j)
-                        inflight.add(fut)
-                        return True
-
-                    logger.info(
-                        "Direct chunk write: %d chunks -> single BigTIFF, %d worker(s), up to %d in flight",
-                        total_chunks, n_workers, max_inflight,
-                    )
-                    done = 0
-                    with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
-                        for _ in range(min(max_inflight, total_chunks)):
-                            if not _submit_next():
-                                break
-                        for fut in inflight:
-                            i, j = fut_meta.pop(fut)
+                            arr = fut.result()
+                        finally:
+                            del fut
+                        if write_err:
+                            raise write_err["e"]
+                        write_q.put((arr, col_off[j], row_off[i]))
+                        del arr
+                        done += 1
+                        if done % 10 == 0:
                             try:
-                                arr = fut.result()
-                            finally:
-                                del fut
+                                cp.get_default_memory_pool().free_all_blocks()
+                            except Exception:
+                                pass
+                        pbar.update(1)
+                        _submit_next()
+            else:
+                # Serial fallback (no distributed client)
+                with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
+                    for i in range(n_rows):
+                        for j in range(n_cols):
+                            arr = delayed_chunks[i, j].compute()
                             if write_err:
                                 raise write_err["e"]
                             write_q.put((arr, col_off[j], row_off[i]))
                             del arr
-                            done += 1
-                            if done % 10 == 0:
-                                try:
-                                    cp.get_default_memory_pool().free_all_blocks()
-                                except Exception:
-                                    pass
                             pbar.update(1)
-                            _submit_next()
-                else:
-                    # Serial fallback (no distributed client)
-                    with tqdm(total=total_chunks, desc="Writing chunks", unit="chunk") as pbar:
-                        for i in range(n_rows):
-                            for j in range(n_cols):
-                                arr = delayed_chunks[i, j].compute()
-                                if write_err:
-                                    raise write_err["e"]
-                                write_q.put((arr, col_off[j], row_off[i]))
-                                del arr
-                                pbar.update(1)
-                # Drain and stop the writer.
-                write_q.put(None)
-                write_q.join()
-                wt.join(timeout=120)
-                if write_err:
-                    raise write_err["e"]
-                out_band.FlushCache()
-                out_ds.FlushCache()
-            finally:
-                out_band = None
-                out_ds = None
+            # Drain and stop the writer.
+            write_q.put(None)
+            write_q.join()
+            wt.join(timeout=120)
+            if write_err:
+                raise write_err["e"]
+            out_band.FlushCache()
+            out_ds.FlushCache()
+        finally:
+            out_band = None
+            out_ds = None
 
-            # merged_tmp.tif now holds the full result in one tiled BigTIFF. Build
-            # the COG (overviews + COG layout) in a single CreateCopy via the COG
-            # driver; fall back to the gdaladdo+translate path on older GDAL.
-            logger.info("Building COG (overviews + layout) from single intermediate: %s", dst)
-            if not _build_cog_via_cog_driver(merged_tif, dst, cog_options):
-                build_cog_with_overviews(merged_tif, dst, cog_options)
-            try:
-                merged_tif.unlink()
-            except OSError:
-                pass
-            logger.info("Successfully created COG (%d chunks, direct single-file write)", total_chunks)
+        # merged_tmp.tif now holds the full result in one tiled BigTIFF. Build
+        # the COG (overviews + COG layout) in a single CreateCopy via the COG
+        # driver; fall back to the gdaladdo+translate path on older GDAL.
+        logger.info("Building COG (overviews + layout) from single intermediate: %s", dst)
+        if not _build_cog_via_cog_driver(merged_tif, dst, cog_options):
+            build_cog_with_overviews(merged_tif, dst, cog_options)
+        try:
+            merged_tif.unlink()
+        except OSError:
+            pass
+        logger.info("Successfully created COG (%d chunks, direct single-file write)", total_chunks)
 
 def _dask_worker_memory_limit_gb() -> Optional[float]:
     """Return the smallest connected Dask worker memory limit in GB.
@@ -998,6 +982,23 @@ def _quantize_block_cp(block, *, a_coef: float, b_coef: float,
     return dn.astype(cp_dtype)
 
 
+def _scatter_to_workers(value, label: str):
+    """Scatter bulky concrete CuPy/NumPy arrays so they are not embedded in every task."""
+    if value is None:
+        return None
+    try:
+        client = get_client()
+        if isinstance(value, dict):
+            return {
+                k: client.scatter(v, broadcast=True, hash=False)
+                for k, v in value.items()
+            }
+        return client.scatter(value, broadcast=True, hash=False)
+    except Exception as exc:  # pragma: no cover - no distributed client fallback
+        logger.debug("Could not scatter %s to Dask workers; embedding value directly: %s", label, exc)
+        return value
+
+
 def _estimate_output_range(result_gpu: da.Array,
                            *, lo_pct: float = 1.0, hi_pct: float = 99.0,
                            max_window: int = 4096):
@@ -1113,27 +1114,7 @@ def run_pipeline(
                 _vram_gb, data_gb=total_gb, algorithm=algorithm,
             )
 
-            # ALGORITHM_COMPLEXITY (which drives the chunk size) is calibrated for
-            # the LOCAL single-pass.  A multi-radius spatial run computes one
-            # response per radius and holds them together for the weighted combine,
-            # so the peak per-block VRAM is several times higher -- heavy blocks
-            # (hillshade surface normals, atmospheric trig, etc.) then overflow the
-            # RMM pool.  Shrink the chunk by ~1/sqrt(n_radii) so the per-block
-            # footprint stays inside the pool regardless of the per-algorithm
-            # complexity estimate.
-            _n_radii = len(radii) if radii else 0
-            if _n_radii > 1:
-                _shrink = (2.0 / (1.0 + min(_n_radii, 6))) ** 0.5
-                _shrunk = max(2048, (int(chunk * _shrink) // 256) * 256)
-                if _shrunk < chunk:
-                    logger.info(
-                        "Multi-radius run (%d radii): shrinking chunk %d -> %d "
-                        "to keep per-block VRAM within the RMM pool.",
-                        _n_radii, chunk, _shrunk,
-                    )
-                    chunk = _shrunk
-
-            logger.info(f"Dataset size: {total_gb:.1f} GB, using chunk size: {chunk}x{chunk}")
+            logger.info(f"Dataset size: {total_gb:.1f} GB, initial chunk size: {chunk}x{chunk}")
         
         # 6-1) Lazy-load the DEM (COG or Zarr)
         dem: xr.DataArray = load_input_dataarray(src_cog, chunk)
@@ -1284,6 +1265,32 @@ def run_pipeline(
                     algorithm, _dem_short_side, _auto_r,
                 )
 
+        # P2-1: chunk sizing must account for resolved radii, including auto
+        # spatial radii.  The earlier pre-resolution check only saw the CLI
+        # top-level radii argument and missed the default auto path.
+        if chunk is not None:
+            try:
+                _resolved_radii = params.get('radii')
+                _n_radii = len(_resolved_radii) if isinstance(_resolved_radii, (list, tuple)) else 0
+            except Exception:
+                _n_radii = 0
+            if _n_radii > 1:
+                _shrink = (2.0 / (1.0 + min(_n_radii, 6))) ** 0.5
+                _shrunk = max(2048, (int(chunk * _shrink) // 256) * 256)
+                if _shrunk < int(chunk):
+                    logger.info(
+                        "Resolved multi-radius run (%d radii): shrinking chunk %d -> %d "
+                        "to keep per-block VRAM within the RMM pool.",
+                        _n_radii, int(chunk), _shrunk,
+                    )
+                    chunk = _shrunk
+                    # Rechunk the already-created Dask/CuPy array so all later
+                    # map_overlap calls use the memory-safe chunk geometry.
+                    try:
+                        gpu_arr = gpu_arr.rechunk((chunk, chunk))
+                    except Exception as exc:
+                        logger.warning("Could not rechunk after resolved radii shrink: %s", exc)
+
         # Compute + inject every per-algorithm global normalization statistic
         # (fractal relief -> robust display range -> npr gradient -> specular
         # roughness, in that order) via the shared backend-neutral helper, so the
@@ -1367,7 +1374,8 @@ def run_pipeline(
                         src_cog, large_radii=_large, block_fn=_bfn,
                         coarse_dem=_overview_dem, decimation=_overview_decim)
                     if _fields:
-                        params[f"{_pfx}_large_fields"] = _fields
+                        params[f"{_pfx}_large_fields"] = _scatter_to_workers(
+                            _fields, f"{algorithm} large overview fields")
                         params[f"{_pfx}_full_shape"] = tuple(int(s) for s in gpu_arr.shape)
                         logger.info(
                             "%s hybrid overview path: large_radii=%s, decimation=%.1fx "
@@ -1403,7 +1411,8 @@ def run_pipeline(
                             src_cog, large_radii=_lr, large_weights=_lw,
                         )
                         if _field is not None:
-                            params["_topousm_fast_coarse_field"] = _field
+                            params["_topousm_fast_coarse_field"] = _scatter_to_workers(
+                                _field, "topousm_fast coarse field")
                             params["_topousm_fast_small_radii"] = _sr
                             params["_topousm_fast_small_weights"] = _sw
                             params["_topousm_fast_w_large"] = float(sum(_lw))

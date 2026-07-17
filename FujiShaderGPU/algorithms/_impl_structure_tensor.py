@@ -229,12 +229,15 @@ class StructureTensorAlgorithm(DaskAlgorithm):
         )
         # Two shared-machinery passes (u then v); tensors combine linearly, so a
         # weighted mean of the double-angle components IS the multiscale tensor.
+        # Share the coarse DEM cache so large-radius overview/coarsen materializes
+        # once rather than once per component (P2-2 minimum fix).
+        _coarse_cache = {}
         u_fields = multiscale_response_fields(
             gpu_arr, radii, block_fn=st_component_block,
-            coarse_cache={}, component='u', **common)
+            coarse_cache=_coarse_cache, component='u', **common)
         v_fields = multiscale_response_fields(
             gpu_arr, radii, block_fn=st_component_block,
-            coarse_cache={}, component='v', **common)
+            coarse_cache=_coarse_cache, component='v', **common)
         # Signed vector components only combine linearly; min/max/sum would
         # break the double-angle algebra, so agg is fixed to the weighted mean.
         agg = str(params.get('agg', 'mean')).lower()

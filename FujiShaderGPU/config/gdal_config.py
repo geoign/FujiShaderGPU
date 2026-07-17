@@ -44,7 +44,7 @@ def apply_gdal_io_config(cache_mb: int, *, dataset_pool_size: int = None, force:
     False`` uses ``setdefault`` so a user-set env is respected (dask read path).
     ``GDAL_NUM_THREADS`` is cgroup-aware (``ALL_CPUS`` ignores the CFS quota and
     oversubscribes throttled containers)."""
-    cache_mb = int(max(256, cache_mb))
+    cache_mb = int(max(64, cache_mb))
     if dataset_pool_size is None:
         dataset_pool_size = 2000 if cache_mb >= 8192 else 1000
     cache_bytes = cache_mb * 1024 * 1024

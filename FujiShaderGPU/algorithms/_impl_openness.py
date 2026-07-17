@@ -108,7 +108,7 @@ def compute_openness_vectorized(block: cp.ndarray, *,
 
             phys_dx = float(offset_x) * _sx
             phys_dy = float(offset_y) * _sy
-            phys_dist = max(float(cp.sqrt(phys_dx ** 2 + phys_dy ** 2)), 1e-9)
+            phys_dist = max(float(np.hypot(phys_dx, phys_dy)), 1e-9)
             angle = cp.arctan((shifted - block) / phys_dist)
 
             valid = ~(cp.isnan(angle) | nan_mask)
