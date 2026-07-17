@@ -63,6 +63,16 @@ STRIPS_PER_WORKER = 6
 _STRIP_WORKER_CONTEXT = None
 
 
+def _worker_gdal_cache_mb(available_gb: float, n_workers: int) -> int:
+    """Bound each worker's GDAL cache by its share of 40% available RAM."""
+    available = float(available_gb)
+    if not math.isfinite(available) or available <= 0:
+        available = 1.0 / 1024.0
+    aggregate_budget_mb = max(1, int(available * 1024 * 0.4))
+    per_worker_mb = aggregate_budget_mb // max(1, int(n_workers))
+    return max(1, min(2048, per_worker_mb))
+
+
 # ---------------------------------------------------------------------------
 # Coarse-grid fill (the expensive work happens here, on a small array)
 # ---------------------------------------------------------------------------
@@ -963,8 +973,9 @@ def _stream_fill_parallel(
     # Per-worker GDAL block cache, bounded by ~40% of container-available RAM so
     # the pool stays within the cgroup cap (default GDAL cache would be sized
     # from host RAM and N workers could together exceed the container limit).
-    cache_budget_mb = int(container_memory_available_gb() * 1024 * 0.4)
-    gdal_cachemax_mb = max(512, min(2048, cache_budget_mb // max(1, n_workers)))
+    gdal_cachemax_mb = _worker_gdal_cache_mb(
+        container_memory_available_gb(), n_workers,
+    )
 
     tasks = []
     strip_paths: list[Path] = []

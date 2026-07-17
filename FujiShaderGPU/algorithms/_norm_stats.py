@@ -107,9 +107,10 @@ def _norm_stat_max_scale(merged: dict) -> float:
         v = merged.get(key)
         if isinstance(v, (list, tuple)) and v:
             vals.append(max(float(x) for x in v))
-    ks = merged.get("kernel_size")
-    if ks:
-        vals.append(float(ks))
+    for key in ("kernel_size", "radius"):
+        value = merged.get(key)
+        if value:
+            vals.append(float(value))
     # Algorithm-specific implicit supports used by stats block functions.
     if str(merged.get("component", "texture")).lower() == "texture" and merged.get("tv_scale"):
         vals.append(float(merged.get("tv_scale")))
@@ -144,6 +145,21 @@ def _norm_stat_halo_pixels(algorithm: str, merged: dict) -> int:
     if algo in {"ambient_occlusion", "openness"}:
         return int(max_scale + 16)
     return int(max_scale + 16)
+
+
+def _norm_stat_window_geometry(
+    algorithm: str, merged: dict, max_tile: int = 4096,
+) -> tuple[int, int]:
+    """Return a footprint-containing ``(margin, tile)`` for stats sampling.
+
+    ``max_tile`` is retained as a legacy small-window tuning hint. It must not
+    cap the footprint margin: doing so biases statistics for radii above roughly
+    4000 pixels. Raster dimensions provide the eventual upper bound.
+    """
+    margin = max(1, int(_norm_stat_halo_pixels(algorithm, merged)))
+    small_window_floor = min(2048, max(1, int(max_tile)))
+    tile = max(small_window_floor, 4 * margin)
+    return margin, tile
 
 
 def _norm_stats_unused_for_mode(algorithm: str, merged: dict) -> bool:
@@ -217,13 +233,11 @@ def _compute_norm_stats_tiled(
         kw = {k: merged[k] for k in list(merged) if k in accepted and merged[k] is not None}
         if "normalize" in accepted:
             kw["normalize"] = False
-        halo = max(1, int(_norm_stat_halo_pixels(algorithm, merged)))
         # The valid interior after trimming must still contain pixels, so choose
         # a window that comfortably contains the footprint.  For huge radii this
         # may exceed 4096; that is intentional (audit N-3/M-20) and bounded by
         # raster dimensions later.
-        margin = int(max(1, min(halo, max_tile)))
-        tile = int(max(2048, 4 * margin))
+        margin, tile = _norm_stat_window_geometry(algorithm, merged, max_tile)
 
         pooled = []
         with rasterio.open(src_cog) as src:

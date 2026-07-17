@@ -29,7 +29,12 @@ if platform.system().lower() != "linux":
 # Linux modules
 else:
     try:
-        from .dask_processor import run_pipeline, make_cluster  # noqa: F401
-        __all__.extend(["run_pipeline", "make_cluster"])
+        from .dask_processor import run_pipeline  # noqa: F401
+        __all__.append("run_pipeline")
     except ImportError as exc:
         logger.warning("FujiShaderGPU: dask processor unavailable: %s", exc)
+    try:
+        from .dask_cluster import make_cluster  # noqa: F401
+        __all__.append("make_cluster")
+    except ImportError as exc:
+        logger.warning("FujiShaderGPU: dask cluster unavailable: %s", exc)
