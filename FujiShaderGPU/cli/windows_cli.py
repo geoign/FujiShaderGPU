@@ -15,8 +15,6 @@ from .args import (
     TILE_ARGS,
     add_arguments,
     build_algo_params,
-    parse_nodata_override,
-    parse_output_range,
 )
 from ..core.tile_processor import DEFAULT_ALGORITHMS
 
@@ -55,6 +53,11 @@ Note: Windows and Linux share the same algorithm names and options.
         add_arguments(parser, TILE_ARGS)
 
     def _validate_platform_args(self, args: argparse.Namespace):
+        if args.tile_size is not None and args.tile_size <= 0:
+            self.parser.error("--tile-size must be a positive integer")
+        if args.padding is not None and args.padding < 0:
+            self.parser.error("--padding must be zero or a positive integer")
+
         # COG-only mode reads existing tiles instead of an input raster.
         if getattr(args, "cog_only", False):
             if not os.path.exists(args.tmp_dir):
@@ -114,14 +117,15 @@ Note: Windows and Linux share the same algorithm names and options.
                 sigma=10.0,
                 max_workers=params["max_workers"],
                 nodata_threshold=params["nodata_threshold"],
-                nodata_override=parse_nodata_override(args.nodata),
+                nodata_override=args.nodata_override,
                 output_dtype=getattr(args, "output_dtype", "float32"),
-                output_range=parse_output_range(getattr(args, "output_range", None)),
+                output_range=args.output_range_value,
                 multiscale_mode=params["multiscale_mode"],
                 pixel_size=params["pixel_size"],
                 cog_only=params["cog_only"],
                 cog_backend=params["cog_backend"],
                 gdal_bin_dir=params["gdal_bin_dir"],
+                keep_tiles=getattr(args, "keep_tiles", False),
                 **algo_params,
             )
 

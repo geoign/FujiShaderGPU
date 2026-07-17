@@ -18,8 +18,6 @@ from .args import (
     DASK_ARGS,
     add_arguments,
     build_algo_params,
-    parse_nodata_override,
-    parse_output_range,
 )
 from ..algorithms.dask_registry import ALGORITHMS as DASK_ALGORITHMS
 
@@ -161,9 +159,9 @@ writes them out as Cloud-Optimized GeoTIFF."""
                 show_progress=params["show_progress"],
                 auto_radii=auto_radii,
                 memory_fraction=getattr(args, "memory_fraction", None),
-                nodata_override=parse_nodata_override(getattr(args, "nodata", None)),
+                nodata_override=args.nodata_override,
                 output_dtype=getattr(args, "output_dtype", "float32"),
-                output_range=parse_output_range(getattr(args, "output_range", None)),
+                output_range=args.output_range_value,
                 pixel_size=getattr(args, "pixel_size", None),
                 **algo_params,
             )

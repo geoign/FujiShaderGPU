@@ -267,12 +267,37 @@ def _ensure_cog_has_overviews(dst: Path, cog_options: dict):
     src.unlink(missing_ok=True)
     repaired.unlink(missing_ok=True)
     dst.replace(src)
+    cleanup_src = True
     try:
         build_cog_with_overviews(src, repaired, cog_options)
         repaired.replace(dst)
         _assert_has_overviews(dst)
+    except Exception:
+        # Restore the original even when rebuilding produced a file but the
+        # subsequent overview validation failed.  The original COG body is the
+        # only known-good expensive result at this point.
+        try:
+            dst.unlink(missing_ok=True)
+            src.replace(dst)
+            logger.error(
+                "Overview rebuild failed; restored the overview-less COG at %s",
+                dst,
+            )
+        except Exception as restore_exc:  # pragma: no cover - defensive
+            # Do not let the finally block delete the only surviving original
+            # when Windows locking (or another filesystem error) blocks restore.
+            cleanup_src = False
+            logger.error(
+                "Overview rebuild failed AND restore failed (%s); the computed "
+                "body remains at %s", restore_exc, src,
+            )
+            raise RuntimeError(
+                f"Overview rebuild and output restore both failed; original remains at {src}"
+            ) from restore_exc
+        raise
     finally:
-        src.unlink(missing_ok=True)
+        if cleanup_src:
+            src.unlink(missing_ok=True)
         repaired.unlink(missing_ok=True)
 
 
@@ -500,6 +525,20 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
         except Exception:
             client = None
 
+        # Declared before the try so the finally block can always cancel any
+        # in-flight compute futures even if the loop raised midway.
+        fut_meta = {}
+        writer_stop_sent = False
+
+        def _stop_writer() -> None:
+            """Idempotently drain the queue and terminate the writer thread."""
+            nonlocal writer_stop_sent
+            if not writer_stop_sent:
+                write_q.put(None)
+                writer_stop_sent = True
+            write_q.join()
+            wt.join()
+
         try:
             if client is not None:
                 try:
@@ -512,7 +551,6 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                 from distributed import as_completed as _as_completed
                 coords_flat = [(i, j) for i in range(n_rows) for j in range(n_cols)]
                 task_iter = iter(coords_flat)
-                fut_meta = {}
                 inflight = _as_completed()
 
                 def _submit_next() -> bool:
@@ -563,15 +601,26 @@ def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: boo
                             write_q.put((arr, col_off[j], row_off[i]))
                             del arr
                             pbar.update(1)
-            # Drain and stop the writer.
-            write_q.put(None)
-            write_q.join()
-            wt.join(timeout=120)
+            # Drain and stop the writer (normal path).
+            _stop_writer()
             if write_err:
                 raise write_err["e"]
             out_band.FlushCache()
             out_ds.FlushCache()
         finally:
+            # Guarantee the writer thread is always signalled to stop and joined,
+            # even when the compute/write loop raised.  Without this the daemon
+            # writer thread and its bounded queue leaked on every failed run.
+            if wt.is_alive() or not writer_stop_sent:
+                _stop_writer()
+            # Cancel any compute futures that never got collected so the cluster
+            # does not keep recomputing/holding them after we bail out.
+            if client is not None and fut_meta:
+                try:
+                    client.cancel(list(fut_meta.keys()), force=True)
+                except Exception:
+                    pass
+                fut_meta.clear()
             out_band = None
             out_ds = None
 
@@ -676,6 +725,19 @@ def _persist_budget_gb(cluster, client) -> float:
 
 
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
+    """Write a COG and remove an incomplete destination if any writer fails."""
+    try:
+        return _write_cog_da_chunked(data, dst, show_progress)
+    except Exception:
+        try:
+            Path(dst).unlink(missing_ok=True)
+            logger.info("Removed partial COG after write failure: %s", dst)
+        except OSError as cleanup_exc:
+            logger.warning("Could not remove partial COG %s: %s", dst, cleanup_exc)
+        raise
+
+
+def _write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """Write COG (auto-selected by available memory)."""
     if getattr(data, "ndim", 2) != 2:
         # The streaming writer below is a single-band windowed path.  Multi-band
@@ -844,14 +906,13 @@ def _build_cog_via_cog_driver(src: Path, dst: Path, cog_options: dict) -> bool:
     ]
     if 'PREDICTOR' in cog_options:
         opts.append(f"PREDICTOR={cog_options['PREDICTOR']}")
+    pbar = None
     try:
         pbar = tqdm(total=100, desc="Building COG", unit="%")
 
         def _cb(complete, _msg, _data):
             pbar.n = int(complete * 100)
             pbar.refresh()
-            if complete >= 1.0:
-                pbar.close()
             return 1
 
         res = gdal.Translate(
@@ -864,6 +925,9 @@ def _build_cog_via_cog_driver(src: Path, dst: Path, cog_options: dict) -> bool:
     except Exception as exc:
         logger.warning("COG driver build failed (%s); falling back to gdaladdo+translate", exc)
         return False
+    finally:
+        if pbar is not None:
+            pbar.close()
 
 
 def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
@@ -1055,6 +1119,11 @@ def run_pipeline(
     
     # Validate input
     validate_inputs(src_cog)
+
+    # Fail before cluster creation and expensive GPU work when the destination
+    # directory cannot be created.  This also covers the chunked streaming path.
+    dst_path = Path(dst_cog)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
 
     # GDAL read optimization (set before cluster creation so spawned workers inherit it)
     _configure_gdal_read_performance()
@@ -1671,7 +1740,6 @@ def run_pipeline(
             result_da.rio.write_crs(dem.rio.crs, inplace=True)
         
         # 6-6) Output (COG or Zarr)
-        dst_path = Path(dst_cog)
         if is_zarr_path(str(dst_path)):
             logger.info("Writing output as Zarr: %s", dst_path)
             write_zarr_output(result_da, dst_path, show_progress=show_progress)

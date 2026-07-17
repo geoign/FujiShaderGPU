@@ -327,6 +327,7 @@ def _translate_to_cog(
     none/enclosed, unset for all), so it is inherited here -- avoiding any
     float-NaN formatting issues with the translate options.
     """
+    dst_cog.parent.mkdir(parents=True, exist_ok=True)
     if gdal.GetDriverByName("COG") is None:
         raise RuntimeError(
             "GDAL COG driver is unavailable (GDAL >= 3.1 required). "
@@ -339,17 +340,20 @@ def _translate_to_cog(
         num_threads=num_threads,
     )
     logger.info("Writing COG (ZSTD + AVERAGE overviews x%d): %s", overview_count, dst_cog)
-    result = gdal.Translate(
-        str(dst_cog),
-        str(src_tiff),
-        format="COG",
-        creationOptions=creation_options,
-    )
-    if result is None:
-        raise RuntimeError(f"COG translate failed: {dst_cog}")
-    result = None
-
-    _validate_cog_overviews(dst_cog)
+    try:
+        result = gdal.Translate(
+            str(dst_cog),
+            str(src_tiff),
+            format="COG",
+            creationOptions=creation_options,
+        )
+        if result is None:
+            raise RuntimeError(f"COG translate failed: {dst_cog}")
+        result = None
+        _validate_cog_overviews(dst_cog)
+    except Exception:
+        safe_unlink(dst_cog)
+        raise
 
 
 def _translate_source_to_cog_fast(
@@ -484,6 +488,10 @@ def preprocess_dem_to_cog(
         raise FileExistsError(
             f"Output already exists: {out_path} (use overwrite=True / --force)."
         )
+    # Validate/create the destination before any coarse analysis or full-size
+    # strip work.  Otherwise a missing/unwritable parent is discovered only by
+    # the final streaming Translate after all expensive preprocessing finished.
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with rasterio.open(in_path) as src:
         if src.count < 1:
@@ -952,9 +960,9 @@ def _stream_fill_parallel(
             for fut in as_completed(futures):
                 fut.result()  # re-raise any worker exception
 
-        vrt_path = Path(
-            tempfile.mkstemp(suffix=".mosaic.vrt", dir=str(tmp_parent))[1]
-        )
+        _vrt_fd, _vrt_name = tempfile.mkstemp(suffix=".mosaic.vrt", dir=str(tmp_parent))
+        os.close(_vrt_fd)
+        vrt_path = Path(_vrt_name)
         vrt = gdal.BuildVRT(str(vrt_path), [str(p) for p in strip_paths])
         if vrt is None:
             raise RuntimeError("BuildVRT failed to mosaic fill strips.")

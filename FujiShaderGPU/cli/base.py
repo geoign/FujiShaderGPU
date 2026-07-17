@@ -6,7 +6,13 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
-from .args import SHARED_ARGS, add_arguments, parse_list_fields
+from .args import (
+    SHARED_ARGS,
+    add_arguments,
+    parse_list_fields,
+    parse_nodata_override,
+    parse_output_range,
+)
 
 
 class BaseCLI(ABC):
@@ -102,6 +108,19 @@ class BaseCLI(ABC):
 
         # Parse all comma-separated list arguments uniformly (--radii, --scales, ...).
         parse_list_fields(parsed_args, self.parser)
+
+        # Convert shared scalar/range values while argparse can still present a
+        # concise usage error.  Delaying this until execute() leaked a raw
+        # ValueError traceback for malformed --nodata/--output-range values.
+        try:
+            parsed_args.nodata_override = parse_nodata_override(
+                getattr(parsed_args, "nodata", None)
+            )
+            parsed_args.output_range_value = parse_output_range(
+                getattr(parsed_args, "output_range", None)
+            )
+        except ValueError as exc:
+            self.parser.error(str(exc))
 
         self._validate_platform_args(parsed_args)
         return parsed_args

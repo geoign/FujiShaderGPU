@@ -39,6 +39,7 @@ from ..utils.paths import safe_abspath
 import os
 import math
 import glob
+import shutil
 import tempfile
 import uuid
 from pathlib import Path
@@ -1052,11 +1053,33 @@ def process_dem_tiles(
     nodata_override: Optional[float] = None,
     cog_backend: str = "internal",
     gdal_bin_dir: Optional[str] = None,
+    keep_tiles: bool = False,
     **algo_params  # algorithm-specific parameters
 ):
     """
     Main tile-based DEM processing function (with algorithm selection).
     """
+    # P3-8 (L-5/L-76): validate size/padding inputs before any expensive work so
+    # a bad value fails fast with a clear message instead of a ZeroDivisionError
+    # deep inside tiling or a silent oversized window.
+    if tile_size is not None:
+        try:
+            parsed_tile_size = int(tile_size)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"tile_size must be a positive integer, got {tile_size!r}"
+            ) from exc
+        if isinstance(tile_size, bool) or parsed_tile_size != tile_size or parsed_tile_size <= 0:
+            raise ValueError(f"tile_size must be a positive integer, got {tile_size!r}")
+        tile_size = parsed_tile_size
+    if padding is not None:
+        try:
+            parsed_padding = int(padding)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"padding must be >= 0, got {padding!r}") from exc
+        if isinstance(padding, bool) or parsed_padding != padding or parsed_padding < 0:
+            raise ValueError(f"padding must be >= 0, got {padding!r}")
+        padding = parsed_padding
     # COG-generation-only case
     if cog_only:
         resume_cog_generation(
@@ -1703,11 +1726,36 @@ def process_dem_tiles(
         _validate_cog_for_qgis(output_cog_path)
 
     except Exception as e:
+        # P3-7 (L-34): remove a half-written output so a failed run never leaves
+        # a corrupt/partial COG behind that a later run might mistake for valid.
+        try:
+            if os.path.exists(output_cog_path):
+                os.remove(output_cog_path)
+                logger.info("Removed partial output after failure: %s", output_cog_path)
+        except OSError as rm_exc:
+            logger.warning("Could not remove partial output %s: %s", output_cog_path, rm_exc)
+        # Keep the tiles on failure so the user can resume with --cog-only.
         if os.path.exists(tmp_tile_dir):
             logger.error(f"An error occurred ({e}). Keeping the tile directory: {tmp_tile_dir}")
             logger.info("To run COG generation only: use the --cog-only option")
         raise
-    
+
+    # P3-5 (M-2): on success, delete the temporary tile directory by default so
+    # runs do not silently accumulate large scratch dirs.  --keep-tiles preserves
+    # it (e.g. for a later --cog-only rebuild).
+    if keep_tiles:
+        logger.info("Keeping temporary tile directory (--keep-tiles): %s", tmp_tile_dir)
+    else:
+        try:
+            if os.path.isdir(tmp_tile_dir):
+                shutil.rmtree(tmp_tile_dir)
+                logger.info("Removed temporary tile directory: %s", tmp_tile_dir)
+        except Exception as cleanup_exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not remove temporary tile directory %s: %s (pass --keep-tiles to silence)",
+                tmp_tile_dir, cleanup_exc,
+            )
+
     logger.info("=== Processing complete ===")
     logger.info("[INFO] The generated COG is optimized")
 

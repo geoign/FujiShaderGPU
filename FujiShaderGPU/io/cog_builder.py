@@ -21,6 +21,26 @@ from ..utils.memory import container_memory_available_gb
 logger = logging.getLogger(__name__)
 
 
+def _remove_partial_cog_output(output_path: str) -> None:
+    """Best-effort removal of a failed GDAL output and its common sidecars."""
+    candidates = [
+        Path(output_path),
+        Path(f"{output_path}.tmp"),
+        Path(f"{output_path}.ovr"),
+        Path(f"{output_path}.ovr.tmp"),
+    ]
+    removed = False
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                candidate.unlink()
+                removed = True
+        except OSError as exc:
+            logger.warning("Could not remove partial COG artifact %s: %s", candidate, exc)
+    if removed:
+        logger.info("Removed partial COG output after failure: %s", output_path)
+
+
 def _gdal_num_threads() -> str:
     """GDAL NUM_THREADS bounded to the container CPU budget.
 
@@ -61,7 +81,10 @@ def _create_vrt_command_line_ultra(
     nodata: Optional[float] = None,
 ) -> None:
     """Create VRT by gdalbuildvrt command line (fast path for many tiles)."""
-    file_list_path = vrt_path.replace(".vrt", "_files.txt")
+    # Derive the sidecar list from the VRT stem so a path that merely CONTAINS
+    # ".vrt" earlier (e.g. a parent dir) is not corrupted by str.replace.
+    _vrt = Path(vrt_path)
+    file_list_path = str(_vrt.with_name(_vrt.stem + "_files.txt"))
     try:
         with open(file_list_path, "w", encoding="utf-8") as f:
             for tile_file in tile_files:
@@ -233,6 +256,22 @@ def _create_vrt_ultra_fast(
 
 
 def _create_cog_ultra_fast(
+    vrt_path: str,
+    output_cog_path: str,
+    gpu_config: dict,
+    nodata: Optional[float] = None,
+) -> None:
+    """Create a COG and never leave a failed destination behind."""
+    try:
+        _create_cog_ultra_fast_impl(
+            vrt_path, output_cog_path, gpu_config, nodata=nodata,
+        )
+    except Exception:
+        _remove_partial_cog_output(output_cog_path)
+        raise
+
+
+def _create_cog_ultra_fast_impl(
     vrt_path: str,
     output_cog_path: str,
     gpu_config: dict,
@@ -424,6 +463,7 @@ def _create_cog_gtiff_ultra_fast(
     except Exception:
         if os.path.exists(temp_tiff_path):
             os.remove(temp_tiff_path)
+        _remove_partial_cog_output(output_cog_path)
         raise
 
 
@@ -493,6 +533,28 @@ def _create_vrt_and_cog_external_cli(
     nodata: Optional[float],
     gdal_bin_dir: Optional[str],
 ) -> None:
+    """Run the external backend and remove an incomplete COG on failure."""
+    try:
+        _create_vrt_and_cog_external_cli_impl(
+            tile_files=tile_files,
+            vrt_path=vrt_path,
+            output_cog_path=output_cog_path,
+            nodata=nodata,
+            gdal_bin_dir=gdal_bin_dir,
+        )
+    except Exception:
+        _remove_partial_cog_output(output_cog_path)
+        raise
+
+
+def _create_vrt_and_cog_external_cli_impl(
+    *,
+    tile_files: List[str],
+    vrt_path: str,
+    output_cog_path: str,
+    nodata: Optional[float],
+    gdal_bin_dir: Optional[str],
+) -> None:
     """Build VRT + COG using external GDAL executables (no Python GDAL processing path)."""
     start = time.time()
     preferred_bin = _resolve_external_gdal_bin_dir(gdal_bin_dir)
@@ -506,7 +568,8 @@ def _create_vrt_and_cog_external_cli(
             "For reproducible performance, specify --gdal-bin-dir explicitly."
         )
 
-    file_list_path = vrt_path.replace(".vrt", "_files.txt")
+    _vrt = Path(vrt_path)
+    file_list_path = str(_vrt.with_name(_vrt.stem + "_files.txt"))
     with open(file_list_path, "w", encoding="utf-8", newline="\n") as f:
         for tile_file in tile_files:
             f.write(tile_file + "\n")
