@@ -2,7 +2,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from osgeo import gdal
+
+gdal = pytest.importorskip("osgeo.gdal")
+
+
+def _gtiff_supports_zstd() -> bool:
+    drv = gdal.GetDriverByName("GTiff")
+    options = (drv.GetMetadataItem("DMD_CREATIONOPTIONLIST") or "") if drv else ""
+    return "ZSTD" in options
 
 
 def _write_source_tiff(path: Path, width: int = 1024, height: int = 1024) -> None:
@@ -22,6 +29,7 @@ def _write_source_tiff(path: Path, width: int = 1024, height: int = 1024) -> Non
 
 
 @pytest.mark.skipif(gdal.GetDriverByName("COG") is None, reason="GDAL COG driver unavailable")
+@pytest.mark.skipif(not _gtiff_supports_zstd(), reason="GDAL built without libzstd")
 def test_cog_builder_writes_zstd_overviews(tmp_path):
     from FujiShaderGPU.io.cog_builder import _create_cog_ultra_fast
 

@@ -59,7 +59,9 @@ linux = [
     "dask[array]>=2024.4",
     "distributed>=2024.4",
     "zarr>=2.18",
-    "xarray>=2024.1",
+    # core/dask_io.py passes to_zarr(zarr_format=...), added in xarray 2024.9.1
+    # (replacing the deprecated zarr_version kwarg).
+    "xarray>=2024.9.1",
     "rioxarray>=0.15",
     "scipy>=1.7.0",
     "GPUtil>=1.4",
@@ -160,11 +162,14 @@ disallow_incomplete_defs = false
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+# Repo root on sys.path so `import FujiShaderGPU` works without installing the
+# package (replaces the per-file sys.path.insert bootstrap the tests used to carry).
+pythonpath = ["."]
+# Coverage is opt-in (`pytest --cov=FujiShaderGPU`; pytest-cov is in the dev
+# extra) -- baking --cov into addopts made bare pytest unable to even start
+# when pytest-cov was absent.
 addopts = [
     "--verbose",
-    "--cov=FujiShaderGPU",
-    "--cov-report=html",
-    "--cov-report=term-missing",
 ]
 
 [tool.coverage.run]

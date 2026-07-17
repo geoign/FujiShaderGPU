@@ -1,5 +1,8 @@
-import cupy as cp
-from FujiShaderGPU.algorithms._normalization import NORMAL_PERCENTILE
+import pytest
+
+cp = pytest.importorskip("cupy")
+
+from FujiShaderGPU.algorithms._normalization import NORMAL_PERCENTILE  # noqa: E402
 
 
 def test_visual_saliency_not_collapsed_to_narrow_band():

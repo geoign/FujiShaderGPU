@@ -1,5 +1,8 @@
-import cupy as cp
-from FujiShaderGPU.algorithms._normalization import NORMAL_PERCENTILE
+import pytest
+
+cp = pytest.importorskip("cupy")
+
+from FujiShaderGPU.algorithms._normalization import NORMAL_PERCENTILE  # noqa: E402
 
 
 def test_fractal_anomaly_normalization_is_signed_and_not_collapsed():
@@ -38,6 +41,7 @@ def test_fractal_anomaly_normalization_is_signed_and_not_collapsed():
 def test_fractal_anomaly_smoothing_reduces_noise():
     from FujiShaderGPU.algorithms.dask_shared import compute_fractal_dimension_block
 
+    cp.random.seed(0)
     x = cp.linspace(-5, 5, 256, dtype=cp.float32)
     y = cp.linspace(-5, 5, 256, dtype=cp.float32)
     xx, yy = cp.meshgrid(x, y)

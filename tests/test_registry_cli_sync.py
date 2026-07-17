@@ -1,9 +1,10 @@
-import sys
-from pathlib import Path
+import argparse
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+import pytest
+
+# Both CLIs pull in the full algorithm registries (cupy + dask.array) at import.
+pytest.importorskip("cupy")
+pytest.importorskip("dask.array")
 
 
 def test_linux_cli_matches_dask_registry():
@@ -29,21 +30,32 @@ def test_both_clis_expose_same_algorithms():
     assert LinuxCLI().get_supported_algorithms() == WindowsCLI().get_supported_algorithms()
 
 
+def _sample_argv(flag: str, kwargs: dict) -> list:
+    """Minimal valid argv fragment exercising one argument spec."""
+    action = kwargs.get("action")
+    if action in ("store_true", "store_false") or action is argparse.BooleanOptionalAction:
+        return [flag]
+    choices = kwargs.get("choices")
+    return [flag, str(choices[0]) if choices else "1"]
+
+
 def test_shared_arguments_present_on_both_clis():
-    # Every shared algorithm/output/spatial argument must exist identically on
-    # both platform parsers (single source of truth in cli/args.py).
+    # Every shared algorithm/output/spatial argument must be accepted identically
+    # by both platform parsers (single source of truth in cli/args.py).  Checked
+    # through the public parse_args API, not argparse internals.
     from FujiShaderGPU.cli.linux_cli import LinuxCLI
     from FujiShaderGPU.cli.windows_cli import WindowsCLI
     from FujiShaderGPU.cli.args import SHARED_ARGS
 
-    def flags(cli):
-        return {s for a in cli.parser._actions for s in a.option_strings}
-
-    lin, win = flags(LinuxCLI()), flags(WindowsCLI())
-    for spec_flags, _ in SHARED_ARGS:
-        for f in spec_flags:
-            assert f in lin, f"{f} missing from Linux CLI"
-            assert f in win, f"{f} missing from Windows CLI"
+    base = ["i", "o", "--algorithm", "hillshade"]
+    for cli_name, cli in (("Linux", LinuxCLI()), ("Windows", WindowsCLI())):
+        for spec_flags, kwargs in SHARED_ARGS:
+            for flag in spec_flags:
+                argv = base + _sample_argv(flag, kwargs)
+                try:
+                    cli.parser.parse_args(argv)
+                except SystemExit:
+                    pytest.fail(f"{flag} not accepted by {cli_name} CLI")
 
 
 def test_build_algo_params_parity_across_platforms():

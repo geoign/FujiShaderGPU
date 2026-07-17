@@ -1,11 +1,4 @@
-import sys
-from pathlib import Path
-
 import pytest
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 xr = pytest.importorskip('xarray')
 pytest.importorskip('zarr')
@@ -22,8 +15,9 @@ def test_zarr_roundtrip(tmp_path):
     src = tmp_path / 'input.zarr'
     out = tmp_path / 'output.zarr'
 
+    values = [[1.0, 2.0], [3.0, 4.0]]
     arr = xr.DataArray(
-        [[1.0, 2.0], [3.0, 4.0]],
+        values,
         dims=('y', 'x'),
         name='dem',
     )
@@ -31,7 +25,14 @@ def test_zarr_roundtrip(tmp_path):
 
     loaded = load_input_dataarray(str(src), chunk=2)
     assert loaded.shape == (2, 2)
+    assert str(loaded.dtype) == 'float32'
 
     write_zarr_output(loaded, out, show_progress=False)
     ds = xr.open_zarr(out)
-    assert 'dem' in ds.data_vars or 'result' in ds.data_vars
+    # write_zarr_output keeps the input variable name ('result' only for unnamed).
+    assert 'dem' in ds.data_vars
+    result = ds['dem']
+    assert result.dims == ('y', 'x')
+    assert result.shape == (2, 2)
+    assert str(result.dtype) == 'float32'
+    assert result.values.tolist() == values

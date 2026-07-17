@@ -1,4 +1,6 @@
-import cupy as cp
+import pytest
+
+cp = pytest.importorskip("cupy")
 
 
 def test_visual_saliency_tile_split_stability():
