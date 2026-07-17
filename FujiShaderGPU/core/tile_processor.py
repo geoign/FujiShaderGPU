@@ -177,12 +177,17 @@ def _nodata_is_nan(nodata: Optional[float]) -> bool:
 
 
 def _build_nodata_mask(data: np.ndarray, nodata: Optional[float]) -> Optional[np.ndarray]:
-    """Build nodata mask supporting both numeric nodata and nodata=NaN."""
+    """Build nodata mask supporting both numeric nodata and nodata=NaN.
+
+    With a numeric nodata the input can still carry NaN cells (mixed-source
+    mosaics); they are NoData too.  The Dask backend re-masks every NaN in its
+    final ``da.where(da.isnan(...))`` pass, so dropping them here would let the
+    NaN-filling kernels grow fabricated values over those cells (tile-only)."""
     if nodata is None:
         return None
     if _nodata_is_nan(nodata):
         return np.isnan(data)
-    return np.isclose(data, float(nodata), rtol=0.0, atol=1e-6)
+    return np.isclose(data, float(nodata), rtol=0.0, atol=1e-6) | np.isnan(data)
 
 
 def _replace_nodata_with_nan(data: np.ndarray, nodata: Optional[float]) -> np.ndarray:
@@ -1205,7 +1210,8 @@ def process_dem_tiles(
                             nodata=nodata_override,
                         )
                         if _field is not None:
-                            # Keep the full radii for the global normalization stat,
+                            # Keep the full radii for the global normalization stat
+                            # (consumed by _norm_stats._compute_norm_stats_tiled),
                             # but use small radii for padding + per-tile compute.
                             algo_params["_topousm_fast_full_radii"] = list(_full_r)
                             algo_params["_topousm_fast_full_weights"] = list(_full_w)

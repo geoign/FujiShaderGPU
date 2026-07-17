@@ -67,7 +67,7 @@ def main() -> None:
                 if zero_ratio >= 0.6 or (zero_ratio >= 0.3 and nonzero_present):
                     nodata = 0.0
         if nodata is not None:
-            arr[np.isclose(arr, nodata)] = np.nan
+            arr[np.isclose(arr, nodata, rtol=0.0, atol=1e-6)] = np.nan
 
     dem = cp.asarray(arr, dtype=cp.float32)
     nan_mask = cp.isnan(dem)

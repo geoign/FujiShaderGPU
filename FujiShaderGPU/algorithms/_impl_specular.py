@@ -265,7 +265,7 @@ def _compute_specular_roughness_scale(
             def _dn(a):
                 a = a.astype(np.float32, copy=False)
                 if nodata is not None and not np.isnan(float(nodata)):
-                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
+                    a = np.where(np.isclose(a, float(nodata), rtol=0.0, atol=1e-6), np.nan, a)
                 return a
 
             cov = max(1, max(W, H) // 512)

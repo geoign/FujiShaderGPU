@@ -982,7 +982,8 @@ def _quantize_block_cp(block, *, a_coef: float, b_coef: float,
     """
     dn = cp.rint(cp.float32(a_coef) * block + cp.float32(b_coef))
     dn = cp.clip(dn, cp.float32(dn_min), cp.float32(dn_max))
-    dn = cp.where(cp.isnan(block), cp.float32(0.0), dn)
+    # +/-inf is NoData too (matches io/output_encoding.quantize_array).
+    dn = cp.where(cp.isfinite(block), dn, cp.float32(0.0))
     return dn.astype(cp_dtype)
 
 

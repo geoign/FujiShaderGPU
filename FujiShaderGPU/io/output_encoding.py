@@ -181,7 +181,9 @@ def quantize_array(arr, qp: Dict[str, float], dtype: str):
     a = np.asarray(arr, dtype=np.float32)
     dn = np.rint(np.float32(qp["a_coef"]) * a + np.float32(qp["b_coef"]))
     dn = np.clip(dn, qp["dn_min"], qp["dn_max"])
-    dn = np.where(np.isnan(a), 0.0, dn)
+    # +/-inf is NoData too, not a saturated valid code (clip would turn +inf
+    # into dn_max and -inf into dn_min).
+    dn = np.where(np.isfinite(a), dn, 0.0)
     return dn.astype(np.dtype(dtype))
 
 

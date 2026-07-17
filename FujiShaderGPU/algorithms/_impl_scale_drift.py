@@ -149,7 +149,15 @@ def _drift_output(dx, dy, *, drift_output, normalize, norm_lo, norm_scale):
 def _drift_combine_block(block, *smooths, scales, pair_w, drift_output,
                          normalize, norm_lo, norm_scale):
     nan_mask = cp.isnan(block)
-    dx, dy = _drift_vector(list(smooths), scales, pair_w)
+    # Large-scale smooths arrive from the coarse-overview path with NaN
+    # re-masked over the NoData footprint; refill before gradients/Gaussians
+    # or the NaN erodes up to ~4*DRIFT_WINDOW_CAP px into valid pixels
+    # (restore_nan below only restores the original footprint).  Same
+    # treatment as _vs_combine_block.
+    fillv = cp.nanmean(block)
+    fillv = cp.where(cp.isfinite(fillv), fillv, cp.float32(0.0))
+    sm = [cp.where(cp.isnan(s), fillv, s).astype(cp.float32) for s in smooths]
+    dx, dy = _drift_vector(sm, scales, pair_w)
     out = _drift_output(dx, dy, drift_output=drift_output, normalize=normalize,
                         norm_lo=norm_lo, norm_scale=norm_scale)
     return restore_nan(out, nan_mask)

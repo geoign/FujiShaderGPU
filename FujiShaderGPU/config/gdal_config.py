@@ -54,7 +54,9 @@ def apply_gdal_io_config(cache_mb: int, *, dataset_pool_size: int = None, force:
         "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
         "VSI_CACHE": "YES",
         "VSI_CACHE_SIZE": str(cache_bytes),
-        "GDAL_SWATH_SIZE": str(cache_mb),
+        # Bytes, like the VSI caches (a bare MB figure here meant a 4-32 KB
+        # swath, crippling GDALDatasetCopyWholeRaster during COG builds).
+        "GDAL_SWATH_SIZE": str(cache_bytes),
         "GDAL_FORCE_CACHING": "YES",
         "GDAL_NUM_THREADS": str(max(1, container_cpu_count())),
         "GDAL_HTTP_MULTIPLEX": "YES",

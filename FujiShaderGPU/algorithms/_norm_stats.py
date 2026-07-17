@@ -149,6 +149,16 @@ def _compute_norm_stats_tiled(
         except Exception:
             defaults = {}
         merged = {**defaults, **(params or {})}
+        # Tile backend: the topousm_fast large-radius split replaces
+        # params["radii"] with the small radii BEFORE this prepass runs and
+        # stashes the originals.  The stats must describe the full multiscale
+        # output (the Dask backend injects before its split), otherwise the
+        # tile display stretch is estimated from a distribution missing the
+        # large-radius component and over-amplifies.
+        if merged.get("_topousm_fast_full_radii"):
+            merged["radii"] = list(merged["_topousm_fast_full_radii"])
+            if merged.get("_topousm_fast_full_weights"):
+                merged["weights"] = list(merged["_topousm_fast_full_weights"])
     except Exception as exc:
         logger.warning("Tiled norm-stats helpers unavailable for %s: %s", algorithm, exc)
         return None
@@ -172,7 +182,7 @@ def _compute_norm_stats_tiled(
             def _denodata(a):
                 a = a.astype(np.float32, copy=False)
                 if nodata is not None and not np.isnan(float(nodata)):
-                    a = np.where(np.isclose(a, float(nodata), atol=1e-6), np.nan, a)
+                    a = np.where(np.isclose(a, float(nodata), rtol=0.0, atol=1e-6), np.nan, a)
                 return a
 
             # Coarse overview -> valid-data bounding box.
