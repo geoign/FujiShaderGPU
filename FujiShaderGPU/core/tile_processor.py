@@ -13,7 +13,11 @@ from ..core.tile_compute import (
     apply_nodata_mask,
     _normalize_topousm_fast_radii_and_weights,
 )
-from ..io.raster_info import detect_pixel_size_from_cog, metric_pixel_scales_from_metadata
+from ..io.raster_info import (
+    detect_pixel_size_from_cog,
+    meters_per_degree,
+    metric_pixel_scales_from_metadata,
+)
 from ..utils.types import TileResult
 from ..io.cog_builder import _build_vrt_and_cog_ultra_fast
 from ..io.cog_validator import _validate_cog_for_qgis
@@ -893,9 +897,8 @@ def process_single_tile(
                     core_window = Window(core_x, core_y, core_w, core_h)
                     b_left, b_bottom, b_right, b_top = rasterio.windows.bounds(core_window, src_transform)
                     lat_center_tile = 0.5 * (float(b_bottom) + float(b_top))
-                    meters_per_degree_lat = 111_320.0
-                    meters_per_degree_lon = meters_per_degree_lat * max(
-                        1e-6, abs(math.cos(math.radians(lat_center_tile)))
+                    meters_per_degree_lon, meters_per_degree_lat = meters_per_degree(
+                        lat_center_tile
                     )
                     sx_deg = float(src_transform.a)
                     sy_deg = float(src_transform.e)

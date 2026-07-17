@@ -92,6 +92,42 @@ def test_drift_combine_block_does_not_erode_nan_from_smooths():
 
 
 # ---------------------------------------------------------------------------
+# M-33 / N-2: one precise deg->m conversion, anisotropy preserved
+# ---------------------------------------------------------------------------
+
+def test_meters_per_degree_precise_series():
+    from FujiShaderGPU.io.raster_info import meters_per_degree
+
+    m_lon, m_lat = meters_per_degree(35.0)
+    # WGS84 series reference values at 35N.
+    assert m_lat == pytest.approx(110940.5, abs=15)
+    assert m_lon == pytest.approx(91288.0, abs=15)
+
+
+def test_metric_pixel_scales_geographic_anisotropic():
+    rasterio = pytest.importorskip("rasterio")
+    from affine import Affine
+    from FujiShaderGPU.io.raster_info import (
+        meters_per_degree,
+        metric_pixel_scales_from_metadata,
+    )
+
+    t = Affine(0.001, 0.0, 130.0, 0.0, -0.001, 36.0)
+    crs = rasterio.crs.CRS.from_epsg(4326)
+    bounds = (130.0, 35.0, 131.0, 36.0)  # center latitude 35.5
+    sx, sy, mean_m, is_geo, lat = metric_pixel_scales_from_metadata(
+        transform=t, crs=crs, bounds=bounds
+    )
+    assert is_geo and lat == pytest.approx(35.5)
+    m_lon, m_lat = meters_per_degree(35.5)
+    # Signed, per-axis, and anisotropic (the isotropic mean misstates each
+    # axis by ~10% here).
+    assert sx == pytest.approx(0.001 * m_lon, rel=1e-9)
+    assert sy == pytest.approx(-0.001 * m_lat, rel=1e-9)
+    assert abs(sy) > abs(sx)
+
+
+# ---------------------------------------------------------------------------
 # H-1: topousm_fast tile prepass must use the pre-split full radii
 # ---------------------------------------------------------------------------
 

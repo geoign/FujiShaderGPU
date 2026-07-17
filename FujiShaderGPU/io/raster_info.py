@@ -10,6 +10,31 @@ import rasterio
 logger = logging.getLogger(__name__)
 
 
+def meters_per_degree(lat_deg: float) -> Tuple[float, float]:
+    """(meters/degree longitude, meters/degree latitude) at a latitude.
+
+    WGS84 series expansion, the single conversion used everywhere (CLI
+    logging, Dask metadata detection, per-tile scaling) so metre-radius
+    conversions cannot drift between backends.  The simple
+    ``111320 * cos(lat)`` form deviated from this by 0.1-0.7% per axis.
+    """
+    lat = math.radians(float(lat_deg))
+    m_lat = (
+        111132.92
+        - 559.82 * math.cos(2.0 * lat)
+        + 1.175 * math.cos(4.0 * lat)
+        - 0.0023 * math.cos(6.0 * lat)
+    )
+    m_lon = (
+        111412.84 * math.cos(lat)
+        - 93.5 * math.cos(3.0 * lat)
+        + 0.118 * math.cos(5.0 * lat)
+    )
+    # The longitude scale collapses at the poles; keep it positive so signed
+    # per-axis pixel scales never flip or hit zero.
+    return max(1e-6, float(m_lon)), float(m_lat)
+
+
 def metric_pixel_scales_from_metadata(
     *,
     transform,
@@ -39,10 +64,7 @@ def metric_pixel_scales_from_metadata(
         else:
             _bottom, _top = float(bounds[1]), float(bounds[3])
         lat_center = 0.5 * (_bottom + _top)
-        meters_per_degree_lat = 111_320.0
-        meters_per_degree_lon = meters_per_degree_lat * max(
-            1e-6, abs(math.cos(math.radians(lat_center)))
-        )
+        meters_per_degree_lon, meters_per_degree_lat = meters_per_degree(lat_center)
         scale_x = math.copysign(abs_x * meters_per_degree_lon, sx if sx != 0 else 1.0)
         scale_y = math.copysign(abs_y * meters_per_degree_lat, sy if sy != 0 else -1.0)
         mean_m = 0.5 * (abs(scale_x) + abs(scale_y))

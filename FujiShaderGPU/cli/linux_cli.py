@@ -11,7 +11,6 @@ import argparse
 import os
 
 import GPUtil
-import numpy as np
 import rasterio
 
 from .base import BaseCLI
@@ -86,24 +85,27 @@ writes them out as Cloud-Optimized GeoTIFF."""
             )
             return
 
+        # args.pixel_size stays None in every auto-detect branch: run_pipeline
+        # treats an explicit pixel_size as an isotropic override (is_geo=False,
+        # both axes forced equal), so auto-setting the mean here silently
+        # discarded the per-axis anisotropy -- ~10%/axis at mid latitudes on
+        # geographic DEMs.  run_pipeline's own metadata detection keeps the
+        # signed per-axis metre scales; this probe only logs what it will find.
         with rasterio.open(input_path) as src:
             if src.crs and src.crs.is_geographic:
-                # Geographic CRS (lat/lon): convert degrees to meters at center latitude.
+                from ..io.raster_info import meters_per_degree
+
                 bounds = src.bounds
                 center_lat = (bounds.bottom + bounds.top) / 2
-                lat_rad = np.radians(center_lat)
-                meters_per_degree_lat = 111132.92 - 559.82 * np.cos(2 * lat_rad) + \
-                    1.175 * np.cos(4 * lat_rad) - 0.0023 * np.cos(6 * lat_rad)
-                meters_per_degree_lon = 111412.84 * np.cos(lat_rad) - \
-                    93.5 * np.cos(3 * lat_rad) + 0.118 * np.cos(5 * lat_rad)
+                m_lon, m_lat = meters_per_degree(center_lat)
                 pixel_size_x_deg = abs(src.transform[0])
                 pixel_size_y_deg = abs(src.transform[4])
-                pixel_size_x_m = pixel_size_x_deg * meters_per_degree_lon
-                pixel_size_y_m = pixel_size_y_deg * meters_per_degree_lat
-                args.pixel_size = (pixel_size_x_m + pixel_size_y_m) / 2
                 self.logger.info(f"Geographic CRS detected: center latitude {center_lat:.2f} deg")
-                self.logger.info(f"Pixel size: {pixel_size_x_deg:.6f} deg x {pixel_size_y_deg:.6f} deg")
-                self.logger.info(f"In meters: {args.pixel_size:.2f}m")
+                self.logger.info(
+                    f"Pixel size: {pixel_size_x_deg:.6f} deg x {pixel_size_y_deg:.6f} deg "
+                    f"(~{pixel_size_x_deg * m_lon:.2f}m x {pixel_size_y_deg * m_lat:.2f}m); "
+                    "anisotropic scales are auto-detected in run_pipeline"
+                )
             else:
                 # Projected CRS (already metric).
                 pixel_size_x = abs(src.transform[0])
@@ -112,8 +114,10 @@ writes them out as Cloud-Optimized GeoTIFF."""
                     units = src.crs.linear_units
                     if units and units.lower() not in ("metre", "meter"):
                         self.logger.warning(f"CRS unit is '{units}'; treating it as meters.")
-                args.pixel_size = (pixel_size_x + pixel_size_y) / 2
-                self.logger.info(f"Projected CRS: pixel size {args.pixel_size:.2f}m")
+                self.logger.info(
+                    f"Projected CRS: pixel size {pixel_size_x:.2f}m x {pixel_size_y:.2f}m "
+                    "(auto-detected in run_pipeline)"
+                )
 
     def execute(self, args: argparse.Namespace):
         """Run Dask-CUDA processing."""
