@@ -28,7 +28,8 @@ import cupy as cp
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
-from ._base import DaskAlgorithm
+from ._base import Constants, DaskAlgorithm
+from ._global_stats import estimate_global_stats_or_default
 from ._nan_utils import (
     restore_nan, _resolve_spatial_radii_weights, _combine_multiscale_dask,
     large_radius_threshold, multiscale_response_fields,
@@ -187,19 +188,23 @@ class FrangiAlgorithm(DaskAlgorithm):
             c = None
 
         if c is None:
-            # Zarr / stats-less fallback: estimate c from one coarse sample of
-            # the array itself (still global -> seam-free).
-            try:
-                sample = gpu_arr[::max(1, gpu_arr.shape[0] // 1024),
-                                 ::max(1, gpu_arr.shape[1] // 1024)].compute()
-                pooled = compute_frangi_block(
-                    cp.asarray(sample), radii=[max(1, int(r)) for r in radii],
-                    normalize=False)
-                c = frangi_c_stat_func(pooled)[1]
-                logger.info("frangi: c estimated from decimated sample: %.6g", c)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("frangi: global c estimation failed (%s); c=1.0", exc)
-                c = 1.0
+            # Zarr / stats-less fallback: bounded central full-resolution window
+            # (not strided full-array reads, and not per-block stats).
+            depth = min(int(2 * max(radii)) + 6, Constants.MAX_DEPTH) if radii else 64
+            stats = estimate_global_stats_or_default(
+                gpu_arr, frangi_c_stat_func, compute_frangi_block,
+                {
+                    'radii': [max(1, int(r)) for r in radii],
+                    'normalize': False,
+                    'beta': beta,
+                    'feature_type': feature_type,
+                    'pixel_size': ps,
+                    'pixel_scale_x': psx,
+                    'pixel_scale_y': psy,
+                },
+                depth=depth, algorithm_name='frangi', default=(0.0, 1.0),
+            )
+            c = float(stats[1])
 
         thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
         responses = multiscale_response_fields(

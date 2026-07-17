@@ -35,6 +35,7 @@ import math
 import cupy as cp
 
 from ._base import Constants, DaskAlgorithm
+from ._global_stats import estimate_global_stats_or_default
 from ._nan_utils import restore_nan
 from ._impl_structure_tensor import nan_filled
 
@@ -187,6 +188,22 @@ class PhaseCongruencyAlgorithm(DaskAlgorithm):
         except Exception:
             pass
         stats = params.get('global_stats', None)
+        if not (isinstance(stats, (tuple, list)) and len(stats) >= 2
+                and float(stats[1]) > 1e-12):
+            stats = estimate_global_stats_or_default(
+                gpu_arr, pc_noise_stat_func, compute_phase_congruency_block,
+                {
+                    'wavelengths': scales,
+                    'sigma_onf': float(params.get('sigma_onf', 0.55)),
+                    'noise_k': float(params.get('noise_k', 2.0)),
+                    'feature_type': params.get('feature_type', 'both'),
+                    'normalize': False,
+                    'pixel_size': float(params.get('pixel_size', 1.0)),
+                    'pixel_scale_x': params.get('pixel_scale_x', None),
+                    'pixel_scale_y': params.get('pixel_scale_y', None),
+                },
+                depth=depth, algorithm_name='phase_congruency', default=(0.0, 1.0),
+            )
         return gpu_arr.map_overlap(
             compute_phase_congruency_block, depth=depth, boundary='reflect',
             dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),

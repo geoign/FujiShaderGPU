@@ -27,6 +27,7 @@ import logging
 import cupy as cp
 
 from ._base import Constants, DaskAlgorithm
+from ._global_stats import estimate_global_stats_or_default
 from ._nan_utils import restore_nan
 from ._impl_structure_tensor import nan_filled
 
@@ -152,14 +153,34 @@ class TVDecompositionAlgorithm(DaskAlgorithm):
             depth = max(1, min(depth, int(min_chunk) - 1))
         except Exception:
             pass
+        stats = params.get('global_stats', None)
+        component = params.get('component', 'texture')
+        if (str(component or 'texture').lower() != 'structure'
+                and not (isinstance(stats, (tuple, list)) and len(stats) >= 2
+                         and float(stats[1]) > 1e-12)):
+            stats = estimate_global_stats_or_default(
+                gpu_arr, tv_texture_stat_func, compute_tv_texture_block,
+                {
+                    'tv_scale': float(params.get('tv_scale', 32.0)),
+                    'iterations': iters,
+                    'fidelity': params.get('fidelity', 'l1'),
+                    'component': component,
+                    'normalize': False,
+                    'radii': params.get('radii', None),
+                    'pixel_size': float(params.get('pixel_size', 1.0)),
+                    'pixel_scale_x': params.get('pixel_scale_x', None),
+                    'pixel_scale_y': params.get('pixel_scale_y', None),
+                },
+                depth=depth, algorithm_name='tv_decomposition', default=(0.0, 1.0),
+            )
         return gpu_arr.map_overlap(
             compute_tv_texture_block, depth=depth, boundary='reflect',
             dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
             tv_scale=float(params.get('tv_scale', 32.0)),
             iterations=iters,
             fidelity=params.get('fidelity', 'l1'),
-            component=params.get('component', 'texture'),
-            normalize=True, global_stats=params.get('global_stats', None),
+            component=component,
+            normalize=True, global_stats=stats,
             radii=params.get('radii', None),
             pixel_size=float(params.get('pixel_size', 1.0)),
             pixel_scale_x=params.get('pixel_scale_x', None),

@@ -8,10 +8,58 @@ Module split out from dask_shared.py (Phase 1).
 """
 from __future__ import annotations
 from typing import Any, Tuple
+import logging
 import cupy as cp
 import dask.array as da
 
 from ._nan_utils import restore_nan
+
+logger = logging.getLogger(__name__)
+
+
+def _stats_valid(stats) -> bool:
+    """True when a stats tuple has a finite positive final scale."""
+    if not isinstance(stats, (tuple, list)) or not stats:
+        return False
+    try:
+        return bool(cp.isfinite(cp.asarray(stats[-1])).item()) and float(stats[-1]) >= 1e-12
+    except Exception:
+        return False
+
+
+def estimate_global_stats_or_default(
+    gpu_arr: da.Array,
+    stat_func: callable,
+    algorithm_func: callable,
+    algorithm_params: dict,
+    *,
+    depth: int = None,
+    algorithm_name: str = None,
+    default: Tuple[Any, ...] = (0.0, 1.0),
+) -> Tuple[Any, ...]:
+    """Seam-free stats fallback for Zarr/pre-pass failures.
+
+    The fallback uses the same bounded central full-resolution window as
+    ``compute_global_stats``.  If that estimate fails or degenerates, return the
+    explicit default and log a warning instead of letting each chunk/tile invent
+    its own normalization constants.
+    """
+    try:
+        stats = compute_global_stats(
+            gpu_arr, stat_func, algorithm_func, algorithm_params,
+            depth=depth, algorithm_name=algorithm_name,
+        )
+        if _stats_valid(stats):
+            logger.info("%s global stats estimated from central window: %s",
+                        algorithm_name or getattr(algorithm_func, "__name__", "algorithm"), stats)
+            return stats
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "%s central-window global stats estimation failed (%s); using default %s",
+            algorithm_name or getattr(algorithm_func, "__name__", "algorithm"),
+            exc, default,
+        )
+    return tuple(default)
 
 
 def compute_global_stats(gpu_arr: da.Array,
@@ -157,6 +205,7 @@ def robust_unsigned_stretch_stat_func(values: cp.ndarray) -> Tuple[float, float]
 
 __all__ = [
     "compute_global_stats",
+    "estimate_global_stats_or_default",
     "apply_global_normalization",
     "apply_display_stretch_dask",
     "robust_unsigned_stretch_stat_func",

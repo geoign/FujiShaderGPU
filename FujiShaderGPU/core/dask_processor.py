@@ -693,6 +693,17 @@ def _persist_budget_gb(cluster, client) -> float:
 
 def write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """Write COG (auto-selected by available memory)."""
+    if getattr(data, "ndim", 2) != 2:
+        # The streaming writer below is a single-band windowed path.  Multi-band
+        # outputs (currently --agg stack, band,y,x) are still written correctly by
+        # rioxarray/GDAL's direct COG path.
+        logger.info(
+            "Multi-band output (%s dims) detected; using direct COG writer.",
+            getattr(data, "ndim", "unknown"),
+        )
+        _write_cog_da_original(data, dst, show_progress)
+        return
+
     total_gb = data.nbytes / (1024**3)
     
     # Auto-determine the threshold from system memory.
@@ -1428,10 +1439,15 @@ def run_pipeline(
         # DEM is NoData.  Algorithms are NaN-aware internally, but multiscale /
         # large-radius paths fill voids (cliff-free) for stability; this final
         # mask guarantees the exterior stays NoData with no boundary halo.
-        # (Skip when the algorithm changed the shape, e.g. agg='stack'.)
         if result_gpu.shape == gpu_arr.shape:
             result_gpu = da.where(
                 da.isnan(gpu_arr), cp.float32(cp.nan), result_gpu
+            )
+        elif result_gpu.ndim == gpu_arr.ndim + 1 and result_gpu.shape[-2:] == gpu_arr.shape:
+            # Formal --agg stack contract: band-first (C,H,W). Broadcast the
+            # source NoData footprint across every output band.
+            result_gpu = da.where(
+                da.isnan(gpu_arr)[None, :, :], cp.float32(cp.nan), result_gpu
             )
 
         # Drop internal helper arrays so they never reach COG metadata (str(params)).
@@ -1453,36 +1469,45 @@ def run_pipeline(
                 algorithm, params=params, override=output_range,
             )
             if value_range is None:
-                logger.info(
-                    "No fixed output range for %s (unit=%s); estimating from data percentiles",
-                    algorithm, params.get("unit", ""),
+                # Parity with the tile backend (audit M-17 / P1-9): when no fixed
+                # output range is resolvable (e.g. slope --unit percent,
+                # tv_decomposition --component structure), write float32 instead of
+                # quantizing from a backend-specific data estimate.  A per-backend
+                # percentile estimate gives tile and Dask different output dtypes
+                # (tile writes float32, Dask would quantize) and, even if both
+                # estimated, different DN<->value mappings for the same input (the
+                # tile backend has no cheap seam-free global range pre-pass), so
+                # neither backend estimates here.
+                logger.warning(
+                    "No fixed output range for %s (unit=%s); writing float32 instead of %s.",
+                    algorithm, params.get("unit", ""), output_dtype,
                 )
-                value_range = _estimate_output_range(result_gpu)
-            lo, hi = float(value_range[0]), float(value_range[1])
-            qp = quantize_params(lo, hi, output_dtype)
-            cp_dtype = cp.int16 if output_dtype == "int16" else cp.uint8
-            out_np_dtype = output_dtype
-            # Visualization integer outputs are written as plain DN rasters
-            # (uint8: 0..255, int16: raw codes) with NoData=0 and NO GDAL
-            # scale/offset metadata.  Embedding scale/offset makes QGIS auto-
-            # unscale the band and present it as Float32 over the physical range,
-            # which looks "quantized float with NoData=0" and is confusing for a
-            # display product.  The DN<->value mapping is still logged and
-            # recorded in the COG 'parameters'/value_range attrs for anyone who
-            # needs to recover physical units.  Same policy as the tile backend.
-            logger.info(
-                "Output dtype=%s (%s): range [%.6g, %.6g] -> DN [%d, %d], NoData=0 "
-                "(DN<->value mapping: value = %.6g*DN + %.6g; not embedded as scale/offset)",
-                output_dtype, "signed" if qp["signed"] else "unsigned",
-                lo, hi, qp["dn_min"], qp["dn_max"], qp["scale"], qp["offset"],
-            )
-            result_gpu = result_gpu.map_blocks(
-                _quantize_block_cp,
-                dtype=np.dtype(out_np_dtype),
-                meta=cp.empty((0, 0), dtype=cp_dtype),
-                a_coef=qp["a_coef"], b_coef=qp["b_coef"],
-                dn_min=qp["dn_min"], dn_max=qp["dn_max"], cp_dtype=cp_dtype,
-            )
+            else:
+                lo, hi = float(value_range[0]), float(value_range[1])
+                qp = quantize_params(lo, hi, output_dtype)
+                cp_dtype = cp.int16 if output_dtype == "int16" else cp.uint8
+                out_np_dtype = output_dtype
+                # Visualization integer outputs are written as plain DN rasters
+                # (uint8: 0..255, int16: raw codes) with NoData=0 and NO GDAL
+                # scale/offset metadata.  Embedding scale/offset makes QGIS auto-
+                # unscale the band and present it as Float32 over the physical range,
+                # which looks "quantized float with NoData=0" and is confusing for a
+                # display product.  The DN<->value mapping is still logged and
+                # recorded in the COG 'parameters'/value_range attrs for anyone who
+                # needs to recover physical units.  Same policy as the tile backend.
+                logger.info(
+                    "Output dtype=%s (%s): range [%.6g, %.6g] -> DN [%d, %d], NoData=0 "
+                    "(DN<->value mapping: value = %.6g*DN + %.6g; not embedded as scale/offset)",
+                    output_dtype, "signed" if qp["signed"] else "unsigned",
+                    lo, hi, qp["dn_min"], qp["dn_max"], qp["scale"], qp["offset"],
+                )
+                result_gpu = result_gpu.map_blocks(
+                    _quantize_block_cp,
+                    dtype=np.dtype(out_np_dtype),
+                    meta=cp.empty((0, 0), dtype=cp_dtype),
+                    a_coef=qp["a_coef"], b_coef=qp["b_coef"],
+                    dn_min=qp["dn_min"], dn_max=qp["dn_max"], cp_dtype=cp_dtype,
+                )
         elif output_dtype in ("int16", "uint8"):
             logger.warning(
                 "Output dtype=%s requested but result shape changed (e.g. agg=stack); "
@@ -1526,8 +1551,19 @@ def run_pipeline(
     
         # 6-5) xarray wrap (improved: simplified coordinate construction)
         # 6-5) xarray wrap (coordinate construction)
-        dims = dem.dims
-        coords = dem.coords
+        if result_cpu.ndim == dem.data.ndim:
+            dims = dem.dims
+            coords = dem.coords
+        elif result_cpu.ndim == dem.data.ndim + 1 and result_cpu.shape[-2:] == gpu_arr.shape:
+            # Formal --agg stack contract: band-first (C,H,W), represented in
+            # xarray/rasterio as band,y,x.  Preserve the source y/x coordinates.
+            dims = ("band",) + tuple(dem.dims)
+            coords = {k: v for k, v in dem.coords.items()}
+            coords["band"] = np.arange(1, int(result_cpu.shape[0]) + 1, dtype=np.int32)
+        else:
+            raise ValueError(
+                f"Unsupported result shape {result_cpu.shape} for source dims {dem.dims}"
+            )
         
         # Set the appropriate value range per algorithm
         if algorithm in ['hillshade']:

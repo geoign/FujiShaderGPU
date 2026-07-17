@@ -1,8 +1,12 @@
 """Bridge tile backend algorithms to shared Dask algorithm implementations."""
 from __future__ import annotations
 
+import logging
+
 import cupy as cp
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class _FallbackToDask(Exception):
@@ -24,14 +28,15 @@ def _merged_params(algo, params):
 def _combine_direct(responses, *, weights=None, agg="mean"):
     if not responses:
         raise ValueError("responses must not be empty")
+    agg_norm = str(agg or "mean").lower()
+    if agg_norm == "stack":
+        # Formal stack contract shared with the Dask backend: band-first
+        # (C, H, W), even for a single scale. The tile writer accepts this
+        # layout directly.
+        return cp.stack(responses, axis=0).astype(cp.float32, copy=False)
     if len(responses) == 1:
         return responses[0]
 
-    agg_norm = str(agg or "mean").lower()
-    if agg_norm == "stack":
-        # The tile writer expects either HxWxC or band-first arrays. Keep this
-        # unusual shape on the legacy path until the writer contract is explicit.
-        raise _FallbackToDask()
     if agg_norm == "max":
         out = responses[0]
         for item in responses[1:]:
@@ -351,6 +356,11 @@ def _direct_topousm_fast(block, params, algo):
     if not (
         isinstance(stats, (tuple, list)) and len(stats) >= 1 and float(stats[0]) > 1e-9
     ):
+        logger.warning(
+            "topousm_fast: global_stats missing on tile direct path; estimating "
+            "from this tile only. Run through the normal COG pipeline so "
+            "inject_global_stats can provide seam-free global stats."
+        )
         stats = topousm_fast_stat_func(topousm_fast)
     return apply_global_normalization(topousm_fast, topousm_fast_norm_func, stats)
 
@@ -397,12 +407,11 @@ def _direct_fractal_anomaly(block, params, algo):
     weights = params.get("weights", None)
     stats = params.get("global_stats", None)
     if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):
-        raw = compute_fractal_dimension_block(
-            block, radii=radii, normalize=False, smoothing_sigma=sm_sig,
-            despeckle_threshold=ds_thr, despeckle_alpha_max=ds_am,
-            detail_boost=db, weights=weights,
+        logger.warning(
+            "fractal_anomaly: global_stats missing on tile direct path; using "
+            "the shared Dask fallback instead of per-tile statistics."
         )
-        stats = fractal_stat_func(raw)
+        raise _FallbackToDask()
     rp10 = params.get("relief_p10", None)
     rp75 = params.get("relief_p75", None)
     if rp10 is None and rp75 is None and isinstance(stats, (tuple, list)) and len(stats) >= 4:

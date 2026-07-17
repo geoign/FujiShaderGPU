@@ -174,13 +174,14 @@ def _combine_multiscale_dask(
     """Combine per-radius dask responses with optional weighted mean."""
     if not responses:
         raise ValueError("responses must not be empty")
+    agg_norm = str(agg or "mean").lower()
+    if agg_norm == "stack":
+        # Formal stack contract: band-first (C, H, W), even for a single scale.
+        return da.stack(responses, axis=0)
     if len(responses) == 1:
         return responses[0]
 
     stacked = da.stack(responses, axis=0)
-    agg_norm = str(agg or "mean").lower()
-    if agg_norm == "stack":
-        return stacked
     if agg_norm == "max":
         return da.max(stacked, axis=0)
     if agg_norm == "min":

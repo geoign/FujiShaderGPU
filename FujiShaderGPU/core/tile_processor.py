@@ -229,12 +229,13 @@ def _required_padding_for_algorithm(
 
     _MAX_DEPTH = int(Constants.MAX_DEPTH)
     _mode = str(algo_params.get("mode", "spatial")).lower()
-    _is_geo = bool(algo_params.get("is_geographic_dem", False))
     # Overview path engaged for these runs (mirrors the injection gate); large
-    # radii then come from the overview and need no per-tile halo.
+    # radii then come from the overview and need no per-tile halo.  Geographic
+    # DEMs use the same path as Dask; pixel_scale_x/y are scaled independently
+    # by overview decimation, so anisotropy is preserved.
     _overview_active = (
         _mode == "spatial" and bool(algo_params.get("radii"))
-        and not _is_geo and algorithm != "topousm_fast"
+        and algorithm != "topousm_fast"
     )
     # large_radius_threshold for the spatial-switch algorithms (matches
     # _nan_utils.large_radius_threshold's floor; the tile is one chunk).
@@ -511,8 +512,17 @@ def _compute_geotiff_tile_profile(
     if result_core.ndim == 2:
         band_count = 1
     elif result_core.ndim == 3:
-        # Tile algorithms return HxWxC
-        band_count = int(result_core.shape[-1])
+        if tuple(result_core.shape[-2:]) == (int(core_h), int(core_w)):
+            # Formal stack contract: CxHxW.
+            band_count = int(result_core.shape[0])
+        elif tuple(result_core.shape[:2]) == (int(core_h), int(core_w)):
+            # Legacy HxWxC output.
+            band_count = int(result_core.shape[-1])
+        else:
+            raise ValueError(
+                f"Unsupported result_core shape {result_core.shape} for "
+                f"tile core {core_h}x{core_w}"
+            )
     else:
         raise ValueError(f"Unsupported result_core ndim: {result_core.ndim}")
 
@@ -618,8 +628,9 @@ def _format_algorithm_output(
     """
     arr = result_core.astype(np.float32, copy=False)
     if algorithm == "hillshade":
-        # Keep hillshade as single-band float output.
-        if arr.ndim == 3:
+        # Keep ordinary hillshade as single-band float output, but preserve
+        # formal --agg stack output (C,H,W) as multiple bands.
+        if arr.ndim == 3 and arr.shape[-1] in (3, 4) and arr.shape[-2:] != arr.shape[:2]:
             arr = arr[:, :, 0]
         arr = np.clip(arr, 0.0, 1.0)
     return arr, np.nan
@@ -933,11 +944,25 @@ def process_single_tile(
             core_x_in_win = core_x - win_x_off
             core_y_in_win = core_y - win_y_off
             if result_gpu.ndim == 3:
-                result_core_gpu = result_gpu[
-                    core_y_in_win : core_y_in_win + core_h,
-                    core_x_in_win : core_x_in_win + core_w,
-                    :,
-                ]
+                if tuple(result_gpu.shape[:2]) == tuple(dem_gpu.shape):
+                    # HxWxC legacy layout.
+                    result_core_gpu = result_gpu[
+                        core_y_in_win : core_y_in_win + core_h,
+                        core_x_in_win : core_x_in_win + core_w,
+                        :,
+                    ]
+                elif tuple(result_gpu.shape[-2:]) == tuple(dem_gpu.shape):
+                    # Band-first stack layout (C,H,W).
+                    result_core_gpu = result_gpu[
+                        :,
+                        core_y_in_win : core_y_in_win + core_h,
+                        core_x_in_win : core_x_in_win + core_w,
+                    ]
+                else:
+                    raise ValueError(
+                        f"Unsupported 3D result shape {result_gpu.shape} for "
+                        f"input tile {dem_gpu.shape}"
+                    )
             else:
                 result_core_gpu = result_gpu[
                     core_y_in_win : core_y_in_win + core_h,
@@ -1182,54 +1207,49 @@ def process_dem_tiles(
     # TopoUSM Fast large-radius-from-overview fast path (tile).  Split radii at a
     # tile-size-aware threshold; the large radii are taken from a single global
     # overview-derived coarse field (seam-free, no large per-tile halo), so the
-    # tile padding only needs to cover the small radii.  Projected-only: on
-    # geographic DEMs each tile uses local-latitude metric pixel scales, which a
-    # single global field cannot match, so the optimization is skipped there.
+    # tile padding only needs to cover the small radii.  This is enabled for both
+    # projected and geographic DEMs to match the Dask backend's overview policy.
     if algorithm == "topousm_fast":
         try:
             with rasterio.open(input_cog_path, "r") as _src:
-                _sx, _sy, _pxm, _is_geo, _lat = metric_pixel_scales_from_metadata(
-                    transform=_src.transform, crs=_src.crs, bounds=_src.bounds,
-                )
                 _full_w_px, _full_h_px = int(_src.width), int(_src.height)
-            if not _is_geo:
-                from ..algorithms._impl_topousm_fast import (
-                    topousm_fast_default_large_radius_threshold,
-                    split_radii_by_threshold,
-                )
-                _full_r, _full_w = _normalize_topousm_fast_radii_and_weights(
-                    target_distances=target_distances,
-                    weights=weights,
-                    pixel_size=float(pixel_size),
-                    manual_radii=algo_params.get("radii"),
-                    manual_weights=algo_params.get("weights"),
-                )
-                if _full_r:
-                    _thr = topousm_fast_default_large_radius_threshold(int(tile_size))
-                    _sr, _sw, _lr, _lw = split_radii_by_threshold(_full_r, _full_w, _thr)
-                    if _lr:
-                        _field = _compute_topousm_fast_overview_coarse_field_tile(
-                            input_cog_path, large_radii=_lr, large_weights=_lw,
-                            nodata=nodata_override,
+            from ..algorithms._impl_topousm_fast import (
+                topousm_fast_default_large_radius_threshold,
+                split_radii_by_threshold,
+            )
+            _full_r, _full_w = _normalize_topousm_fast_radii_and_weights(
+                target_distances=target_distances,
+                weights=weights,
+                pixel_size=float(pixel_size),
+                manual_radii=algo_params.get("radii"),
+                manual_weights=algo_params.get("weights"),
+            )
+            if _full_r:
+                _thr = topousm_fast_default_large_radius_threshold(int(tile_size))
+                _sr, _sw, _lr, _lw = split_radii_by_threshold(_full_r, _full_w, _thr)
+                if _lr:
+                    _field = _compute_topousm_fast_overview_coarse_field_tile(
+                        input_cog_path, large_radii=_lr, large_weights=_lw,
+                        nodata=nodata_override,
+                    )
+                    if _field is not None:
+                        # Keep the full radii for the global normalization stat
+                        # (consumed by _norm_stats._compute_norm_stats_tiled),
+                        # but use small radii for padding + per-tile compute.
+                        algo_params["_topousm_fast_full_radii"] = list(_full_r)
+                        algo_params["_topousm_fast_full_weights"] = list(_full_w)
+                        algo_params["radii"] = _sr
+                        algo_params["weights"] = _sw
+                        algo_params["_topousm_fast_coarse_field"] = _field
+                        algo_params["_topousm_fast_small_radii"] = _sr
+                        algo_params["_topousm_fast_small_weights"] = _sw
+                        algo_params["_topousm_fast_w_large"] = float(sum(_lw))
+                        algo_params["_topousm_fast_full_shape"] = (_full_h_px, _full_w_px)
+                        logger.info(
+                            "TopoUSM Fast overview large-radius path (tile): small=%s, large=%s "
+                            "(threshold=%dpx)",
+                            _sr, _lr, _thr,
                         )
-                        if _field is not None:
-                            # Keep the full radii for the global normalization stat
-                            # (consumed by _norm_stats._compute_norm_stats_tiled),
-                            # but use small radii for padding + per-tile compute.
-                            algo_params["_topousm_fast_full_radii"] = list(_full_r)
-                            algo_params["_topousm_fast_full_weights"] = list(_full_w)
-                            algo_params["radii"] = _sr
-                            algo_params["weights"] = _sw
-                            algo_params["_topousm_fast_coarse_field"] = _field
-                            algo_params["_topousm_fast_small_radii"] = _sr
-                            algo_params["_topousm_fast_small_weights"] = _sw
-                            algo_params["_topousm_fast_w_large"] = float(sum(_lw))
-                            algo_params["_topousm_fast_full_shape"] = (_full_h_px, _full_w_px)
-                            logger.info(
-                                "TopoUSM Fast overview large-radius path (tile): small=%s, large=%s "
-                                "(threshold=%dpx)",
-                                _sr, _lr, _thr,
-                            )
         except Exception as exc:
             logger.warning(
                 "TopoUSM Fast tile overview large-radius path unavailable; using full radii: %s",
@@ -1474,14 +1494,14 @@ def process_dem_tiles(
             # large-radius path, so large radii come from a single global field
             # (seam-free, bounded halo) instead of a per-tile coarsen.  The per-tile
             # global origin is injected in process_single_tile (_tile_origin).
-            # Projected DEMs only: a single global field is incompatible with the
-            # per-tile latitude metre scaling used on geographic DEMs.  TopoUSM Fast has its
-            # own split above (bespoke direct path).
+            # Enabled for both projected and geographic DEMs, matching the Dask
+            # backend.  The shared coarse-path helpers scale pixel_scale_x/y
+            # independently by the overview decimation, preserving anisotropy.
+            # TopoUSM Fast has its own split above (bespoke direct path).
             if (
                 mode == "spatial"
                 and algo_params.get("radii")
                 and algorithm != "topousm_fast"
-                and not bool(algo_params.get("is_geographic_dem", False))
             ):
                 try:
                     from ..algorithms._nan_utils import read_overview_coarse_dem
