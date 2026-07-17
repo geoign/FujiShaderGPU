@@ -138,7 +138,15 @@ class BaseCLI(ABC):
 
         import os
 
-        if not getattr(parsed_args, "_skip_input_check", False) and not os.path.exists(parsed_args.input):
+        input_text = str(parsed_args.input)
+        is_remote = input_text.lower().startswith(
+            ("http://", "https://", "s3://", "gs://", "az://", "/vsi")
+        )
+        if (
+            not getattr(parsed_args, "_skip_input_check", False)
+            and not is_remote
+            and not os.path.exists(parsed_args.input)
+        ):
             self.logger.error(f"Input file does not exist: {parsed_args.input}")
             raise FileNotFoundError(f"Input file not found: {parsed_args.input}")
 

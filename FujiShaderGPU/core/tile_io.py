@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import threading
+import atexit
 import numpy as np
 import rasterio
 from rasterio.windows import Window
 
 _thread_local = threading.local()
+_readers_lock = threading.Lock()
+_open_readers = {}
 
 
 def _get_thread_reader(input_cog_path: str):
@@ -23,7 +26,24 @@ def _get_thread_reader(input_cog_path: str):
     reader = rasterio.open(input_cog_path, "r")
     _thread_local.reader = reader
     _thread_local.reader_path = input_cog_path
+    with _readers_lock:
+        _open_readers[id(reader)] = reader
     return reader
+
+
+def close_all_tile_readers() -> None:
+    """Close cached per-thread readers explicitly at executor/pipeline shutdown."""
+    with _readers_lock:
+        readers = list(_open_readers.values())
+        _open_readers.clear()
+    for reader in readers:
+        try:
+            reader.close()
+        except Exception:
+            pass
+
+
+atexit.register(close_all_tile_readers)
 
 
 def read_tile_window(input_cog_path: str, window: Window) -> np.ndarray:

@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 from contextlib import contextmanager
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import GPUtil
 import cupy as cp
@@ -35,7 +35,7 @@ DASK_RUNTIME_CONFIG = {
 }
 
 
-def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Client]:
+def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Client, Dict[str, Any]]:
     is_colab = 'google.colab' in sys.modules
 
     gpus = GPUtil.getGPUs()
@@ -57,24 +57,27 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
     device_limit_gb = max(1.0, min(gpu_memory_gb, available_gb) * device_memory_fraction)
     # Keep the eager RMM pool below Dask's device_memory_limit.  A pool larger
     # than the worker limit can stall or restart the nanny during startup.
-    rmm_cap_gb = max(1, int(device_limit_gb * 0.80))
-    rmm_size = min(
+    rmm_cap_gb = max(0.25, device_limit_gb * 0.80)
+    rmm_size = max(0.25, min(
         tuned["rmm_pool_size_gb"],
-        int(available_gb * tuned["rmm_pool_fraction"]),
+        available_gb * tuned["rmm_pool_fraction"],
         rmm_cap_gb,
-    )
+    ))
     # Let the pool grow to nearly the full device budget.  Capping it at
     # rmm_size*1.2 left only ~3GB of headroom above the eager pool, so the
     # combine-heavy algorithms (visual_saliency / fractal_anomaly) -- whose many
     # small alloc/free cycles fragment the pool -- ran out of room even at tiny
     # chunks.  Staying just under device_memory_limit lets dask spill instead of
     # hard-failing the RMM pool.
-    rmm_max_gb = max(rmm_size + 1, int(device_limit_gb * 0.97))
+    rmm_max_gb = min(
+        device_limit_gb * 0.97,
+        max(rmm_size, device_limit_gb * 0.90),
+    )
     spill_dir = os.environ.get('FUJISHADER_SPILL_DIR', tempfile.gettempdir())
     logger.info("Dask spill directory: %s", spill_dir)
     logger.info(
         "Dask CUDA memory: total=%.1fGB available=%.1fGB device_limit=%.1fGB "
-        "rmm_pool=%dGB rmm_max=%dGB",
+        "rmm_pool=%.2fGB rmm_max=%.2fGB",
         gpu_memory_gb,
         available_gb,
         device_limit_gb,
@@ -84,12 +87,12 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
 
     cluster_kwargs = {
         'device_memory_limit': device_memory_fraction,
-        'rmm_pool_size': f'{rmm_size}GB',
+        'rmm_pool_size': f'{rmm_size:.2f}GB',
         'threads_per_worker': 1,
         'silence_logs': logging.WARNING,
         'death_timeout': '60s' if is_colab else '30s',
         'interface': 'lo' if is_colab else None,
-        'rmm_maximum_pool_size': f'{rmm_max_gb}GB',
+        'rmm_maximum_pool_size': f'{rmm_max_gb:.2f}GB',
         'enable_cudf_spill': True,
         'local_directory': spill_dir,
     }
@@ -104,23 +107,14 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         logger.info("dask-cuda does not support enable_cudf_spill; using default spilling")
         cluster = LocalCUDACluster(**cluster_kwargs)
 
-    # Expose the computed GPU memory budget so downstream persist/gather
-    # decisions (dask_processor) can size themselves to the real per-worker
-    # on-device headroom (device_limit minus the eager RMM pool) instead of a
-    # hardcoded threshold -- the fix for single-GPU-worker host-RAM OOM when
-    # persisting a result too large to stay resident on the device.
-    try:
-        cluster._fujishader_mem = {
-            "gpu_memory_gb": float(gpu_memory_gb),
-            "device_limit_gb": float(device_limit_gb),
-            "rmm_pool_gb": float(rmm_size),
-            "rmm_max_gb": float(rmm_max_gb),
-        }
-    except Exception:
-        pass
-
     client = Client(cluster)
-    return cluster, client
+    memory_budget = {
+        "gpu_memory_gb": float(gpu_memory_gb),
+        "device_limit_gb": float(device_limit_gb),
+        "rmm_pool_gb": float(rmm_size),
+        "rmm_max_gb": float(rmm_max_gb),
+    }
+    return cluster, client, memory_budget
 
 
 @contextmanager

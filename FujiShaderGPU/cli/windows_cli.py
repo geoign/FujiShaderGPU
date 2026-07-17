@@ -99,12 +99,11 @@ Note: Windows and Linux share the same algorithm names and options.
             self.logger.info(f"Mode: {'multiscale' if params['multiscale_mode'] else 'single-scale'}")
             self.logger.info(f"Spatial mode: {args.mode}")
 
-        try:
-            from ..core.tile_processor import process_dem_tiles
+        from ..core.tile_processor import process_dem_tiles
 
-            algo_params = build_algo_params(args)
+        algo_params = build_algo_params(args)
 
-            process_dem_tiles(
+        process_dem_tiles(
                 input_cog_path=params["input_path"],
                 output_cog_path=params["output_path"],
                 tmp_tile_dir=params["tmp_dir"],
@@ -125,9 +124,6 @@ Note: Windows and Linux share the same algorithm names and options.
                 keep_tiles=getattr(args, "keep_tiles", False),
                 show_progress=params["show_progress"],
                 **algo_params,
-            )
+        )
 
-            self.logger.info("Done")
-        except Exception as e:
-            self.logger.error(f"Error: {e}")
-            raise
+        self.logger.info("Done")

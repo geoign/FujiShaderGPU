@@ -57,7 +57,9 @@ def compute_lic_block(block, *, length=20, lic_field='flow', composite='hillshad
         return restore_nan(cp.full(block.shape, 0.5, dtype=cp.float32), nan_mask)
 
     L = int(max(1, min(int(length), LIC_MAX_LENGTH)))
-    smooth = gaussian_filter(filled, sigma=max(0.5, float(flow_sigma)),
+    max_flow_sigma = max(0.5, (Constants.MAX_DEPTH - L - 4) / 4.0)
+    flow_sigma = min(max(0.5, float(flow_sigma)), max_flow_sigma)
+    smooth = gaussian_filter(filled, sigma=flow_sigma,
                              mode='nearest')
     gy, gx = cp.gradient(smooth)
     if str(lic_field or 'flow').lower() == 'contour':
@@ -75,18 +77,23 @@ def compute_lic_block(block, *, length=20, lic_field='flow', composite='hillshad
                          cp.arange(w, dtype=cp.float32), indexing='ij')
     acc = noise.copy()
     total = cp.ones(block.shape, dtype=cp.float32)
+    px = cp.empty_like(xx)
+    py = cp.empty_like(yy)
+    coords = cp.empty((2, h, w), dtype=cp.float32)
     for direction in (1.0, -1.0):
-        px = xx.copy()
-        py = yy.copy()
+        px[...] = xx
+        py[...] = yy
         dvx = direction * vx
         dvy = direction * vy
         for _ in range(L):
-            coords = cp.stack([py, px])
+            coords[0] = py
+            coords[1] = px
             sx = map_coordinates(dvx, coords, order=1, mode='nearest')
             sy = map_coordinates(dvy, coords, order=1, mode='nearest')
-            px = px + sx
-            py = py + sy
-            coords = cp.stack([py, px])
+            cp.add(px, sx, out=px)
+            cp.add(py, sy, out=py)
+            coords[0] = py
+            coords[1] = px
             acc += map_coordinates(noise, coords, order=1, mode='nearest')
             total += 1.0
     lic = acc / total
@@ -126,7 +133,14 @@ class LICAlgorithm(DaskAlgorithm):
         if int(params.get('length', 20)) > LIC_MAX_LENGTH:
             logger.info("lic: length clamped to %d px (halo budget).",
                         LIC_MAX_LENGTH)
-        flow_sigma = float(params.get('flow_sigma', 1.5))
+        requested_flow_sigma = float(params.get('flow_sigma', 1.5))
+        max_flow_sigma = max(0.5, (Constants.MAX_DEPTH - L - 4) / 4.0)
+        flow_sigma = min(max(0.5, requested_flow_sigma), max_flow_sigma)
+        if flow_sigma != requested_flow_sigma:
+            logger.warning(
+                "lic: flow_sigma %.3g clamped to %.3g to fit the halo budget.",
+                requested_flow_sigma, flow_sigma,
+            )
         depth = min(int(L + 4 * flow_sigma + 4), Constants.MAX_DEPTH)
         try:
             min_chunk = min(min(ax) for ax in gpu_arr.chunks)

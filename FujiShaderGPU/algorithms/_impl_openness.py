@@ -67,8 +67,6 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     distances = np.unique((np.linspace(0.1, 1.0, 10) * max_distance).astype(int))
     distances = distances[distances > 0]
 
-    pad_value = Constants.NAN_FILL_VALUE_POSITIVE if openness_type == 'positive' else Constants.NAN_FILL_VALUE_NEGATIVE
-
     _sx = abs(float(pixel_scale_x)) if pixel_scale_x is not None else float(pixel_size)
     _sy = abs(float(pixel_scale_y)) if pixel_scale_y is not None else float(pixel_size)
     if _sx < 1e-9:
@@ -81,10 +79,8 @@ def compute_openness_vectorized(block: cp.ndarray, *,
     # block for every sample (up to num_directions * len(distances) times).
     D = int(max(distances)) if distances.size else 0
     if D > 0:
-        if nan_mask.any():
-            padded_all = cp.pad(block, D, mode='constant', constant_values=pad_value)
-        else:
-            padded_all = cp.pad(block, D, mode='edge')
+        padded_all = cp.pad(cp.where(nan_mask, 0.0, block), D, mode='edge')
+        padded_valid = cp.pad(~nan_mask, D, mode='constant', constant_values=False)
 
     # Accumulate the per-azimuth angle (zenith for positive, nadir for negative)
     # then divide by the number of azimuths that contributed a valid sample.
@@ -105,13 +101,15 @@ def compute_openness_vectorized(block: cp.ndarray, *,
 
             shifted = padded_all[D + offset_y:D + offset_y + h,
                                  D + offset_x:D + offset_x + w]
+            shifted_valid = padded_valid[D + offset_y:D + offset_y + h,
+                                         D + offset_x:D + offset_x + w]
 
             phys_dx = float(offset_x) * _sx
             phys_dy = float(offset_y) * _sy
             phys_dist = max(float(np.hypot(phys_dx, phys_dy)), 1e-9)
             angle = cp.arctan((shifted - block) / phys_dist)
 
-            valid = ~(cp.isnan(angle) | nan_mask)
+            valid = shifted_valid & ~nan_mask
             if openness_type == 'positive':
                 dir_ext = cp.where(valid, cp.maximum(dir_ext, angle), dir_ext)
             else:

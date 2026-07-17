@@ -39,6 +39,11 @@ def resolve_tmp_dir(default: Path) -> Tuple[Path, Optional[str]]:
             chosen = Path(value)
             break
 
+    if chosen.exists() and not chosen.is_dir():
+        source = f"${selected_from}" if selected_from else "the default path"
+        raise NotADirectoryError(
+            f"Temporary directory from {source} points to a file: {chosen}"
+        )
     chosen.mkdir(parents=True, exist_ok=True)
     return chosen, selected_from
 

@@ -14,6 +14,7 @@ host count, the cpuset allowance, and the CFS-quota-derived core count.
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Optional
 
@@ -100,6 +101,6 @@ def container_cpu_count() -> int:
 
     quota_cores = _cfs_quota_cores()
     if quota_cores:
-        candidates.append(max(1, round(quota_cores)))
+        candidates.append(max(1, math.ceil(quota_cores)))
 
     return max(1, min(candidates))

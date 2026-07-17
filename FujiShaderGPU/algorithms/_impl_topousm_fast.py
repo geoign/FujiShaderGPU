@@ -47,10 +47,12 @@ def high_pass(block: cp.ndarray, *, sigma: float) -> cp.ndarray:
 
 
 def compute_topousm_fast_efficient_block(block: cp.ndarray, *,
-                               radii: List[int] = [4, 16, 64],
+                               radii: Optional[List[int]] = None,
                                weights: Optional[List[float]] = None,
                                pixel_size: float = 1.0) -> cp.ndarray:
     """Efficient TopoUSM Fast computation (memory-optimized)."""
+    if radii is None:
+        radii = [4, 16, 64]
     nan_mask = cp.isnan(block)
 
     if weights is None:

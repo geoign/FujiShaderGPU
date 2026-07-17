@@ -103,17 +103,21 @@ writes them out as Cloud-Optimized GeoTIFF."""
                     "anisotropic scales are auto-detected in run_pipeline"
                 )
             else:
-                # Projected CRS (already metric).
                 pixel_size_x = abs(src.transform[0])
                 pixel_size_y = abs(src.transform[4])
-                if src.crs:
+                if src.crs is None:
+                    self.logger.warning(
+                        "Input raster has no CRS; coordinate units cannot be identified. "
+                        "The pipeline will reject metadata that looks like unlabelled degrees."
+                    )
+                else:
                     units = src.crs.linear_units
                     if units and units.lower() not in ("metre", "meter"):
                         self.logger.warning(f"CRS unit is '{units}'; treating it as meters.")
-                self.logger.info(
-                    f"Projected CRS: pixel size {pixel_size_x:.2f}m x {pixel_size_y:.2f}m "
-                    "(auto-detected in run_pipeline)"
-                )
+                    self.logger.info(
+                        f"Projected CRS: pixel size {pixel_size_x:.2f}m x {pixel_size_y:.2f}m "
+                        "(auto-detected in run_pipeline)"
+                    )
 
     def execute(self, args: argparse.Namespace):
         """Run Dask-CUDA processing."""
@@ -129,25 +133,19 @@ writes them out as Cloud-Optimized GeoTIFF."""
         # TopoUSM Fast auto-determines radii unless explicit --radii were given.
         auto_radii = getattr(args, "radii_list", None) is None and getattr(args, "auto_radii", True)
 
-        try:
-            from ..core.dask_processor import run_pipeline
+        from ..core.dask_processor import run_pipeline
 
-            run_pipeline(
-                src_cog=params["input_path"],
-                dst_cog=params["output_path"],
-                algorithm=args.algorithm,
-                chunk=getattr(args, "chunk", None),
-                show_progress=params["show_progress"],
-                auto_radii=auto_radii,
-                memory_fraction=getattr(args, "memory_fraction", None),
-                nodata_override=args.nodata_override,
-                output_dtype=getattr(args, "output_dtype", "float32"),
-                output_range=args.output_range_value,
-                pixel_size=getattr(args, "pixel_size", None),
-                **algo_params,
-            )
-        except Exception as e:
-            self.logger.error(f"An error occurred during processing: {e}")
-            import traceback
-            traceback.print_exc()
-            raise
+        run_pipeline(
+            src_cog=params["input_path"],
+            dst_cog=params["output_path"],
+            algorithm=args.algorithm,
+            chunk=getattr(args, "chunk", None),
+            show_progress=params["show_progress"],
+            auto_radii=auto_radii,
+            memory_fraction=getattr(args, "memory_fraction", None),
+            nodata_override=args.nodata_override,
+            output_dtype=getattr(args, "output_dtype", "float32"),
+            output_range=args.output_range_value,
+            pixel_size=getattr(args, "pixel_size", None),
+            **algo_params,
+        )

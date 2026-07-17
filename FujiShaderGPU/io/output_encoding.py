@@ -101,6 +101,9 @@ def resolve_output_range(
         lo, hi = float(override[0]), float(override[1])
         if hi > lo:
             return lo, hi
+        raise ValueError(
+            f"output range must satisfy high > low, got ({lo!r}, {hi!r})"
+        )
 
     algo = str(algorithm).lower()
     if algo == "slope" and params is not None:
@@ -185,5 +188,4 @@ def quantize_array(arr, qp: Dict[str, float], dtype: str):
     # into dn_max and -inf into dn_min).
     dn = np.where(np.isfinite(a), dn, 0.0)
     return dn.astype(np.dtype(dtype))
-
 

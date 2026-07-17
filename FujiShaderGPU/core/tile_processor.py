@@ -6,11 +6,17 @@ from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from importlib import import_module
 from ..core.gpu_memory import gpu_memory_pool
 from ..config.system_config import get_gpu_config
-from ..config.auto_tune import compute_max_workers, ALGORITHM_COMPLEXITY
-from ..core.tile_io import read_tile_window, write_tile_output
+from ..config.auto_tune import (
+    ALGORITHM_COMPLEXITY,
+    BYTES_PER_FLOAT_PIXEL,
+    VRAM_OVERHEAD_MULTIPLIER,
+    compute_max_workers,
+)
+from ..core.tile_io import close_all_tile_readers, read_tile_window, write_tile_output
 from ..core.tile_compute import (
     run_tile_algorithm,
     apply_nodata_mask,
+    deduplicate_radii_weights,
     _normalize_topousm_fast_radii_and_weights,
 )
 from ..io.raster_info import (
@@ -80,6 +86,12 @@ DEFAULT_ALGORITHMS = {
     "scale_drift": "ScaleDriftAlgorithm",
 }
 
+SPATIAL_TILE_ALGORITHMS = {
+    "hillshade", "slope", "specular", "atmospheric_scattering", "curvature",
+    "ambient_occlusion", "openness", "multi_light_uncertainty", "npr_edges",
+    "structure_tensor", "frangi",
+}
+
 # NOTE: output normalization is owned entirely by the algorithms themselves
 # (internal normalization with globally injected stats via inject_global_stats),
 # identically on both backends.  The tile pipeline no longer applies any
@@ -115,7 +127,8 @@ def _sanitize_spatial_radii_weights_for_tile(
             out_no_cap.append(max(1, int(round(fv))))
         if not out_no_cap:
             return None, weights, None
-        return out_no_cap, weights, None
+        dedup_r, dedup_w = deduplicate_radii_weights(out_no_cap, weights)
+        return dedup_r, dedup_w, None
 
     # AO / openness previously capped radii (256 / 512 px) to bound per-tile
     # padding and VRAM.  That cap is removed so user-specified radii are honoured
@@ -143,21 +156,9 @@ def _sanitize_spatial_radii_weights_for_tile(
     if not out_r:
         return None, None, None
 
-    # De-duplicate while preserving order.
-    dedup_idx = []
-    seen = set()
-    for idx, r in enumerate(out_r):
-        if r not in seen:
-            seen.add(r)
-            dedup_idx.append(idx)
-    dedup_r = [out_r[i] for i in dedup_idx]
-
-    dedup_w: Optional[List[float]] = None
-    if len(out_w) == len(out_r):
-        w2 = [max(0.0, out_w[i]) for i in dedup_idx]
-        s = float(sum(w2))
-        if s > 0:
-            dedup_w = [w / s for w in w2]
+    dedup_r, dedup_w = deduplicate_radii_weights(
+        out_r, out_w if len(out_w) == len(out_r) else None,
+    )
 
     warn = None
     try:
@@ -348,21 +349,7 @@ def _required_padding_for_algorithm(
             required,
             int(math.ceil(max(small) * 4.0)) + int(4 * DRIFT_WINDOW_CAP) + 8)
 
-    spatial_algorithms = {
-        "hillshade",
-        "slope",
-        "specular",
-        "atmospheric_scattering",
-        "curvature",
-        "ambient_occlusion",
-        "openness",
-        "multi_light_uncertainty",
-        "npr_edges",
-        # sigma = radius/2 Gaussian support -> the same 2R + margin rule.
-        "structure_tensor",
-        "frangi",
-    }
-    if _mode == "spatial" and algorithm in spatial_algorithms:
+    if _mode == "spatial" and algorithm in SPATIAL_TILE_ALGORITHMS:
         radii = algo_params.get("radii")
         if not radii:
             try:
@@ -867,8 +854,10 @@ def process_single_tile(
             mask_nodata = None
             if nodata is not None:
                 mask_nodata = _build_nodata_mask(dem_tile, nodata)
-            elif np.isnan(dem_tile).any():
-                mask_nodata = np.isnan(dem_tile)
+            else:
+                nan_mask = np.isnan(dem_tile)
+                if nan_mask.any():
+                    mask_nodata = nan_mask
 
             # NoData void filling is owned by the preprocessing command
             # (`python -m FujiShaderGPU.prepare`); tiles only mask NoData here.
@@ -892,9 +881,8 @@ def process_single_tile(
                 # kernels handle the boundary (no virtual-fill cliff -> no dark
                 # halo).  This matches the Dask-CUDA backend, which always feeds
                 # NaN, and apply_nodata_mask restores the NoData footprint below.
-                dem_tile_processed = dem_tile.astype(np.float32, copy=True)
-                if mask_nodata is not None:
-                    dem_tile_processed[mask_nodata] = np.nan
+                dem_tile_processed = dem_tile
+                dem_tile_processed[mask_nodata] = np.nan
             else:
                 dem_tile_processed = dem_tile
 
@@ -953,12 +941,6 @@ def process_single_tile(
                 tile_algo_params,
             )
 
-            # Restore NoData as NaN -- the uniform float NoData policy (matches
-            # the Dask backend; a numeric fill like -9999 would survive into
-            # post-processing, e.g. hillshade's [0,1] clip turned it into a
-            # valid black pixel).
-            result_gpu = apply_nodata_mask(result_gpu, mask_nodata, np.nan)
-
             # Crop on GPU before PCIe transfer; the padded halo is discarded.
             core_x_in_win = core_x - win_x_off
             core_y_in_win = core_y - win_y_off
@@ -987,6 +969,15 @@ def process_single_tile(
                     core_y_in_win : core_y_in_win + core_h,
                     core_x_in_win : core_x_in_win + core_w,
                 ]
+
+            # Restore only the core NoData footprint after cropping. Masking the
+            # discarded halo wasted a full padded-window GPU assignment per tile.
+            if mask_nodata is not None:
+                mask_core = mask_nodata[
+                    core_y_in_win : core_y_in_win + core_h,
+                    core_x_in_win : core_x_in_win + core_w,
+                ]
+                result_core_gpu = apply_nodata_mask(result_core_gpu, mask_core, np.nan)
 
             # CPU transfer (optimized)
             result_core = cp.asnumpy(result_core_gpu)
@@ -1056,6 +1047,9 @@ def process_dem_tiles(
     """
     Main tile-based DEM processing function (with algorithm selection).
     """
+    # Preserve user intent before local/spatial defaults inject radii and weights.
+    user_radii_specified = algo_params.get("radii") is not None
+    user_weights_specified = algo_params.get("weights") is not None
     # P3-8 (L-5/L-76): validate size/padding inputs before any expensive work so
     # a bad value fails fast with a clear message instead of a ZeroDivisionError
     # deep inside tiling or a silent oversized window.
@@ -1205,19 +1199,7 @@ def process_dem_tiles(
         max_workers = gpu_config["max_workers"]
 
     mode_norm = str(algo_params.get("mode", "spatial")).lower()
-    spatial_algorithms = {
-        "hillshade",
-        "slope",
-        "specular",
-        "atmospheric_scattering",
-        "curvature",
-        "ambient_occlusion",
-        "openness",
-        "multi_light_uncertainty",
-        "structure_tensor",
-        "frangi",
-    }
-    if mode_norm == "spatial" and algorithm in spatial_algorithms:
+    if mode_norm == "spatial" and algorithm in SPATIAL_TILE_ALGORITHMS:
         # Radii are normally injected above from the DEM short side; this is a
         # defensive fallback (full geometric sequence) if that was skipped.
         if algo_params.get("radii", None) is None:
@@ -1366,7 +1348,10 @@ def process_dem_tiles(
         # available VRAM.  The TopoUSM Fast radius cap was intentionally removed, so warn
         # explicitly (rather than silently clamping) when an OOM is likely.
         _complexity = float(ALGORITHM_COMPLEXITY.get(algorithm, 1.0))
-        est_tile_vram_gb = (effective_span ** 2 * 4.0 * 15.0 * _complexity) / (1024 ** 3)
+        est_tile_vram_gb = (
+            effective_span ** 2 * BYTES_PER_FLOAT_PIXEL
+            * VRAM_OVERHEAD_MULTIPLIER * _complexity
+        ) / (1024 ** 3)
         usable_vram_gb = max(0.1, _vram * 0.70)
         try:
             _radii_for_msg = algo_params.get("radii")
@@ -1381,7 +1366,8 @@ def process_dem_tiles(
         if est_tile_vram_gb > usable_vram_gb * 0.6:
             # Suggest a core tile size that would bring one tile within budget.
             _budget_span = int(math.sqrt(
-                usable_vram_gb * (1024 ** 3) / (4.0 * 15.0 * _complexity)
+                usable_vram_gb * (1024 ** 3) /
+                (BYTES_PER_FLOAT_PIXEL * VRAM_OVERHEAD_MULTIPLIER * _complexity)
             ))
             _suggested_tile = _budget_span - 2 * int(padding)
             severity = "high" if est_tile_vram_gb > usable_vram_gb else "moderate"
@@ -1451,8 +1437,6 @@ def process_dem_tiles(
             except Exception:
                 pass
             requested_mode = str(algo_params.get("mode", "spatial")).lower()
-            user_radii_specified = ("radii" in algo_params) and (algo_params.get("radii") is not None)
-            user_weights_specified = ("weights" in algo_params) and (algo_params.get("weights") is not None)
             # Spatial preset may include large radii (up to 512px). For small rasters,
             # force local mode unless the user explicitly provided radii/weights.
             if (
@@ -1698,6 +1682,8 @@ def process_dem_tiles(
                         # Refill with new tasks as ones complete
                         _submit_next()
 
+            close_all_tile_readers()
+
             logger.info(f"Results: success={len(processed_tiles)}, skipped={len(skipped_tiles)}, error={len(error_tiles)}")
 
             if error_tiles:
@@ -1724,6 +1710,7 @@ def process_dem_tiles(
             raise RuntimeError(f"Generated output failed COG validation: {output_cog_path}")
 
     except Exception as e:
+        close_all_tile_readers()
         # P3-7 (L-34): remove a half-written output so a failed run never leaves
         # a corrupt/partial COG behind that a later run might mistake for valid.
         try:
@@ -1820,7 +1807,12 @@ def resume_cog_generation(
         # Cleanup suggestion on success
         logger.info("\n[TIP] COG generation completed.")
         logger.info("Delete the temporary tile directory?")
-        logger.info(f"Delete command: rm -rf {tmp_tile_dir}")
+        if os.name == "nt":
+            escaped = str(tmp_tile_dir).replace("'", "''")
+            logger.info("Delete command: Remove-Item -LiteralPath '%s' -Recurse -Force", escaped)
+        else:
+            import shlex
+            logger.info("Delete command: rm -rf -- %s", shlex.quote(str(tmp_tile_dir)))
         
     except Exception as e:
         logger.error(f"COG generation error: {e}")

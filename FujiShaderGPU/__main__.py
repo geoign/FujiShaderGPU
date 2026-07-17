@@ -33,15 +33,25 @@ def main() -> None:
             sys.exit(1)
 
     elif system == "windows":
-        from .cli.windows_cli import WindowsCLI
-        cli = WindowsCLI()
+        try:
+            from .cli.windows_cli import WindowsCLI
+            cli = WindowsCLI()
+        except ImportError as exc:
+            print(f"Error: Windows dependencies are not available: {exc}")
+            print("Install FujiShaderGPU and a matching GDAL Python binding.")
+            sys.exit(1)
 
     elif system == "darwin":
         warnings.warn(
             "macOS support is experimental. Windows tile pipeline is used as fallback."
         )
-        from .cli.windows_cli import WindowsCLI
-        cli = WindowsCLI()
+        try:
+            from .cli.windows_cli import WindowsCLI
+            cli = WindowsCLI()
+        except ImportError as exc:
+            print(f"Error: macOS fallback dependencies are not available: {exc}")
+            print("Install FujiShaderGPU and a matching GDAL Python binding.")
+            sys.exit(1)
 
     else:
         print(f"Error: Unsupported OS: {system}")

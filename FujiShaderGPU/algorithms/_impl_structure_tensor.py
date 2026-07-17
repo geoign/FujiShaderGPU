@@ -138,11 +138,17 @@ def compute_structure_tensor_block(block, *, radii=None, weights=None,
     if not radii:
         radii = [2, 8, 32]
     short = max(8, min(int(block.shape[0]), int(block.shape[1])))
-    rs = sorted({max(1, min(int(round(float(r))), short // 4)) for r in radii})
-    ws = None
-    if weights is not None and len(list(weights)) == len(list(radii)):
-        # Clamping may merge radii; only keep weights when the count still matches.
-        ws = [float(w) for w in weights] if len(rs) == len(list(radii)) else None
+    raw_radii = list(radii)
+    raw_weights = list(weights) if weights is not None else None
+    weighted = raw_weights is not None and len(raw_weights) == len(raw_radii)
+    merged = {}
+    for index, radius in enumerate(raw_radii):
+        clamped = max(1, min(int(round(float(radius))), short // 4))
+        merged[clamped] = merged.get(clamped, 0.0) + (
+            float(raw_weights[index]) if weighted else 1.0
+        )
+    rs = sorted(merged)
+    ws = [merged[radius] for radius in rs] if weighted else None
     acc_u = cp.zeros(block.shape, dtype=cp.float32)
     acc_v = cp.zeros(block.shape, dtype=cp.float32)
     wsum = 0.0

@@ -53,8 +53,12 @@ def handle_nan_for_gradient(block: cp.ndarray, scale: float = 1.0,
                           pixel_scale_y: float = None) -> Tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """NaN-aware gradient computation."""
     nan_mask = cp.isnan(block)
-    if nan_mask.any():
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
+    if bool(nan_mask.any()):
+        if bool((~nan_mask).any()):
+            local_fill, _ = handle_nan_with_gaussian(block, sigma=1.0, mode="nearest")
+            filled = cp.where(nan_mask, local_fill, block)
+        else:
+            filled = cp.zeros_like(block)
     else:
         filled = block
 
@@ -110,19 +114,29 @@ def _resolve_spatial_radii_weights(
     """
     if radii is None:
         auto_radii, auto_weights = auto_spatial_profile(short_side_px)
-        if isinstance(weights, (list, tuple)) and len(weights) == len(auto_radii):
+        if _weight_count_matches(weights, len(auto_radii)):
             user = _clean_normalized_weights(weights)
             if user is not None:
                 return auto_radii, user
         return auto_radii, auto_weights
 
     resolved_radii = _normalize_spatial_radii(radii, pixel_size)
-    if isinstance(weights, (list, tuple)) and len(weights) == len(resolved_radii):
+    if _weight_count_matches(weights, len(resolved_radii)):
         user = _clean_normalized_weights(weights)
         if user is not None:
             return resolved_radii, user
     # Weights omitted or invalid: fall back to the 2**n profile (nearer = heavier).
     return resolved_radii, auto_spatial_weights(len(resolved_radii))
+
+
+def _weight_count_matches(weights, expected: int) -> bool:
+    """Accept normal sequences/arrays while rejecting scalars and strings."""
+    if weights is None or isinstance(weights, (str, bytes)):
+        return False
+    try:
+        return len(weights) == expected
+    except TypeError:
+        return False
 
 
 def _clean_normalized_weights(weights) -> Optional[List[float]]:
@@ -189,13 +203,12 @@ def _combine_multiscale_dask(
     if agg_norm == "sum":
         return da.sum(stacked, axis=0)
 
-    if isinstance(weights, (list, tuple)) and len(weights) == len(responses):
-        w = np.asarray(weights, dtype=np.float32)
-        if np.isfinite(w).all() and w.sum() > 0:
-            w = w / w.sum()
-            out = responses[0] * float(w[0])
+    if _weight_count_matches(weights, len(responses)):
+        clean = _clean_normalized_weights(weights)
+        if clean is not None:
+            out = responses[0] * clean[0]
             for i in range(1, len(responses)):
-                out = out + responses[i] * float(w[i])
+                out = out + responses[i] * clean[i]
             return out
     return da.mean(stacked, axis=0)
 
@@ -350,6 +363,10 @@ def coarse_large_radius_response(
         fac = float(coarse_decimation)
         r_coarse = max(1, int(round(float(radius) / fac)))
         kw = dict(block_kwargs)
+        # A whole-raster coarse response already has global thresholds. Reusing
+        # a full-resolution small-radius stats entry under the rounded coarse
+        # radius can collide (e.g. radius 320 / factor 8 -> key 40).
+        kw.pop("grad_stats_map", None)
         kw[radius_kw] = r_coarse
         kw["pixel_size"] = float(pixel_size) * fac
         if pixel_scale_x is not None:
@@ -388,6 +405,7 @@ def coarse_large_radius_response(
 
     r_coarse = max(1, int(round(float(radius) / float(factor))))
     kw = dict(block_kwargs)
+    kw.pop("grad_stats_map", None)
     kw[radius_kw] = r_coarse
     kw["pixel_size"] = float(pixel_size) * float(factor)
     if pixel_scale_x is not None:
@@ -660,6 +678,9 @@ def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int]) -> cp.n
     nan_mask = cp.isnan(block)
     if not bool(nan_mask.any()):
         out = zoom(block, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
+        pad_h, pad_w = max(0, th - out.shape[0]), max(0, tw - out.shape[1])
+        if pad_h or pad_w:
+            out = cp.pad(out, ((0, pad_h), (0, pad_w)), mode="edge")
         return out[:th, :tw]
     # NaN-aware bilinear upsample: interpolate valid contributors only so the
     # exterior NoData (now preserved as NaN by _downsample_nan_aware) does not
@@ -671,6 +692,9 @@ def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int]) -> cp.n
     den = zoom(valid, zoom=(sy, sx), order=1, mode="nearest")
     out = cp.where(den > cp.float32(1e-3), num / cp.maximum(den, cp.float32(1e-6)),
                    cp.float32(cp.nan)).astype(cp.float32)
+    pad_h, pad_w = max(0, th - out.shape[0]), max(0, tw - out.shape[1])
+    if pad_h or pad_w:
+        out = cp.pad(out, ((0, pad_h), (0, pad_w)), mode="edge")
     return out[:th, :tw]
 
 
@@ -732,11 +756,11 @@ def _hybrid_combine_wrapper(dem, *small_blocks, _scales_order, _small_scales,
         c1 += int(_tile_origin[1])
     if _tile_full_shape is not None:
         _full_h, _full_w = int(_tile_full_shape[0]), int(_tile_full_shape[1])
-    small_map = {int(round(float(s))): b for s, b in zip(_small_scales, small_blocks)}
-    large_map = {int(round(float(s))): cf for s, cf in zip(_large_scales, _large_list)}
+    small_map = {float(s): b for s, b in zip(_small_scales, small_blocks)}
+    large_map = {float(s): cf for s, cf in zip(_large_scales, _large_list)}
     fields = []
     for s in _scales_order:
-        k = int(round(float(s)))
+        k = float(s)
         if k in small_map:
             fields.append(small_map[k])
         else:
@@ -783,10 +807,11 @@ def hybrid_multiscale_response_combine(
     min_chunk = min((min(ax) for ax in gpu_arr.chunks), default=1) if hasattr(gpu_arr, "chunks") else 1
     chunk_cap = max(1, int(min_chunk) - 1)
     large_fields = _resolve_scattered(large_fields)
-    large_keys = {int(round(float(s))) for s in large_fields.keys()}
+    large_fields = {float(scale): value for scale, value in large_fields.items()}
+    large_keys = set(large_fields)
     scales_f = [float(s) for s in scales]
-    small_scales = [s for s in scales_f if int(round(s)) not in large_keys]
-    large_scales = [s for s in scales_f if int(round(s)) in large_keys]
+    small_scales = [s for s in scales_f if s not in large_keys]
+    large_scales = [s for s in scales_f if s in large_keys]
     small_fields = [
         gpu_arr.map_overlap(
             small_block_fn,
@@ -797,7 +822,7 @@ def hybrid_multiscale_response_combine(
             pixel_scale_y=pixel_scale_y, **{radius_kw: s}, **block_kwargs)
         for s in small_scales
     ]
-    large_list = [large_fields[int(round(s))] for s in large_scales]
+    large_list = [large_fields[s] for s in large_scales]
     return da.map_blocks(
         _hybrid_combine_wrapper, gpu_arr, *small_fields,
         dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),
@@ -821,6 +846,7 @@ def read_overview_coarse_dem(src_cog: str, *, sample_max: int = 2048):
         return None, 1.0
     try:
         with rasterio.open(src_cog) as src:
+            source_width, source_height = int(src.width), int(src.height)
             scale = max(src.width / sample_max, src.height / sample_max, 1.0)
             # Derive both axes from the SAME scale (no per-axis floor): a floor
             # on one axis would make the actual decimation anisotropic on very
@@ -837,7 +863,10 @@ def read_overview_coarse_dem(src_cog: str, *, sample_max: int = 2048):
             sample = np.where(
                 np.isclose(sample, float(nodata), rtol=0.0, atol=1e-6),
                 np.nan, sample).astype(np.float32, copy=False)
-        return cp.asarray(sample, dtype=cp.float32), float(scale)
+        actual_decimation = 0.5 * (
+            source_width / float(sw) + source_height / float(sh)
+        )
+        return cp.asarray(sample, dtype=cp.float32), float(actual_decimation)
     except Exception:
         return None, 1.0
 

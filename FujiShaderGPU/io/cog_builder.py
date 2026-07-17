@@ -62,7 +62,8 @@ def _gdal_cachemax_mb() -> int:
 
 
 def _detect_nodata_from_tiles(tile_files: List[str]) -> Optional[float]:
-    """Detect nodata value from first readable tile band."""
+    """Return the common tile NoData value, rejecting inconsistent mosaics."""
+    detected = []
     for path in tile_files:
         ds = gdal.Open(path, gdal.GA_ReadOnly)
         if ds is None:
@@ -70,9 +71,22 @@ def _detect_nodata_from_tiles(tile_files: List[str]) -> Optional[float]:
         band = ds.GetRasterBand(1)
         nodata = band.GetNoDataValue() if band is not None else None
         ds = None
-        if nodata is not None:
-            return float(nodata)
-    return None
+        detected.append((path, None if nodata is None else float(nodata)))
+    if not detected:
+        return None
+
+    expected = detected[0][1]
+    for path, value in detected[1:]:
+        both_nan = (
+            expected is not None and value is not None
+            and expected != expected and value != value
+        )
+        if not both_nan and value != expected:
+            raise ValueError(
+                f"Tile NoData mismatch: {detected[0][0]} has {expected!r}, "
+                f"but {path} has {value!r}"
+            )
+    return expected
 
 
 def _create_vrt_command_line_ultra(
@@ -92,6 +106,7 @@ def _create_vrt_command_line_ultra(
 
         cmd = [
             "gdalbuildvrt",
+            "-allow_projection_difference",
             "-resolution",
             "highest",
             "-r",
@@ -205,32 +220,23 @@ def _assert_has_overviews(tiff_path: str) -> None:
 
 
 def _ensure_output_nodata(path: str, nodata: Optional[float]) -> None:
-    """Ensure output file carries nodata metadata when nodata is known."""
+    """Validate inherited NoData metadata without modifying COG layout in place."""
     if nodata is None:
         return
 
     # Fast path: already set, do nothing.
     ds_ro = gdal.OpenEx(path, gdal.OF_RASTER | gdal.OF_READONLY)
     if ds_ro is None:
-        return
+        raise ValueError(f"Cannot open output to validate NoData: {path}")
     band_ro = ds_ro.GetRasterBand(1)
     current = band_ro.GetNoDataValue() if band_ro is not None else None
     ds_ro = None
-    if current is not None:
+    both_nan = current is not None and current != current and nodata != nodata
+    if both_nan or current == float(nodata):
         return
-
-    # Only update when nodata is actually missing.
-    ds = gdal.OpenEx(
-        path,
-        gdal.OF_RASTER | gdal.OF_UPDATE,
-        open_options=["IGNORE_COG_LAYOUT_BREAK=YES"],
+    raise ValueError(
+        f"Output NoData metadata mismatch for {path}: expected {nodata!r}, got {current!r}"
     )
-    if ds is None:
-        return
-    band = ds.GetRasterBand(1)
-    if band is not None:
-        band.SetNoDataValue(float(nodata))
-    ds = None
 
 
 def _create_vrt_ultra_fast(
@@ -592,6 +598,7 @@ def _create_vrt_and_cog_external_cli_impl(
     try:
         cmd_vrt = [
             gdalbuildvrt,
+            "-allow_projection_difference",
             "-input_file_list",
             file_list_path,
             "-resolution",

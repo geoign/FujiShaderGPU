@@ -55,6 +55,29 @@ def metric_pixel_scales_from_metadata(
     abs_x = abs(sx)
     abs_y = abs(sy)
 
+    if crs is None:
+        if hasattr(bounds, "left"):
+            left, bottom, right, top = (
+                float(bounds.left), float(bounds.bottom),
+                float(bounds.right), float(bounds.top),
+            )
+        else:
+            left, bottom, right, top = map(float, bounds)
+        plausible_lonlat_extent = (
+            -180.0 <= left <= 180.0 and -180.0 <= right <= 180.0
+            and -90.0 <= bottom <= 90.0 and -90.0 <= top <= 90.0
+        )
+        plausible_degree_pixels = 0.0 < abs_x <= 1.0 and 0.0 < abs_y <= 1.0
+        if plausible_lonlat_extent and plausible_degree_pixels:
+            raise ValueError(
+                "Raster has no CRS and its extent/pixel size look geographic; "
+                "cannot safely interpret degree-sized pixels as meters. Assign a CRS first."
+            )
+        logger.warning(
+            "Raster has no CRS; treating coordinate units as meters because the "
+            "metadata does not look like longitude/latitude."
+        )
+
     if crs and getattr(crs, "is_geographic", False):
         # bounds may be a rasterio BoundingBox (.bottom/.top) or a plain
         # (left, bottom, right, top) tuple, which rioxarray's .rio.bounds()
@@ -92,6 +115,7 @@ def detect_pixel_size_from_cog(input_cog_path: str) -> float:
                 logger.info("Projected CRS: %.3fm x %.3fm", abs(scale_x), abs(scale_y))
             logger.info("Auto pixel size: %.3fm", pixel_size)
             return float(pixel_size)
-    except Exception as e:
-        logger.warning("Pixel size detection error: %s", e)
-        return 0.5
+    except Exception as exc:
+        raise ValueError(
+            f"Could not determine a safe metric pixel size for {input_cog_path}: {exc}"
+        ) from exc

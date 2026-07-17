@@ -60,6 +60,7 @@ FILL_MODES = ("none", "enclosed", "all")
 # load-balance uneven strips (ocean compresses fast, terrain is heavy) instead
 # of stranding fast workers while a few heavy strips finish the tail.
 STRIPS_PER_WORKER = 6
+_STRIP_WORKER_CONTEXT = None
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +110,7 @@ def _fill_coarse_surface(coarse: np.ndarray, valid: np.ndarray) -> np.ndarray:
             pass
         return surface
     except Exception as exc:
-        logger.info("GPU push-pull fill unavailable (%s); using CPU fallback.", exc)
+        logger.warning("GPU push-pull fill unavailable (%s); using CPU fallback.", exc)
 
     # CPU fallback: identical push-pull via NumPy + SciPy.
     from scipy.ndimage import zoom as sp_zoom
@@ -130,6 +131,7 @@ def _nan_aware_coarse_average(
     *,
     oversample: int = 4,
     max_intermediate: int = 4096,
+    sample_ma=None,
 ) -> tuple:
     """Build the coarse fill grid by averaging *valid cells only*.
 
@@ -146,14 +148,20 @@ def _nan_aware_coarse_average(
     only a fully-NoData cell becomes a void.  Returns ``(coarse, cmask)`` where
     ``cmask`` is the NoData (void) mask.
     """
-    k = max(1, int(oversample))
-    while k > 1 and max(ch * k, cw * k) > int(max_intermediate):
+    # At least 2x2 source samples per coarse cell are required for an actual
+    # NaN-aware average; k=1 degenerates to one nearest-neighbour point.
+    k = max(2, int(oversample))
+    while k > 2 and max(ch * k, cw * k) > int(max_intermediate):
         k -= 1
     ih, iw = ch * k, cw * k
-    ma = src.read(
-        1, out_shape=(ih, iw), resampling=Resampling.nearest,
-        out_dtype=np.float32, masked=True,
-    )
+    ma = sample_ma
+    if ma is None:
+        ma = src.read(
+            1, out_shape=(ih, iw), resampling=Resampling.nearest,
+            out_dtype=np.float32, masked=True,
+        )
+    elif tuple(ma.shape) != (ih, iw):
+        raise ValueError(f"Coarse sample shape {ma.shape} does not match {(ih, iw)}")
     a = np.ma.getdata(ma).astype(np.float32, copy=False)
     m = np.ma.getmaskarray(ma) | ~np.isfinite(a)
     if src_nodata is not None and np.isfinite(src_nodata):
@@ -161,9 +169,6 @@ def _nan_aware_coarse_average(
     for v in extra_nodata:
         if np.isfinite(v):
             m = m | (a == np.float32(v))
-    if k == 1:
-        coarse = np.where(m, np.float32(0.0), a).astype(np.float32)
-        return coarse, m
     a = np.where(m, np.nan, a).reshape(ch, k, cw, k)
     finite = np.isfinite(a)
     cnt = finite.sum(axis=(1, 3))
@@ -276,7 +281,7 @@ def _band_height(width: int, target_pixels: int = 16_000_000) -> int:
     few hundred MB regardless of raster width.
     """
     rows = int(target_pixels // max(1, width))
-    return int(max(64, min(4096, rows)))
+    return int(max(1, min(4096, rows)))
 
 
 # ---------------------------------------------------------------------------
@@ -517,11 +522,19 @@ def preprocess_dem_to_cog(
         if nodata_override is not None and np.isfinite(nodata_override):
             extra_nodata.append(float(nodata_override))
             logger.info("NoData override: %s -> NaN", float(nodata_override))
+        coarse_oversample = 4
+        while coarse_oversample > 2 and max(
+            ch * coarse_oversample, cw * coarse_oversample,
+        ) > 4096:
+            coarse_oversample -= 1
+        nn_ma = src.read(
+            1,
+            out_shape=(ch * coarse_oversample, cw * coarse_oversample),
+            resampling=Resampling.nearest,
+            out_dtype=np.float32,
+            masked=True,
+        )
         if detect_nodata:
-            nn_ma = src.read(
-                1, out_shape=(ch, cw), resampling=Resampling.nearest,
-                out_dtype=np.float32, masked=True,
-            )
             nn = np.ma.getdata(nn_ma).astype(np.float32, copy=False)
             nn_valid = (~np.ma.getmaskarray(nn_ma)) & np.isfinite(nn)
             # Rule 2: a dominant sentinel/extreme across the whole grid; Rule 3: a
@@ -554,6 +567,7 @@ def preprocess_dem_to_cog(
         # ~800 between 0 and 5000, and breaks downstream normalization).
         coarse, cmask = _nan_aware_coarse_average(
             src, ch, cw, src_nodata, extra_nodata,
+            oversample=coarse_oversample, sample_ma=nn_ma,
         )
         cvalid = (~cmask) & np.isfinite(coarse)
         has_holes = bool((~cvalid).any())
@@ -719,10 +733,17 @@ def _sample_coarse(
     """
     from scipy.ndimage import map_coordinates
 
-    rr = (row_off + np.arange(band_h, dtype=np.float64) + 0.5) * (ch / height) - 0.5
-    cc = (np.arange(width, dtype=np.float64) + 0.5) * (cw / width) - 0.5
-    grid_r, grid_c = np.meshgrid(rr, cc, indexing="ij")
-    coords = np.stack([grid_r, grid_c], axis=0)
+    rr = (
+        (row_off + np.arange(band_h, dtype=np.float32) + np.float32(0.5))
+        * np.float32(ch / height) - np.float32(0.5)
+    )
+    cc = (
+        (np.arange(width, dtype=np.float32) + np.float32(0.5))
+        * np.float32(cw / width) - np.float32(0.5)
+    )
+    coords = np.empty((2, band_h, width), dtype=np.float32)
+    coords[0] = rr[:, None]
+    coords[1] = cc[None, :]
 
     fill_vals = map_coordinates(
         surface, coords, order=1, mode="nearest", output=np.float32
@@ -759,7 +780,7 @@ def _apply_band_fill(
     the *global* grid, so the coarse fill is sampled at the same positions in both
     paths and across strip boundaries (seamless).
     """
-    arr = np.ma.getdata(band_ma).astype(np.float32, copy=True)
+    arr = np.array(np.ma.getdata(band_ma), dtype=np.float32, copy=True)
     wmask = np.ma.getmaskarray(band_ma) | ~np.isfinite(arr)
     for v in extra_nodata:
         wmask = wmask | (arr == np.float32(v))
@@ -767,7 +788,7 @@ def _apply_band_fill(
     # -9999) are handled identically to declared NoData regardless of fill mode
     # (the fill step below then overwrites only the cells it is meant to fill).
     if wmask.any():
-        arr = np.where(wmask, np.float32(np.nan), arr).astype(np.float32)
+        arr[wmask] = np.float32(np.nan)
 
     if do_fill and wmask.any():
         # Sample the global coarse surface at this band's pixel centres
@@ -779,15 +800,19 @@ def _apply_band_fill(
             fill_here = wmask & ~ext
         else:  # all
             fill_here = wmask
-        arr = np.where(fill_here, fill_vals, arr).astype(np.float32)
+        arr[fill_here] = fill_vals[fill_here]
 
     if out_nodata is None:
-        # 'all' mode must be fully dense; replace any residual NaN.
+        # 'all' mode promises a fully dense output. A residual non-finite value
+        # indicates a fill failure and must not silently become an elevation 0.
         if not np.isfinite(arr).all():
-            arr = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
+            remaining = int(np.count_nonzero(~np.isfinite(arr)))
+            raise RuntimeError(
+                f"fill_mode='all' left {remaining} non-finite pixels in band at row {row_off}"
+            )
     else:
         # Remaining masked cells become the NaN nodata sentinel.
-        arr = np.where(np.isfinite(arr), arr, np.float32(np.nan))
+        arr[~np.isfinite(arr)] = np.float32(np.nan)
     return arr
 
 
@@ -843,6 +868,13 @@ def _stream_fill_serial(
         safe_unlink(tmp_tiff)
 
 
+def _init_strip_worker(context: dict) -> None:
+    """Install immutable shared strip inputs once per spawned worker."""
+    global _STRIP_WORKER_CONTEXT
+    _STRIP_WORKER_CONTEXT = context
+    gdal.SetCacheMax(int(context["gdal_cachemax_mb"]) * 1024 * 1024)
+
+
 def _process_strip(task: tuple) -> str:
     """Worker process: fill one horizontal strip into its own GeoTIFF.
 
@@ -850,19 +882,29 @@ def _process_strip(task: tuple) -> str:
     writes a standalone strip; the parent mosaics the strips via a VRT.  Returns
     the strip path.
     """
-    (in_path, strip_path, strip_start, strip_h, width, height, band_rows,
-     ch, cw, surface, exterior_coarse, extra_nodata, do_fill, fill_mode,
-     out_nodata, strip_profile, gdal_cachemax_mb) = task
+    strip_path, strip_start, strip_h = task
+    if _STRIP_WORKER_CONTEXT is None:
+        raise RuntimeError("Strip worker was not initialized")
+    context = _STRIP_WORKER_CONTEXT
+    in_path = context["in_path"]
+    width = context["width"]
+    height = context["height"]
+    band_rows = context["band_rows"]
+    ch = context["ch"]
+    cw = context["cw"]
+    surface = context["surface"]
+    exterior_coarse = context["exterior_coarse"]
+    extra_nodata = context["extra_nodata"]
+    do_fill = context["do_fill"]
+    fill_mode = context["fill_mode"]
+    out_nodata = context["out_nodata"]
+    strip_profile = context["strip_profile"]
 
     profile = dict(strip_profile)
     profile["height"] = strip_h
     profile["transform"] = rio_window_transform(
         Window(0, strip_start, width, strip_h), strip_profile["transform"],
     )
-    # Bound this worker's GDAL block cache (process-wide; SetCacheMax takes
-    # effect immediately, unlike the GDAL_CACHEMAX config option which is only
-    # read when the cache is first created).  Keeps N workers within the cgroup.
-    gdal.SetCacheMax(int(gdal_cachemax_mb) * 1024 * 1024)
     with rasterio.open(in_path) as src, \
             rasterio.open(strip_path, "w", **profile) as dst:
         for r in range(strip_start, strip_start + strip_h, band_rows):
@@ -932,12 +974,25 @@ def _stream_fill_parallel(
         fd, sp = tempfile.mkstemp(suffix=f".strip{si:04d}.tif", dir=str(tmp_parent))
         os.close(fd)
         strip_paths.append(Path(sp))
-        tasks.append((
-            str(in_path), sp, strip_start, strip_h, width, height, band_rows,
-            ch, cw, surface, exterior_coarse, extra_nodata, do_fill, fill_mode,
-            out_nodata, strip_profile, gdal_cachemax_mb,
-        ))
+        tasks.append((sp, strip_start, strip_h))
         si += 1
+
+    worker_context = {
+        "in_path": str(in_path),
+        "width": width,
+        "height": height,
+        "band_rows": band_rows,
+        "ch": ch,
+        "cw": cw,
+        "surface": surface,
+        "exterior_coarse": exterior_coarse,
+        "extra_nodata": extra_nodata,
+        "do_fill": do_fill,
+        "fill_mode": fill_mode,
+        "out_nodata": out_nodata,
+        "strip_profile": strip_profile,
+        "gdal_cachemax_mb": gdal_cachemax_mb,
+    }
 
     vrt_path: Optional[Path] = None
     try:
@@ -955,7 +1010,12 @@ def _stream_fill_parallel(
             _ctx = mp.get_context("spawn")
         except ValueError:  # pragma: no cover - platform without spawn
             _ctx = None
-        with ProcessPoolExecutor(max_workers=n_workers, mp_context=_ctx) as ex:
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=_ctx,
+            initializer=_init_strip_worker,
+            initargs=(worker_context,),
+        ) as ex:
             futures = [ex.submit(_process_strip, t) for t in tasks]
             for fut in as_completed(futures):
                 fut.result()  # re-raise any worker exception

@@ -6,6 +6,18 @@ import cupy as cp
 from cupyx.scipy.ndimage import gaussian_filter
 
 
+def _locally_filled(block: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
+    if not bool(nan_mask.any()):
+        return block
+    if not bool((~nan_mask).any()):
+        return cp.zeros_like(block)
+    valid = (~nan_mask).astype(cp.float32)
+    values = gaussian_filter(cp.where(nan_mask, 0.0, block), sigma=1.0, mode="nearest")
+    weights = gaussian_filter(valid, sigma=1.0, mode="nearest")
+    local = values / cp.maximum(weights, cp.float32(1e-6))
+    return cp.where(nan_mask, local, block)
+
+
 def scale_space_surprise(
     block: cp.ndarray,
     *,
@@ -23,7 +35,7 @@ def scale_space_surprise(
     """
     if nan_mask is None:
         nan_mask = cp.isnan(block)
-    work = cp.where(nan_mask, cp.nanmean(block), block) if nan_mask.any() else block
+    work = _locally_filled(block, nan_mask)
 
     scale_list = [float(s) for s in scales]
     weight_list = None
@@ -89,7 +101,10 @@ def multi_light_uncertainty(
     """Multi-light uncertainty shading kernel on a single CuPy block."""
     if nan_mask is None:
         nan_mask = cp.isnan(block)
-    work = cp.where(nan_mask, cp.nanmean(block), block) if nan_mask.any() else block
+    azimuths = list(azimuths)
+    if not azimuths:
+        raise ValueError("azimuths must contain at least one light direction")
+    work = _locally_filled(block, nan_mask)
 
     step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
     step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
@@ -123,4 +138,3 @@ def multi_light_uncertainty(
     if nan_mask.any():
         shaded[nan_mask] = cp.nan
     return shaded.astype(cp.float32)
-

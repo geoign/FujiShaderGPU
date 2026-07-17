@@ -1,17 +1,19 @@
 """
 FujiShaderGPU/algorithms/tile_shared.py
-Shared foundation for tile-based processing (Windows/macOS).
+Minimal abstract interface for native tile algorithms.
 
-NOTE: most algorithms use the dask_shared.py classes from the tile
-path via tile/dask_bridge.py.
-This file keeps only the tile-specific TileAlgorithm base class and the
-lightweight algorithms that delegate directly to shared kernels.
+Concrete classes live under ``algorithms.tile``. Most are lightweight adapters
+around the canonical Dask implementations; importing this base module must not
+pull that entire dependency graph into callers that only need the interface.
 """
-import cupy as cp
 from abc import ABC, abstractmethod
-from typing import Dict, Any
-from .tile.scale_space_surprise import ScaleSpaceSurpriseAlgorithm
-from .tile.multi_light_uncertainty import MultiLightUncertaintyAlgorithm
+from typing import TYPE_CHECKING, Any, Dict
+
+import cupy as cp
+
+if TYPE_CHECKING:
+    from .tile.multi_light_uncertainty import MultiLightUncertaintyAlgorithm
+    from .tile.scale_space_surprise import ScaleSpaceSurpriseAlgorithm
 
 
 class TileAlgorithm(ABC):
@@ -40,6 +42,19 @@ class TileAlgorithm(ABC):
             Processing result (on GPU)
         """
         pass
+
+
+def __getattr__(name):
+    """Load legacy concrete re-exports only when explicitly requested."""
+    if name == "ScaleSpaceSurpriseAlgorithm":
+        from .tile.scale_space_surprise import ScaleSpaceSurpriseAlgorithm
+
+        return ScaleSpaceSurpriseAlgorithm
+    if name == "MultiLightUncertaintyAlgorithm":
+        from .tile.multi_light_uncertainty import MultiLightUncertaintyAlgorithm
+
+        return MultiLightUncertaintyAlgorithm
+    raise AttributeError(name)
 
 
 __all__ = [

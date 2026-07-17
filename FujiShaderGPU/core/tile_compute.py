@@ -6,6 +6,39 @@ from typing import Dict, Any, Iterable, Optional, Tuple, List
 import cupy as cp
 
 
+def deduplicate_radii_weights(
+    radii: Iterable[int], weights: Optional[Iterable[float]],
+) -> Tuple[List[int], Optional[List[float]]]:
+    """Preserve radius order and sum weights belonging to duplicate radii."""
+    radii_list = list(radii)
+    order: List[int] = []
+    positions: Dict[int, int] = {}
+    for radius in radii_list:
+        if radius not in positions:
+            positions[radius] = len(order)
+            order.append(radius)
+
+    if weights is None:
+        return order, None
+    weights_list = list(weights)
+    if len(weights_list) != len(radii_list):
+        return order, None
+
+    aggregated = [0.0] * len(order)
+    for radius, value in zip(radii_list, weights_list):
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            weight = 0.0
+        if not math.isfinite(weight) or weight <= 0:
+            weight = 0.0
+        aggregated[positions[radius]] += weight
+    total = sum(aggregated)
+    if total <= 0:
+        return order, None
+    return order, [weight / total for weight in aggregated]
+
+
 def _normalize_topousm_fast_radii_and_weights(
     target_distances,
     weights,
@@ -53,34 +86,8 @@ def _normalize_topousm_fast_radii_and_weights(
     if not resolved:
         return None, None
 
-    # Deduplicate while preserving first appearance order.
-    deduped_radii = list(dict.fromkeys(resolved))
-
     weights_raw = manual_weights if manual_weights is not None else weights
-    if weights_raw is None:
-        return deduped_radii, None
-
-    cleaned_weights: List[float] = []
-    for value in weights_raw:
-        try:
-            w = float(value)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(w) and w > 0:
-            cleaned_weights.append(w)
-        else:
-            cleaned_weights.append(0.0)
-
-    # If lengths differ (often after radius dedupe), let algorithm use uniform weights.
-    if len(cleaned_weights) != len(deduped_radii):
-        return deduped_radii, None
-
-    total = sum(cleaned_weights)
-    if total <= 0:
-        return deduped_radii, None
-
-    normalized_weights = [w / total for w in cleaned_weights]
-    return deduped_radii, normalized_weights
+    return deduplicate_radii_weights(resolved, weights_raw)
 
 
 def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma: float,

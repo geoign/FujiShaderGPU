@@ -97,7 +97,16 @@ def compute_frangi_block(block, *, radii=None, weights=None, beta=0.5,
     if not radii:
         radii = [2, 4, 8, 16]
     short = max(8, min(int(block.shape[0]), int(block.shape[1])))
-    rs = sorted({max(1, min(int(round(float(r))), short // 4)) for r in radii})
+    raw_radii = list(radii)
+    raw_weights = list(weights) if weights is not None else None
+    weighted = raw_weights is not None and len(raw_weights) == len(raw_radii)
+    merged_weights = {}
+    for index, radius in enumerate(raw_radii):
+        clamped = max(1, min(int(round(float(radius))), short // 4))
+        merged_weights[clamped] = merged_weights.get(clamped, 0.0) + (
+            float(raw_weights[index]) if weighted else 1.0
+        )
+    rs = sorted(merged_weights)
 
     if not normalize:
         s_max = cp.zeros(block.shape, dtype=cp.float32)
@@ -115,10 +124,7 @@ def compute_frangi_block(block, *, radii=None, weights=None, beta=0.5,
             block, radii=rs, normalize=False)
         c = frangi_c_stat_func(pooled)[1]
 
-    ws = None
-    if weights is not None and len(list(weights)) == len(list(radii)) \
-            and len(rs) == len(list(radii)):
-        ws = [float(w) for w in weights]
+    ws = [merged_weights[radius] for radius in rs] if weighted else None
     agg_norm = str(agg or 'mean').lower()
     acc = None
     wsum = 0.0

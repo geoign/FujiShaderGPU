@@ -36,6 +36,12 @@ try:
     from .tile.fractal_anomaly import FractalAnomalyAlgorithm  # noqa: F401
     from .tile.scale_space_surprise import ScaleSpaceSurpriseAlgorithm  # noqa: F401
     from .tile.multi_light_uncertainty import MultiLightUncertaintyAlgorithm  # noqa: F401
+    from .tile.structure_tensor import StructureTensorAlgorithm  # noqa: F401
+    from .tile.frangi import FrangiAlgorithm  # noqa: F401
+    from .tile.lic import LICAlgorithm  # noqa: F401
+    from .tile.phase_congruency import PhaseCongruencyAlgorithm  # noqa: F401
+    from .tile.tv_decomposition import TVDecompositionAlgorithm  # noqa: F401
+    from .tile.scale_drift import ScaleDriftAlgorithm  # noqa: F401
 
     __all__.extend([
         "TileAlgorithm",
@@ -54,6 +60,12 @@ try:
         "FractalAnomalyAlgorithm",
         "ScaleSpaceSurpriseAlgorithm",
         "MultiLightUncertaintyAlgorithm",
+        "StructureTensorAlgorithm",
+        "FrangiAlgorithm",
+        "LICAlgorithm",
+        "PhaseCongruencyAlgorithm",
+        "TVDecompositionAlgorithm",
+        "ScaleDriftAlgorithm",
     ])
 except Exception as exc:
     logger.warning("FujiShaderGPU: tile algorithm classes unavailable: %s", exc)

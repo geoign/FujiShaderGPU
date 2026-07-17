@@ -31,15 +31,20 @@ def get_gpu_config(
 
     gpu_name = sys_config.get("gpu_name", "").upper()
     vram_gb = float(sys_config.get("vram_gb", 0.0))
-    gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
-    logger.info("GPU auto-detected: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
+    if sys_config.get("gpu_detected"):
+        gpu_type = _gpu_config_manager.detect_gpu_type(vram_gb, gpu_name)
+        logger.info("GPU auto-detected: %s (%.1fGB) -> %s", gpu_name, vram_gb, gpu_type)
+        tuning_vram_gb = vram_gb
+    else:
+        gpu_type = "no_gpu"
+        tuning_vram_gb = 8.0
+        logger.warning("No CUDA GPU detected; using conservative 8GB sizing metadata.")
 
-    # Dynamic parameter computation from VRAM
-    vram_gb = float(sys_config.get("vram_gb", 8.0))
+    # Dynamic parameter computation from the single detection result.
     cpu_count = int(sys_config.get("cpu_count", 4))
     is_colab_env = bool(sys_config.get("is_colab", False))
     tuned = auto_tune(
-        vram_gb,
+        tuning_vram_gb,
         algorithm=algorithm,
         cpu_count=cpu_count,
         is_colab=is_colab_env,
@@ -62,10 +67,14 @@ def get_gpu_config(
         "tile_size": tuned["tile_size"],
         "max_workers": tuned["max_workers"],
         "padding": calculated_padding,
-        "vram_monitor": vram_gb < 40,
+        "vram_monitor": tuning_vram_gb < 40,
         "batch_size": tuned["batch_size"],
         "prefetch_tiles": tuned["prefetch_tiles"],
-        "description": f"{gpu_type.upper()} dynamic optimization (VRAM {vram_gb:.0f}GB)",
+        "description": (
+            f"{gpu_type.upper()} dynamic optimization (VRAM {vram_gb:.0f}GB)"
+            if sys_config.get("gpu_detected")
+            else "NO_GPU conservative sizing metadata"
+        ),
         "system_info": sys_config,
     }
 
@@ -145,8 +154,4 @@ def check_gdal_environment():
 
     logger.info("QGIS optimization: 512x512 blocks / multi-level overviews / AVERAGE resampling / ZSTD compression")
 
-    sys_config = detect_optimal_system_config()
-    logger.info(
-        "Platform: %s, GPU detected: %s",
-        sys_config['platform'], sys_config['gpu_detected'],
-    )
+    logger.info("Hardware detection is deferred until processing configuration is requested.")

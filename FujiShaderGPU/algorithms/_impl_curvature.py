@@ -12,7 +12,7 @@ from ._nan_utils import (
     restore_nan,
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
     large_radius_threshold, multiscale_response_fields,
-    _smooth_for_radius,
+    _smooth_for_radius, handle_nan_for_gradient,
 )
 
 
@@ -20,17 +20,15 @@ def compute_curvature_block(block, *, curvature_type='mean', pixel_size=1.0,
                           pixel_scale_x=None, pixel_scale_y=None):
     """Curvature computation (mean, Gaussian, plan, and profile curvature)."""
     nan_mask = cp.isnan(block)
-    if nan_mask.any():
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
-    else:
-        filled = block
     step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
     step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
     if abs(step_y) < 1e-9:
         step_y = float(pixel_size if pixel_size else 1.0)
     if abs(step_x) < 1e-9:
         step_x = float(pixel_size if pixel_size else 1.0)
-    dy, dx = cp.gradient(filled, step_y, step_x, edge_order=2)
+    dy, dx, _ = handle_nan_for_gradient(
+        block, pixel_scale_x=step_x, pixel_scale_y=step_y,
+    )
     dyy, dyx = cp.gradient(dy, step_y, step_x, edge_order=2)
     dxy, dxx = cp.gradient(dx, step_y, step_x, edge_order=2)
     if curvature_type == 'mean':

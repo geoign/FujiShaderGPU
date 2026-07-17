@@ -71,7 +71,11 @@ def pushpull_fill(coarse, valid, *, xp, zoom):
         th, tw = vws[lvl].shape[:2]
         fh, fw = filled.shape[:2]
         up = zoom(filled, zoom=(th / float(fh), tw / float(fw)),
-                  order=1, mode="nearest")[:th, :tw]
+                  order=1, mode="nearest")
+        pad_h, pad_w = max(0, th - up.shape[0]), max(0, tw - up.shape[1])
+        if pad_h or pad_w:
+            up = xp.pad(up, ((0, pad_h), (0, pad_w)), mode="edge")
+        up = up[:th, :tw]
         wl = ws[lvl]
         vl = xp.where(wl > eps, vws[lvl] / xp.maximum(wl, eps), f32(0.0))
         filled = xp.where(wl > eps, vl, up).astype(f32)

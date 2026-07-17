@@ -18,8 +18,11 @@ class GPUConfigManager:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super().__new__(cls)
-            cls._instance._load_config()
         return cls._instance
+
+    def _ensure_config(self):
+        if self._config is None:
+            self._load_config()
     
     def _load_config(self):
         """Load settings from the YAML file."""
@@ -29,6 +32,7 @@ class GPUConfigManager:
     
     def detect_gpu_type(self, vram_gb: float, gpu_name: str = "") -> str:
         """Determine the GPU type."""
+        self._ensure_config()
         gpu_name_upper = gpu_name.upper()
         
         # Decide by name (preferred)
@@ -59,6 +63,7 @@ class GPUConfigManager:
     
     def _find_closest_gpu_by_vram(self, vram_gb: float) -> str:
         """Find the GPU config with the closest VRAM size."""
+        self._ensure_config()
         closest_gpu = "t4"  # default
         min_diff = float('inf')
         

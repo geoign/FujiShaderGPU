@@ -280,7 +280,7 @@ def _compute_npr_grad_stats(
     grid: int = 3,
     max_tile: int = 4096,
     min_valid_frac: float = 0.02,
-    small_radius_max: float = 600.0,
+    small_radius_max: float = 256.0,
 ) -> Optional[dict]:
     """Per-radius GLOBAL gradient (base, range, mean) for npr_edges, from full-res
     stratified tiles.  npr's edge threshold is otherwise computed per block, which

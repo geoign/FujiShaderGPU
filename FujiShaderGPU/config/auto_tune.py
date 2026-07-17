@@ -11,6 +11,10 @@ from typing import Dict, Any, List
 
 logger = logging.getLogger(__name__)
 
+# Shared per-pixel VRAM model used by both worker-count and tile-fit estimates.
+BYTES_PER_FLOAT_PIXEL = 4.0
+VRAM_OVERHEAD_MULTIPLIER = 15.0
+
 # ---------------------------------------------------------------------------
 # Algorithm complexity map (single source of truth)
 # Higher = more VRAM per pixel, more compute.  1.0 = baseline.
@@ -168,8 +172,8 @@ def compute_max_workers(
     complexity = ALGORITHM_COMPLEXITY.get(algorithm, 1.0)
 
     # VRAM constraint: estimated peak per-tile VRAM consumption
-    overhead = 15.0 * complexity
-    gb_per_tile = (effective_span ** 2 * 4.0 * overhead) / (1024 ** 3)
+    overhead = VRAM_OVERHEAD_MULTIPLIER * complexity
+    gb_per_tile = (effective_span ** 2 * BYTES_PER_FLOAT_PIXEL * overhead) / (1024 ** 3)
     usable_vram = vram * 0.70
     vram_workers = max(1, int(usable_vram / max(gb_per_tile, 0.001)))
 

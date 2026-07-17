@@ -25,8 +25,6 @@ from typing import List, Tuple, Optional
 from osgeo import gdal
 import cupy as cp
 import dask.array as da
-from dask.callbacks import Callback
-from dask.diagnostics import ProgressBar
 from dask.distributed import progress
 from distributed import get_client
 import xarray as xr
@@ -339,6 +337,21 @@ def _build_zstd_overviews(path: Path, cog_options: dict):
             gdal.SetConfigOption(key, value)
 
 
+def _materialize_dataarray(data: xr.DataArray, show_progress: bool) -> xr.DataArray:
+    """Compute once through the distributed scheduler and preserve xarray metadata."""
+    future = get_client().compute(data.data)
+    if show_progress:
+        logger.info("Computing result chunks...")
+        progress(future, interval="1s")
+    computed_da = xr.DataArray(
+        future.result(), dims=data.dims, coords=data.coords, attrs=data.attrs, name=data.name,
+    )
+    if hasattr(data, "rio") and data.rio.crs is not None:
+        computed_da.rio.write_crs(data.rio.crs, inplace=True)
+    computed_da.rio.write_nodata(output_nodata_for_dtype(computed_da.dtype), inplace=True)
+    return computed_da
+
+
 def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """Save a DataArray directly as a COG (with progress display)."""
     major, minor = check_gdal_version()
@@ -350,48 +363,14 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
     if not hasattr(data, 'rio') or data.rio.crs is None:
         logger.warning("No CRS found in data. Output may not have proper georeferencing.")
     
+    # Compute failures (OOM, worker loss, bad graph) are deterministic and must
+    # propagate. Only a subsequent GDAL/COG write failure is eligible for fallback.
+    computed_da = _materialize_dataarray(data, show_progress)
+
     if use_cog_driver:
         try:
             logger.info(f"Using COG driver (GDAL {major}.{minor}) with dtype={dtype_str}")
             with rasterio.Env(GDAL_CACHEMAX=512):
-                if show_progress:
-                    # More detailed progress display
-                    logger.info("Computing result chunks...")
-                    # Progress display using tqdm
-                    class TqdmCallback(Callback):
-                        def __init__(self):
-                            self.tqdm = None
-                            
-                        def _start(self, dsk):
-                            self.tqdm = tqdm(total=len(dsk), desc='Computing', unit='tasks')
-                            
-                        def _posttask(self, key, result, dsk, _state, _worker_id):
-                            self.tqdm.update(1)
-                            
-                        def _finish(self, dsk, _state, _failed):
-                            self.tqdm.close()
-                    
-                    with TqdmCallback():
-                        computed_data = data.compute()
-                else:
-                    computed_data = data.compute()
-                
-                # Wrap the computed data back into xarray
-                computed_da = xr.DataArray(
-                    computed_data,
-                    dims=data.dims,
-                    coords=data.coords,
-                    attrs=data.attrs,
-                    name=data.name
-                )
-                
-                # Carry over CRS information
-                if hasattr(data, 'rio') and data.rio.crs is not None:
-                    computed_da.rio.write_crs(data.rio.crs, inplace=True)
-                # Set NoData explicitly on the output (prevents a black border): 0 for integer output, NaN for float.
-                _nd = output_nodata_for_dtype(computed_da.dtype)
-                computed_da.rio.write_nodata(_nd, inplace=True)
-
                 # Write the COG
                 logger.info("Writing to COG...")
                 computed_da.rio.to_raster(
@@ -406,10 +385,10 @@ def _write_cog_da_original(data: xr.DataArray, dst: Path, show_progress: bool = 
             
         except Exception as e:
             logger.warning(f"COG driver failed: {e}, falling back to gdal_translate")
-            _fallback_cog_write(data, dst, cog_options)
+            _fallback_cog_write(computed_da, dst, cog_options)
     else:
         logger.warning(f"GDAL {major}.{minor} < 3.8, using fallback method")
-        _fallback_cog_write(data, dst, cog_options)
+        _fallback_cog_write(computed_da, dst, cog_options)
 
 def _write_cog_da_chunked_impl(data: xr.DataArray, dst: Path, show_progress: bool = True):
     """Chunked write implementation for large datasets."""
@@ -669,7 +648,7 @@ def _dask_worker_memory_limit_gb() -> Optional[float]:
     return None
 
 
-def _persist_budget_gb(cluster, client) -> float:
+def _persist_budget_gb(memory_budget, client) -> float:
     """Resource-aware cap (GB) on the result size worth ``persist``-ing.
 
     ``client.persist`` holds the ENTIRE result resident across the cluster.  It
@@ -702,7 +681,7 @@ def _persist_budget_gb(cluster, client) -> float:
         n_workers = 1
 
     gpu_headroom_gb = None
-    mem = getattr(cluster, "_fujishader_mem", None)
+    mem = memory_budget
     if isinstance(mem, dict):
         device_limit = float(mem.get("device_limit_gb", 0.0) or 0.0)
         # Use the pool's MAX growth, not its eager size: the pool expands to
@@ -833,7 +812,7 @@ def _write_cog_da_chunked(data: xr.DataArray, dst: Path, show_progress: bool = T
         logger.info("Using direct writing for better performance")
         _write_cog_da_original(data, dst, show_progress)
 
-def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
+def _fallback_cog_write(computed_da: xr.DataArray, dst: Path, cog_options: dict):
     """Fallback: create the COG via a temporary file."""
     tmp = dst.with_suffix(".tmp.tif")
     try:
@@ -848,29 +827,6 @@ def _fallback_cog_write(data: xr.DataArray, dst: Path, cog_options: dict):
             ]
         }
         
-        # Compute with progress display, then write
-        logger.info("Computing result...")
-        with ProgressBar():
-            computed_data = data.compute()
-        
-        # Wrap the computed data back into xarray
-        computed_da = xr.DataArray(
-            computed_data,
-            dims=data.dims,
-            coords=data.coords,
-            attrs=data.attrs,
-            name=data.name
-        )
-        
-        # Carry over CRS information
-        if hasattr(data, 'rio') and data.rio.crs is not None:
-            computed_da.rio.write_crs(data.rio.crs, inplace=True)
-        # Set NoData explicitly (0 for integer output, NaN for float). The (AVERAGE) overviews
-        # exclude NoData and the final COG inherits the nodata tag.
-        computed_da.rio.write_nodata(
-            output_nodata_for_dtype(computed_da.dtype), inplace=True,
-        )
-
         logger.info("Writing temporary TIFF...")
         computed_da.rio.to_raster(
             tmp,
@@ -1164,7 +1120,7 @@ def run_pipeline(
             f"Choose from {SUPPORTED_OUTPUT_DTYPES}."
         )
     runtime_context = cluster_runtime(memory_fraction)
-    cluster, client = runtime_context.__enter__()
+    cluster, client, cluster_memory_budget = runtime_context.__enter__()
 
     try:
         # Automatic chunk-size determination
@@ -1612,7 +1568,7 @@ def run_pipeline(
         # budget is sized from the real per-worker GPU headroom + host RAM, not a
         # fixed threshold (which assumed a large-VRAM GPU / abundant host RAM).
         total_gb = result_cpu.nbytes / (1024**3)
-        persist_budget_gb = _persist_budget_gb(cluster, client)
+        persist_budget_gb = _persist_budget_gb(cluster_memory_budget, client)
         if total_gb <= persist_budget_gb:
             if show_progress:
                 logger.info(

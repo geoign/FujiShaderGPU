@@ -77,7 +77,7 @@ def visual_saliency_stat_func(data):
     return (0.0, scale if scale > 1e-9 else 1.0)
 
 
-def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
+def compute_visual_saliency_block(block, *, scales=None, radii=None,
                                  pixel_size=1.0, pixel_scale_x=None,
                                  pixel_scale_y=None, normalize=True,
                                  norm_min=None, norm_scale=None, weights=None):
@@ -111,6 +111,8 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
     """
     if radii:  # unified --radii feeds the conspicuity scales
         scales = [float(r) for r in radii]
+    if scales is None:
+        scales = [2, 4, 8, 16]
     nan_mask = cp.isnan(block)
     if nan_mask.any():
         fill = cp.nanmean(block)
@@ -123,6 +125,7 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
         use_scales = [2.0, 4.0, 8.0, 16.0]
     # Per-scale weights (unified --weights); None -> equal averaging.
     wvec = resolve_block_weights(weights, len(use_scales))
+    w_host = cp.asnumpy(wvec).tolist() if wvec is not None else None
     # Compute every per-scale gaussian smooth once and reuse it: the previous
     # per-(center, surround) recomputation ran each gaussian up to twice.
     smooths = [gaussian_filter(work, sigma=s, mode='nearest') for s in use_scales]
@@ -138,7 +141,7 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
             fm = cp.abs(smooths[ci] - smooths[si])
             intensity_maps.append(_compress_saliency_feature(fm))
             if wvec is not None:
-                intensity_w.append(float(wvec[ci]))
+                intensity_w.append(w_host[ci])
     intensity = _weighted_mean_maps(intensity_maps, intensity_w if wvec is not None else None, work)
     ori_maps = []
     ori_w = []
@@ -157,7 +160,7 @@ def compute_visual_saliency_block(block, *, scales=[2, 4, 8, 16], radii=None,
             resp = mag * cp.maximum(cp.cos(2.0 * (theta - o)), 0.0)
             ori_maps.append(_compress_saliency_feature(resp))
             if wvec is not None:
-                ori_w.append(float(wvec[j]))
+                ori_w.append(w_host[j])
     orientation = _weighted_mean_maps(ori_maps, ori_w if wvec is not None else None, work)
     sal = 0.5 * (intensity + orientation)
     if normalize:
@@ -190,6 +193,7 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
     sm = [cp.where(cp.isnan(s), fillv, s).astype(cp.float32) for s in smooths]
     n = len(sm)
     wvec = resolve_block_weights(weights, n)
+    w_host = cp.asnumpy(wvec).tolist() if wvec is not None else None
     # Intensity conspicuity: running weighted mean of |center - surround|.  The
     # maps are accumulated in place (not stacked) so peak per-block VRAM stays low
     # on large rasters -- a stacked list of all intensity+orientation maps exhausts
@@ -202,7 +206,7 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
             if si >= n:
                 continue
             fm = _compress_saliency_feature(cp.abs(sm[ci] - sm[si]))
-            wj = float(wvec[ci]) if wvec is not None else 1.0
+            wj = w_host[ci] if w_host is not None else 1.0
             I_acc += fm * cp.float32(wj)
             I_w += wj
     intensity = I_acc / cp.float32(I_w) if I_w > 0 else I_acc
@@ -220,7 +224,7 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
         gy, gx = cp.gradient(sm[j], step_y, step_x)
         mag = cp.sqrt(gx * gx + gy * gy) + 1e-8
         theta = cp.arctan2(gy, gx)
-        wj = float(wvec[j]) if wvec is not None else 1.0
+        wj = w_host[j] if w_host is not None else 1.0
         for o in orientations:
             resp = _compress_saliency_feature(mag * cp.maximum(cp.cos(2.0 * (theta - o)), 0.0))
             O_acc += resp * cp.float32(wj)

@@ -91,6 +91,9 @@ def _configure_gdal_ultra_performance(gpu_config: dict):
         cache_mb, dataset_pool_size = 4096, 1000
 
     apply_gdal_io_config(cache_mb, dataset_pool_size=dataset_pool_size, force=True)
+    # GDAL_CACHEMAX may already have been read when the block cache was first
+    # created; SetCacheMax applies the byte limit immediately.
+    gdal.SetCacheMax(int(cache_mb) * 1024 * 1024)
 
     logging.getLogger(__name__).info(
         "GDAL settings applied: cache=%dMB, dataset_pool=%d, HTTP/2 enabled",

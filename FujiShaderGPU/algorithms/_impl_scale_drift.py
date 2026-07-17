@@ -173,16 +173,15 @@ def compute_scale_drift_block(block, *, radii=None, scales=None, weights=None,
         scales = [float(r) for r in radii]
     if not scales:
         scales = list(_DEFAULT_SCALES)
-    short = max(8, min(int(block.shape[0]), int(block.shape[1])))
-    scales = [min(float(s), short / 8.0) for s in scales]
+    scales = [float(s) for s in scales]
     sorted_scales, pair_w = _sorted_scales_and_pair_weights(scales, weights)
     filled, nan_mask = nan_filled(block)
     smooths = [gaussian_filter(filled, sigma=max(0.5, s), mode='nearest')
                for s in sorted_scales]
     dx, dy = _drift_vector(smooths, sorted_scales, pair_w)
     if not normalize:
-        # Stats prepass: raw magnitude for magnitude/direction runs, raw
-        # divergence for divergence runs (the stat is mode-matched).
+        # Stats prepass: raw magnitude or divergence. Direction is already a
+        # bounded angle map and the shared norm-stats dispatcher skips it.
         out = _drift_output(dx, dy, drift_output=drift_output, normalize=False,
                             norm_lo=0.0, norm_scale=0.0)
         return restore_nan(out, nan_mask)

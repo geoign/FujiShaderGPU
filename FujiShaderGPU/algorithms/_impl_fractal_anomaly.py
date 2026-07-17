@@ -78,7 +78,7 @@ def _fractal_roughness_block(block, *, scale, pixel_size=1.0, pixel_scale_x=None
     return cp.sqrt(cp.maximum(energy, 1e-8)).astype(cp.float32)
 
 
-def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
+def compute_fractal_dimension_block(block, *, radii=None,
                                   normalize=True, mean_global=None, std_global=None,
                                   relief_p10=None, relief_p75=None,
                                   smoothing_sigma=1.2, despeckle_threshold=0.35,
@@ -94,6 +94,8 @@ def compute_fractal_dimension_block(block, *, radii=[4, 8, 16, 32, 64],
     user can emphasize particular scales in the fractal-slope fit.  Absent or
     mismatched weights keep the original ``sqrt(scale)`` behavior.
     """
+    if radii is None:
+        radii = [4, 8, 16, 32, 64]
     sigmas = compute_roughness_multiscale(block, radii, window_mult=3, detrend=True)
     return _fractal_feature_from_roughness(
         block, sigmas, radii=radii, weights=weights, normalize=normalize,
