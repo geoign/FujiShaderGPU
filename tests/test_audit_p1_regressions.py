@@ -1,4 +1,5 @@
-"""Regression tests for the Phase 1 audit fixes (AUDIT_VERIFICATION_20260717.md).
+"""Regression tests for the Phase 1 audit fixes
+(``docs/archive/reviews/AUDIT_VERIFICATION_20260717.md``).
 
 Each test pins one fixed defect: M-1 (NaN lost under numeric nodata), H-3
 (scale_drift NaN erosion from coarse smooths), H-1 (topousm_fast tile stats
