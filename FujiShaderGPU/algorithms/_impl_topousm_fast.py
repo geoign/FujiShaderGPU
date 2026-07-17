@@ -8,7 +8,6 @@ from __future__ import annotations
 import logging
 from typing import List, Optional
 import cupy as cp
-import numpy as np
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
 
@@ -342,10 +341,6 @@ class TopoUSMFastAlgorithm(DaskAlgorithm):
             radii.append(radius)
 
         radii = sorted(list(set(radii)))
-
-        if len(radii) > 4:
-            indices = np.logspace(0, np.log10(len(radii)-1), 4).astype(int)
-            radii = [radii[int(i)] for i in indices]
 
         return radii
 

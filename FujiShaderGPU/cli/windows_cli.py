@@ -102,9 +102,6 @@ Note: Windows and Linux share the same algorithm names and options.
         try:
             from ..core.tile_processor import process_dem_tiles
 
-            if args.cog_only:
-                params["input_path"] = params["input_path"] if os.path.exists(params["input_path"]) else "dummy_input.tif"
-
             algo_params = build_algo_params(args)
 
             process_dem_tiles(
@@ -126,6 +123,7 @@ Note: Windows and Linux share the same algorithm names and options.
                 cog_backend=params["cog_backend"],
                 gdal_bin_dir=params["gdal_bin_dir"],
                 keep_tiles=getattr(args, "keep_tiles", False),
+                show_progress=params["show_progress"],
                 **algo_params,
             )
 

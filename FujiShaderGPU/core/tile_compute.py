@@ -83,8 +83,8 @@ def _normalize_topousm_fast_radii_and_weights(
     return deduped_radii, normalized_weights
 
 
-def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma: float, multiscale_mode: bool,
-                       target_distances, weights, pixel_size: float, algo_params: Dict[str, Any]):
+def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma: float,
+                       multiscale_mode: bool, pixel_size: float, algo_params: Dict[str, Any]):
     # The DEM is fed to the algorithms as-is (raw elevation), exactly like the
     # Dask backend: metric handling lives entirely in pixel_scale_x/y (signed
     # meters per pixel).  The old elevation_scale pre-multiply scaled the
@@ -92,8 +92,8 @@ def run_tile_algorithm(algo_instance, algorithm: str, dem_gpu: cp.ndarray, sigma
     # from the shared (raw-elevation) normalization stats and washed them out.
     if algorithm == 'topousm_fast':
         radii, topousm_fast_weights = _normalize_topousm_fast_radii_and_weights(
-            target_distances=target_distances,
-            weights=weights,
+            target_distances=None,
+            weights=None,
             pixel_size=pixel_size,
             manual_radii=algo_params.get("radii"),
             manual_weights=algo_params.get("weights"),

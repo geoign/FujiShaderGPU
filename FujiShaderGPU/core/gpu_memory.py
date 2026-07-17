@@ -8,20 +8,27 @@ import cupy as cp
 # Thread-local GPU context management (improved)
 _thread_local = threading.local()
 
+
+def _initialize_allocator() -> None:
+    """Select the process-wide CuPy allocator exactly once at module import."""
+    try:
+        import rmm
+        try:
+            from rmm.allocators.cupy import rmm_cupy_allocator
+        except ImportError:
+            rmm_cupy_allocator = getattr(rmm, "rmm_cupy_allocator", None)
+        if rmm_cupy_allocator:
+            cp.cuda.set_allocator(rmm_cupy_allocator)
+    except ImportError:
+        pass
+
+
+_initialize_allocator()
+
+
 def get_gpu_context():
     """Get a thread-local GPU memory pool (improved)."""
     if not hasattr(_thread_local, 'mempool'):
-        try:
-            import rmm
-            try:
-                from rmm.allocators.cupy import rmm_cupy_allocator
-            except ImportError:
-                rmm_cupy_allocator = getattr(rmm, "rmm_cupy_allocator", None)
-            if rmm_cupy_allocator:
-                cp.cuda.set_allocator(rmm_cupy_allocator)
-        except ImportError:
-            pass
-
         _thread_local.mempool = cp.get_default_memory_pool()
         _thread_local.pinned_mempool = cp.get_default_pinned_memory_pool()
 

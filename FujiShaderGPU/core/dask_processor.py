@@ -57,7 +57,7 @@ from ..utils.memory import (
     container_memory_total_gb,
 )
 from ..utils.paths import resolve_tmp_dir
-from .dask_cluster import make_cluster
+from .dask_cluster import cluster_runtime
 from .dask_io import (
     is_zarr_path,
     load_input_dataarray,
@@ -133,7 +133,8 @@ def _select_chunk_temp_parent(data_nbytes: int) -> Path:
     """Choose and diagnose the temporary directory for chunk GeoTIFFs."""
     parent, selected_from = resolve_tmp_dir(Path(tempfile.gettempdir()))
     usage = shutil.disk_usage(parent)
-    estimated = max(data_nbytes, int(data_nbytes * 0.75))
+    # Staging can temporarily hold both the intermediate GTiff and final COG.
+    estimated = int(data_nbytes * 1.75)
     origin = f" from ${selected_from}" if selected_from else " from tempfile default"
     logger.info(
         "Chunk temporary directory%s: %s (free=%s)",
@@ -188,7 +189,7 @@ def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, floa
 
 ###############################################################################
 # 1. Dask-CUDA cluster
-#    make_cluster() is imported directly from dask_cluster.py
+#    cluster_runtime() scopes configuration around make_cluster() and teardown
 ###############################################################################
 
 ###############################################################################
@@ -316,14 +317,19 @@ def _build_zstd_overviews(path: Path, cog_options: dict):
         gdal.SetConfigOption("ZLEVEL_OVERVIEW", cog_options.get("LEVEL", "1"))
         gdal.SetConfigOption("BIGTIFF_OVERVIEW", "YES")
         gdal.SetConfigOption("GDAL_TIFF_OVR_BLOCKSIZE", cog_options.get("BLOCKSIZE", "512"))
-        gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
+        gdal.SetConfigOption("GDAL_NUM_THREADS", str(max(1, container_cpu_count())))
 
         ds = gdal.Open(str(path), gdal.GA_Update)
         if ds is None:
             raise ValueError(f"Failed to open temporary TIFF for overviews: {path}")
+        min_dimension = min(int(ds.RasterXSize), int(ds.RasterYSize))
+        levels = [level for level in (2, 4, 8, 16, 32, 64, 128, 256) if level <= min_dimension]
+        if not levels:
+            ds = None
+            raise ValueError(f"Raster is too small to build overviews: {path}")
         result = ds.BuildOverviews(
             cog_options.get("OVERVIEW_RESAMPLING", "AVERAGE"),
-            [2, 4, 8, 16, 32, 64, 128, 256],
+            levels,
         )
         ds = None
         if result != 0:
@@ -1157,8 +1163,9 @@ def run_pipeline(
             f"Unsupported output_dtype={output_dtype!r}. "
             f"Choose from {SUPPORTED_OUTPUT_DTYPES}."
         )
-    cluster, client = make_cluster(memory_fraction)  # direct call into dask_cluster.py
-    
+    runtime_context = cluster_runtime(memory_fraction)
+    cluster, client = runtime_context.__enter__()
+
     try:
         # Automatic chunk-size determination
         if chunk is None:
@@ -1309,10 +1316,6 @@ def run_pipeline(
                 raise ValueError("Either provide radii or enable auto_radii")
 
         else:
-            # Many algorithms need the pixel size (for non-TopoUSM Fast cases)
-            if 'pixel_size' not in params or params['pixel_size'] == 1.0:
-                params['pixel_size'] = float(params.get('pixel_size', 1.0))
-
             if _is_local:
                 if radii is not None or params.get('scales'):
                     logger.warning(
@@ -1788,6 +1791,13 @@ def run_pipeline(
             cluster.close(timeout=10)
         except Exception as e:
             logger.debug(f"Cluster close warning (can be ignored): {e}")
+
+        # Restore the caller's Dask configuration and distributed.core log level
+        # only after workers and scheduler have finished shutting down.
+        try:
+            runtime_context.__exit__(*sys.exc_info())
+        except Exception as e:
+            logger.debug(f"Dask runtime configuration restore warning: {e}")
         
         # Wait for the Dask worker processes to terminate for sure
         time.sleep(3)

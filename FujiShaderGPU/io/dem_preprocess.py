@@ -912,7 +912,7 @@ def _stream_fill_parallel(
     # leave fast workers idle while a few heavy ones grind out the tail (only
     # ~2/7 cores busy near the end).  Many small strips let an idle worker steal
     # the next queued strip, keeping every core busy until the very end.
-    n_strips = min(n_bands_total, max(n_workers, n_workers * STRIPS_PER_WORKER))
+    n_strips = min(n_bands_total, n_workers * STRIPS_PER_WORKER)
     bands_per_strip = math.ceil(n_bands_total / n_strips)
     # Strip writes are single-threaded (process-level parallelism already
     # saturates the cores); ALL_CPUS is reserved for the final COG translate.

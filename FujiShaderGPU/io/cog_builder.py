@@ -124,7 +124,11 @@ def _create_overviews_gdal_api(tiff_path: str) -> None:
         if ds is None:
             raise ValueError("Failed to open TIFF for overview creation")
 
-        levels = [2, 4, 8, 16, 32, 64, 128, 256]
+        min_dimension = min(int(ds.RasterXSize), int(ds.RasterYSize))
+        levels = [level for level in (2, 4, 8, 16, 32, 64, 128, 256) if level <= min_dimension]
+        if not levels:
+            ds = None
+            raise ValueError(f"Raster is too small to build overviews: {tiff_path}")
         result = ds.BuildOverviews("AVERAGE", levels)
         ds = None
         if result != 0:
@@ -147,7 +151,18 @@ def _get_overview_count(tiff_path: str) -> int:
 
 def _create_qgis_optimized_overviews(tiff_path: str) -> None:
     """Build QGIS-friendly overview pyramid."""
-    overview_levels = ["2", "4", "8", "16", "32", "64", "128", "256", "512"]
+    ds = gdal.Open(tiff_path, gdal.GA_ReadOnly)
+    if ds is None:
+        raise ValueError(f"Failed to open TIFF for overview sizing: {tiff_path}")
+    min_dimension = min(int(ds.RasterXSize), int(ds.RasterYSize))
+    ds = None
+    overview_levels = [
+        str(level)
+        for level in (2, 4, 8, 16, 32, 64, 128, 256, 512)
+        if level <= min_dimension
+    ]
+    if not overview_levels:
+        raise ValueError(f"Raster is too small to build overviews: {tiff_path}")
     cmd = [
         "gdaladdo",
         "-r",

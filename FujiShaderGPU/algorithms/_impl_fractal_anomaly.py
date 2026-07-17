@@ -344,9 +344,6 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             base = [2, 4, 8, 16, 24, 32]
         else:
             base = [2, 4, 8, 12, 16, 24]
-        if len(base) > 6:
-            indices = cp.linspace(0, len(base)-1, 6).astype(int).get()
-            base = [base[int(i)] for i in indices]
         return base
 
     def get_default_params(self):

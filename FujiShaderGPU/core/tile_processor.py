@@ -846,8 +846,6 @@ def process_single_tile(
     vram_monitor: bool = False,
     multiscale_mode: bool = True,
     pixel_size: float = 0.5,
-    target_distances: Optional[List[float]] = None,
-    topousm_fast_weights: Optional[List[float]] = None,
     **algo_params
 ) -> TileResult:
     """
@@ -951,8 +949,6 @@ def process_single_tile(
                 dem_gpu,
                 sigma,
                 multiscale_mode,
-                target_distances,
-                topousm_fast_weights,
                 pixel_size,
                 tile_algo_params,
             )
@@ -1054,6 +1050,7 @@ def process_dem_tiles(
     cog_backend: str = "internal",
     gdal_bin_dir: Optional[str] = None,
     keep_tiles: bool = False,
+    show_progress: bool = True,
     **algo_params  # algorithm-specific parameters
 ):
     """
@@ -1667,7 +1664,7 @@ def process_dem_tiles(
                         input_cog_path, info, tmp_tile_dir, algorithm, sigma,
                         nodata, src_transform, src_crs, profile,
                         nodata_threshold, gpu_config.get("vram_monitor", False),
-                        multiscale_mode, pixel_size, target_distances, weights,
+                        multiscale_mode, pixel_size,
                         **algo_params
                     )
                     pending.add(fut)
@@ -1692,7 +1689,7 @@ def process_dem_tiles(
                         else:
                             error_tiles.append(result)
 
-                        if completed_count % 10 == 0:
+                        if show_progress and completed_count % 10 == 0:
                             logger.info(
                                 f"[OK] Progress: {completed_count}/{total_tiles} ({progress:.1f}%) "
                                 f"[success={len(processed_tiles)}, skipped={len(skipped_tiles)}, error={len(error_tiles)}]"
@@ -1723,7 +1720,8 @@ def process_dem_tiles(
         # COG quality validation.  No post-hoc metadata edits: updating a COG
         # in place (display hints / scale-offset) breaks its layout guarantee
         # and GDAL 3.8+ refuses the update outright.
-        _validate_cog_for_qgis(output_cog_path)
+        if not _validate_cog_for_qgis(output_cog_path):
+            raise RuntimeError(f"Generated output failed COG validation: {output_cog_path}")
 
     except Exception as e:
         # P3-7 (L-34): remove a half-written output so a failed run never leaves
@@ -1815,7 +1813,8 @@ def resume_cog_generation(
             backend=cog_backend,
             gdal_bin_dir=gdal_bin_dir,
         )
-        _validate_cog_for_qgis(output_cog_path)
+        if not _validate_cog_for_qgis(output_cog_path):
+            raise RuntimeError(f"Generated output failed COG validation: {output_cog_path}")
         logger.info("[OK] COG generation complete")
         
         # Cleanup suggestion on success

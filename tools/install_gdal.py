@@ -35,7 +35,11 @@ def _run(cmd: list[str], *, env: dict | None = None, dry: bool = False) -> int:
     print("  $ " + " ".join(cmd))
     if dry:
         return 0
-    return subprocess.call(cmd, env=env)
+    try:
+        return subprocess.call(cmd, env=env)
+    except OSError as exc:
+        print(f"  command could not be started: {exc}")
+        return 127
 
 
 def _verify() -> str | None:
@@ -45,8 +49,9 @@ def _verify() -> str | None:
             [sys.executable, "-c", "from osgeo import gdal; print(gdal.__version__)"],
             stderr=subprocess.STDOUT, text=True,
         )
-        return out.strip().splitlines()[-1].strip()
-    except subprocess.CalledProcessError:
+        lines = out.strip().splitlines()
+        return lines[-1].strip() if lines and lines[-1].strip() else None
+    except (OSError, subprocess.CalledProcessError):
         return None
 
 
@@ -77,17 +82,20 @@ def _gdal_include_dir() -> str | None:
 
 
 def _in_conda() -> bool:
-    return (
-        os.path.isdir(os.path.join(sys.prefix, "conda-meta"))
-        or bool(os.environ.get("CONDA_PREFIX"))
-    )
+    # CONDA_PREFIX can leak into a subprocess that is using a different Python.
+    # Only the active interpreter's prefix proves that this interpreter is conda-managed.
+    return os.path.isdir(os.path.join(sys.prefix, "conda-meta"))
 
 
 def _sudo_prefix() -> list[str]:
     # Root needs no sudo; otherwise use sudo if available.
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         return []
-    return ["sudo"] if shutil.which("sudo") else []
+    if shutil.which("sudo"):
+        return ["sudo"]
+    raise RuntimeError(
+        "apt-get requires root privileges, but this process is not root and `sudo` is unavailable"
+    )
 
 
 def _pip_build_binding(version: str | None, *, dry: bool) -> bool:
@@ -100,7 +108,9 @@ def _pip_build_binding(version: str | None, *, dry: bool) -> bool:
         for var in ("CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH"):
             env[var] = inc + (os.pathsep + env[var] if env.get(var) else "")
     # numpy headers let the build include osgeo.gdal_array (used by the pipeline).
-    _run([sys.executable, "-m", "pip", "install", "numpy"], env=env, dry=dry)
+    if _run([sys.executable, "-m", "pip", "install", "numpy"], env=env, dry=dry) != 0:
+        print("  installing the NumPy build dependency failed")
+        return False
     spec = f"GDAL=={version}" if version else "GDAL"
     base = [
         sys.executable, "-m", "pip", "install", "--no-build-isolation",
@@ -126,7 +136,9 @@ def main() -> int:
     print(f"Python: {sys.version.split()[0]}  ({sys.executable})")
     print(f"Platform: {platform.system()} {platform.machine()}")
 
-    existing = _verify()
+    # A dry run must describe actions only; even verification imports can have
+    # environment-dependent side effects and would make the plan misleading.
+    existing = None if dry else _verify()
     if existing:
         print(f"[OK] GDAL bindings already work: osgeo {existing} -- nothing to do.")
         return 0
@@ -147,7 +159,13 @@ def main() -> int:
         if tool:
             print("Detected conda environment.")
             if confirm(f"run `{os.path.basename(tool)} install -c conda-forge gdal`"):
-                _run([tool, "install", "-y", "-c", "conda-forge", "gdal"], dry=dry)
+                rc = _run([tool, "install", "-y", "-c", "conda-forge", "gdal"], dry=dry)
+                if rc != 0:
+                    print(f"[!] conda install failed with exit code {rc}.")
+                    return 1
+                if dry:
+                    print("[DRY RUN] Conda installation would be followed by verification.")
+                    return 0
                 v = _verify()
                 if v:
                     print(f"[OK] GDAL installed via conda-forge: osgeo {v}")
@@ -161,6 +179,9 @@ def main() -> int:
     if ver:
         print(f"Detected native GDAL {ver} (gdal-config). Building the matching Python binding.")
         if _pip_build_binding(ver, dry=dry):
+            if dry:
+                print("[DRY RUN] The binding build would be followed by verification.")
+                return 0
             v = _verify()
             if v:
                 print(f"[OK] GDAL bindings installed: osgeo {v}")
@@ -171,11 +192,27 @@ def main() -> int:
     if system == "linux" and shutil.which("apt-get"):
         print("Detected Debian/Ubuntu (apt). Installing native GDAL, then the binding.")
         if confirm("install libgdal-dev + gdal-bin via apt-get"):
-            sudo = _sudo_prefix()
-            _run(sudo + ["apt-get", "update"], dry=dry)
-            _run(sudo + ["apt-get", "install", "-y", "libgdal-dev", "gdal-bin"], dry=dry)
+            try:
+                sudo = _sudo_prefix()
+            except RuntimeError as exc:
+                print(f"[FAILED] {exc}")
+                return 2
+            rc = _run(sudo + ["apt-get", "update"], dry=dry)
+            if rc != 0:
+                print(f"[FAILED] apt-get update failed with exit code {rc}.")
+                return 1
+            rc = _run(
+                sudo + ["apt-get", "install", "-y", "libgdal-dev", "gdal-bin"],
+                dry=dry,
+            )
+            if rc != 0:
+                print(f"[FAILED] apt-get install failed with exit code {rc}.")
+                return 1
             ver = _gdal_config_version()
             if _pip_build_binding(ver, dry=dry):
+                if dry:
+                    print("[DRY RUN] apt and pip installation would be followed by verification.")
+                    return 0
                 v = _verify()
                 if v:
                     print(f"[OK] GDAL installed (apt + pip): osgeo {v}")
@@ -186,8 +223,14 @@ def main() -> int:
     elif system == "darwin" and shutil.which("brew"):
         print("Detected macOS Homebrew. Installing native GDAL, then the binding.")
         if confirm("install gdal via Homebrew"):
-            _run(["brew", "install", "gdal"], dry=dry)
+            rc = _run(["brew", "install", "gdal"], dry=dry)
+            if rc != 0:
+                print(f"[FAILED] brew install failed with exit code {rc}.")
+                return 1
             if _pip_build_binding(_gdal_config_version(), dry=dry):
+                if dry:
+                    print("[DRY RUN] Homebrew and pip installation would be followed by verification.")
+                    return 0
                 v = _verify()
                 if v:
                     print(f"[OK] GDAL installed (brew + pip): osgeo {v}")

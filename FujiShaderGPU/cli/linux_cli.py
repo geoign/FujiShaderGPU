@@ -8,9 +8,7 @@ options and wires the parsed args into ``run_pipeline``.
 """
 from typing import List
 import argparse
-import os
 
-import GPUtil
 import rasterio
 
 from .base import BaseCLI
@@ -119,23 +117,6 @@ writes them out as Cloud-Optimized GeoTIFF."""
 
     def execute(self, args: argparse.Namespace):
         """Run Dask-CUDA processing."""
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TARGET"] = "0.70"
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__SPILL"] = "0.75"
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE"] = "0.85"
-        os.environ["DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE"] = "0.95"
-        os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT"] = "30s"
-        os.environ["DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP"] = "60s"
-        os.environ["DASK_DISTRIBUTED__DEPLOY__LOST_WORKER_TIMEOUT"] = "60s"
-
-        # Dynamic RMM settings from auto_tune.
-        from FujiShaderGPU.config.auto_tune import compute_rmm_pool_gb
-        gpus = GPUtil.getGPUs()
-        gpu_memory_gb = gpus[0].memoryTotal / 1024 if gpus else 16  # conservative default
-        _rmm_gb = compute_rmm_pool_gb(gpu_memory_gb)
-        os.environ["RMM_ALLOCATOR"] = "pool"
-        os.environ["RMM_POOL_SIZE"] = f"{_rmm_gb}GB"
-        os.environ["RMM_MAXIMUM_POOL_SIZE"] = f"{int(_rmm_gb * 1.1)}GB"
-
         params = self.get_common_params(args)
         self._resolve_pixel_size(args, params["input_path"])
 

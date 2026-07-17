@@ -69,14 +69,6 @@ def _combine_direct(responses, *, weights=None, agg="mean"):
     return out.astype(cp.float32, copy=False)
 
 
-def _resolve_radii_weights(params, pixel_size):
-    from .._nan_utils import _resolve_spatial_radii_weights
-
-    return _resolve_spatial_radii_weights(
-        params.get("radii"), params.get("weights", None), pixel_size,
-    )
-
-
 def _direct_hillshade(block, params):
     from .._base import Constants
     from .._impl_hillshade import compute_hillshade_block, compute_hillshade_spatial_block
@@ -90,22 +82,17 @@ def _direct_hillshade(block, params):
     pixel_size = p.get("pixel_size", 1.0)
     pixel_scale_x = p.get("pixel_scale_x", None)
     pixel_scale_y = p.get("pixel_scale_y", None)
-    mode = str(p.get("mode", "local")).lower()
     radii = p.get("radii", [1])
     weights = p.get("weights", None)
     agg = p.get("agg", "mean")
     multiscale = bool(p.get("multiscale", False))
 
-    if mode == "spatial":
-        radii, weights = _resolve_radii_weights(p, pixel_size)
-        multiscale = True
-    else:
-        if not isinstance(radii, (list, tuple)) or len(radii) == 0:
-            radii = [1]
-        radii = [max(1.0, float(r)) for r in radii]
-        multiscale = bool(multiscale or len(radii) > 1)
+    if not isinstance(radii, (list, tuple)) or len(radii) == 0:
+        radii = [1]
+    radii = [max(1.0, float(r)) for r in radii]
+    multiscale = bool(multiscale or len(radii) > 1)
 
-    if mode == "spatial" or (multiscale and len(radii) > 1):
+    if multiscale and len(radii) > 1:
         responses = [
             compute_hillshade_spatial_block(
                 block, azimuth=azimuth, altitude=altitude, z_factor=z_factor,
@@ -125,22 +112,12 @@ def _direct_hillshade(block, params):
 
 
 def _direct_slope(block, params):
-    from .._impl_slope import compute_slope_block, compute_slope_spatial_block
+    from .._impl_slope import compute_slope_block
 
     unit = params.get("unit", "degree")
     pixel_size = params.get("pixel_size", 1.0)
     psx = params.get("pixel_scale_x", None)
     psy = params.get("pixel_scale_y", None)
-    if str(params.get("mode", "local")).lower() == "spatial":
-        radii, weights = _resolve_radii_weights(params, pixel_size)
-        responses = [
-            compute_slope_spatial_block(
-                block, unit=unit, pixel_size=pixel_size,
-                pixel_scale_x=psx, pixel_scale_y=psy, radius=float(radius),
-            )
-            for radius in radii
-        ]
-        return _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
     return compute_slope_block(
         block, unit=unit, pixel_size=pixel_size,
         pixel_scale_x=psx, pixel_scale_y=psy,
@@ -148,27 +125,13 @@ def _direct_slope(block, params):
 
 
 def _direct_atmospheric_scattering(block, params):
-    from .._impl_atmospheric_scattering import (
-        compute_atmospheric_scattering_block,
-        compute_atmospheric_scattering_spatial_block,
-    )
+    from .._impl_atmospheric_scattering import compute_atmospheric_scattering_block
 
     ss = params.get("scattering_strength", 0.5)
     intensity = params.get("intensity", None)
     pixel_size = params.get("pixel_size", 1.0)
     psx = params.get("pixel_scale_x", None)
     psy = params.get("pixel_scale_y", None)
-    if str(params.get("mode", "local")).lower() == "spatial":
-        radii, weights = _resolve_radii_weights(params, pixel_size)
-        responses = [
-            compute_atmospheric_scattering_spatial_block(
-                block, scattering_strength=ss, intensity=intensity,
-                pixel_size=pixel_size, pixel_scale_x=psx,
-                pixel_scale_y=psy, radius=float(radius),
-            )
-            for radius in radii
-        ]
-        return _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
     return compute_atmospheric_scattering_block(
         block, scattering_strength=ss, intensity=intensity,
         pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
@@ -177,28 +140,11 @@ def _direct_atmospheric_scattering(block, params):
 
 def _direct_curvature(block, params):
     from .._impl_curvature import compute_curvature_block
-    from .._nan_utils import _smooth_for_radius
 
     curvature_type = params.get("curvature_type", "mean")
     pixel_size = params.get("pixel_size", 1.0)
     psx = params.get("pixel_scale_x", None)
     psy = params.get("pixel_scale_y", None)
-    if str(params.get("mode", "local")).lower() == "spatial":
-        radii, weights = _resolve_radii_weights(params, pixel_size)
-        responses = []
-        for radius in radii:
-            smoothed = _smooth_for_radius(
-                block, float(radius), pixel_size=pixel_size,
-                algorithm_name="curvature",
-            )
-            responses.append(
-                compute_curvature_block(
-                    smoothed, curvature_type=curvature_type,
-                    pixel_size=pixel_size, pixel_scale_x=psx,
-                    pixel_scale_y=psy,
-                )
-            )
-        return _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
     return compute_curvature_block(
         block, curvature_type=curvature_type, pixel_size=pixel_size,
         pixel_scale_x=psx, pixel_scale_y=psy,
@@ -207,7 +153,7 @@ def _direct_curvature(block, params):
 
 def _direct_specular(block, params):
     from .._base import Constants
-    from .._impl_specular import compute_specular_block, compute_specular_spatial_block
+    from .._impl_specular import compute_specular_block
 
     rs = params.get("roughness_scale", 20.0)
     sh = params.get("shininess", 10.0)
@@ -217,18 +163,6 @@ def _direct_specular(block, params):
     rns = params.get("roughness_norm_scale", None)
     laz = params.get("light_azimuth", Constants.DEFAULT_AZIMUTH)
     lal = params.get("light_altitude", Constants.DEFAULT_ALTITUDE)
-    if str(params.get("mode", "local")).lower() == "spatial":
-        radii, weights = _resolve_radii_weights(params, pixel_size)
-        responses = [
-            compute_specular_spatial_block(
-                block, roughness_scale=rs, shininess=sh, pixel_size=pixel_size,
-                pixel_scale_x=psx, pixel_scale_y=psy,
-                roughness_norm_scale=rns,
-                light_azimuth=laz, light_altitude=lal, radius=float(radius),
-            )
-            for radius in radii
-        ]
-        return _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
     return compute_specular_block(
         block, roughness_scale=rs, shininess=sh, pixel_size=pixel_size,
         pixel_scale_x=psx, pixel_scale_y=psy, roughness_norm_scale=rns,
@@ -254,10 +188,7 @@ def _apply_display_stretch_block(result, stats):
 
 
 def _direct_ambient_occlusion(block, params):
-    from .._impl_ambient_occlusion import (
-        compute_ambient_occlusion_block,
-        compute_ambient_occlusion_spatial_block,
-    )
+    from .._impl_ambient_occlusion import compute_ambient_occlusion_block
 
     ns = params.get("num_samples", 16)
     radius = params.get("radius", 10.0)
@@ -265,30 +196,17 @@ def _direct_ambient_occlusion(block, params):
     pixel_size = params.get("pixel_size", 1.0)
     psx = params.get("pixel_scale_x", None)
     psy = params.get("pixel_scale_y", None)
-    if str(params.get("mode", "local")).lower() == "spatial":
-        radii, weights = _resolve_radii_weights(params, pixel_size)
-        responses = [
-            compute_ambient_occlusion_spatial_block(
-                block, num_samples=ns,
-                radius=float(max(1, int(round(float(r))))),
-                intensity=intensity, pixel_size=pixel_size,
-                pixel_scale_x=psx, pixel_scale_y=psy,
-            )
-            for r in radii
-        ]
-        result = _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
-    else:
-        result = compute_ambient_occlusion_block(
-            block, num_samples=ns, radius=radius, intensity=intensity,
-            pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
-        )
+    result = compute_ambient_occlusion_block(
+        block, num_samples=ns, radius=radius, intensity=intensity,
+        pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
+    )
     # Apply the same data-driven contrast stretch the Dask .process() applies
     # (the tile pipeline skips re-normalizing these "native" algorithms).
     return _apply_display_stretch_block(result, params.get("global_stats"))
 
 
 def _direct_openness(block, params):
-    from .._impl_openness import compute_openness_spatial_block, compute_openness_vectorized
+    from .._impl_openness import compute_openness_vectorized
 
     openness_type = params.get("openness_type", "positive")
     nd = params.get("num_directions", 16)
@@ -296,23 +214,11 @@ def _direct_openness(block, params):
     pixel_size = params.get("pixel_size", 1.0)
     psx = params.get("pixel_scale_x", None)
     psy = params.get("pixel_scale_y", None)
-    if str(params.get("mode", "local")).lower() == "spatial":
-        radii, weights = _resolve_radii_weights(params, pixel_size)
-        responses = [
-            compute_openness_spatial_block(
-                block, openness_type=openness_type, num_directions=nd,
-                max_distance=int(max(2, round(float(r)))),
-                pixel_size=pixel_size, pixel_scale_x=psx, pixel_scale_y=psy,
-            )
-            for r in radii
-        ]
-        result = _combine_direct(responses, weights=weights, agg=params.get("agg", "mean"))
-    else:
-        result = compute_openness_vectorized(
-            block, openness_type=openness_type, num_directions=nd,
-            max_distance=max_distance, pixel_size=pixel_size,
-            pixel_scale_x=psx, pixel_scale_y=psy,
-        )
+    result = compute_openness_vectorized(
+        block, openness_type=openness_type, num_directions=nd,
+        max_distance=max_distance, pixel_size=pixel_size,
+        pixel_scale_x=psx, pixel_scale_y=psy,
+    )
     return _apply_display_stretch_block(result, params.get("global_stats"))
 
 
@@ -391,7 +297,7 @@ def _direct_multiscale_terrain(block, params):
 
 
 def _direct_fractal_anomaly(block, params, algo):
-    from .._impl_fractal_anomaly import compute_fractal_dimension_block, fractal_stat_func
+    from .._impl_fractal_anomaly import compute_fractal_dimension_block
 
     pixel_size = params.get("pixel_size", 1.0)
     radii = params.get("radii", None)
@@ -429,9 +335,8 @@ def _process_direct(algo, class_name, dem_gpu, params):
     p = _merged_params(algo, params)
     # Spatial-mode multi-radius runs take the shared Dask overview path (large
     # radii sampled from one global overview, tile-origin aware) so the tile
-    # backend is seam-free and matches the Linux backend.  TopoUSM Fast and fractal keep
-    # their own overview-based direct paths; `local` mode keeps the fast direct
-    # paths below (single radius -> no large halo, no seams).
+    # backend is seam-free and matches the Linux backend. TopoUSM Fast keeps its
+    # overview-based direct path; local mode keeps the fast direct paths below.
     if str(p.get("mode", "local")).lower() == "spatial" and class_name in {
         "HillshadeAlgorithm", "SlopeAlgorithm", "SpecularAlgorithm",
         "AtmosphericScatteringAlgorithm", "CurvatureAlgorithm",
@@ -490,13 +395,7 @@ class DaskSharedTileAdapter:
         except _FallbackToDask:
             pass
 
-        try:
-            import dask.array as da
-        except Exception as exc:
-            raise RuntimeError(
-                "Dask is required for this algorithm on tile backend. "
-                "Install with: pip install dask[array]"
-            ) from exc
+        import dask.array as da
 
         gpu_da = da.from_array(dem_gpu, chunks=dem_gpu.shape, asarray=False)
         result_da = self._algo.process(gpu_da, **params)

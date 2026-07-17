@@ -8,6 +8,7 @@ Module split out from dask_shared.py (Phase 3).
 """
 from __future__ import annotations
 import logging
+import math
 import cupy as cp
 import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter
@@ -193,7 +194,7 @@ class ScaleSpaceSurpriseAlgorithm(DaskAlgorithm):
                 compute_scale_space_surprise_block,
                 {'scales': scales, 'enhancement': enhancement, 'normalize': False,
                  'weights': weights},
-                depth=min(int(max(1, cp.ceil(max(scales) * 4).item())) + 1, Constants.MAX_DEPTH),
+                depth=min(max(1, math.ceil(max(scales) * 4)) + 1, Constants.MAX_DEPTH),
                 algorithm_name='scale_space_surprise',
             )
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):

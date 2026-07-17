@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from typing import Tuple
 
 import GPUtil
@@ -16,6 +17,22 @@ from dask_cuda import LocalCUDACluster
 from distributed import Client
 
 logger = logging.getLogger(__name__)
+
+
+DASK_RUNTIME_CONFIG = {
+    # dask-cuda P2P rechunk/shuffle may inspect CuPy buffers from CPU and fail
+    # on non-HMM systems.  The task-based path is slower but robust for the
+    # single-GPU RunPod/Colab workloads targeted here.
+    "array.rechunk.method": "tasks",
+    "distributed.worker.memory.target": 0.70,
+    "distributed.worker.memory.spill": 0.75,
+    "distributed.worker.memory.pause": 0.85,
+    "distributed.worker.memory.terminate": 0.95,
+    "distributed.admin.tick.limit": "15s",
+    "distributed.comm.timeouts.connect": "30s",
+    "distributed.comm.timeouts.tcp": "60s",
+    "distributed.deploy.lost-worker-timeout": "60s",
+}
 
 
 def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Client]:
@@ -65,20 +82,6 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         rmm_max_gb,
     )
 
-    dask_config.set({
-        # dask-cuda P2P rechunk/shuffle may inspect CuPy buffers from CPU and
-        # fail on non-HMM systems.  The task-based rechunk path is slower but
-        # robust for FujiShaderGPU's single-GPU Runpod/Colab workloads.
-        'array.rechunk.method': 'tasks',
-        'distributed.worker.memory.target': 0.70,
-        'distributed.worker.memory.spill': 0.75,
-        'distributed.worker.memory.pause': 0.85,
-        'distributed.worker.memory.terminate': 0.95,
-        'distributed.admin.tick.limit': '15s',
-    })
-
-    logging.getLogger('distributed.core').setLevel(logging.WARNING)
-
     cluster_kwargs = {
         'device_memory_limit': device_memory_fraction,
         'rmm_pool_size': f'{rmm_size}GB',
@@ -118,3 +121,22 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
 
     client = Client(cluster)
     return cluster, client
+
+
+@contextmanager
+def cluster_runtime(memory_fraction: float = None):
+    """Create a cluster under scoped Dask/logging configuration.
+
+    The configuration must be active before nanny/worker processes spawn, but
+    must not leak into unrelated Dask workloads after this pipeline finishes.
+    Cluster/client shutdown remains owned by ``run_pipeline`` so its existing
+    GPU-memory cleanup can run before this context restores the configuration.
+    """
+    distributed_core_logger = logging.getLogger("distributed.core")
+    previous_level = distributed_core_logger.level
+    with dask_config.set(DASK_RUNTIME_CONFIG):
+        distributed_core_logger.setLevel(logging.WARNING)
+        try:
+            yield make_cluster(memory_fraction)
+        finally:
+            distributed_core_logger.setLevel(previous_level)

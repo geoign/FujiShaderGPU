@@ -132,7 +132,7 @@ def test_tile_geographic_overview_gate_matches_dask_policy(tmp_path, monkeypatch
     monkeypatch.setattr(tp, "_load_algorithm", lambda name: None)
     monkeypatch.setattr(tp, "process_single_tile", lambda *a, **kw: tp.TileResult(0, 0, True, "tile.tif"))
     monkeypatch.setattr(tp, "_build_vrt_and_cog_ultra_fast", lambda *a, **kw: None)
-    monkeypatch.setattr(tp, "_validate_cog_for_qgis", lambda *a, **kw: None)
+    monkeypatch.setattr(tp, "_validate_cog_for_qgis", lambda *a, **kw: True)
 
     monkeypatch.setattr(
         "FujiShaderGPU.algorithms._nan_utils.read_overview_coarse_dem",

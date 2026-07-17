@@ -76,7 +76,7 @@ def _validate_cog_for_qgis(cog_path: str):
         metadata = ds.GetMetadata()
         layout = img_md.get('LAYOUT', metadata.get('LAYOUT', 'unknown'))
 
-        if 'COG' in layout.upper() or tiled:
+        if str(layout).strip().upper() == 'COG':
             logger.info("COG-compliant")
             cog_compliant = True
         else:
@@ -120,7 +120,7 @@ def _validate_cog_for_qgis(cog_path: str):
 
         ds = None
         logger.info("=== COG quality validation complete ===")
-        return score >= 60
+        return cog_compliant and score >= 60
 
     except Exception as e:
         logger.error("COG validation error: %s", e)
