@@ -23,6 +23,12 @@ visual_saliency / fractal_anomaly / scale_space_surprise / multi_light_uncertain
 | E1 | Scale Drift(スケール漂流場) | オリジナル | **実装済み** (`scale_drift`, 2026-07-06) | Claude Fable 5 (2026-07-06) |
 | E2 | Eigenterrain 疑似カラー | オリジナル/教師なし学習 | 先送り | Claude Fable 5 (2026-07-06) |
 | E3 | 侵食時間レリーフ | オリジナル/PDE | 先送り | Claude Fable 5 (2026-07-06) |
+| G1 | Geomorphons 地形形態分類 | パターン認識/地形計測 | 検討中 | Kimi (Moonshot AI) (2026-07-18) |
+| F1 | マルチスケール形態学トップハット/DMP | 数学形態学/次数統計 | 検討中 | Kimi (Moonshot AI) (2026-07-18) |
+| F2 | 局所標高ランク(順位レリーフ) | 次数統計 | 検討中 | Kimi (Moonshot AI) (2026-07-18) |
+| H1 | 方向性バリオグラム粗さ異方性 | 地統計/第二級統計 | 検討中 | Kimi (Moonshot AI) (2026-07-18) |
+| E4 | パッチ再帰性マップ | オリジナル/非局所 | 検討中 | Kimi (Moonshot AI) (2026-07-18) |
+| I1 | HAND 水文正規化レリーフ | 水文学/大域routing | 先送り | Kimi (Moonshot AI) (2026-07-18) |
 
 ### 実装メモ(2026-07-06、Claude Fable 5)
 
@@ -313,6 +319,214 @@ FujiShaderGPU オリジナル。ガウシアンスケール空間 L(x; σ_i) の
 
 ---
 
+## 検討中候補(詳細、2026-07-18 追記)
+
+2026-07-06 採用分の実装で「方向性・位相・変分法・スケール間ダイナミクス」の空白は
+概ね埋まった。残る空白の族は **次数統計/数学形態学(min-max-rank)**、
+**パターン分類(カテゴリ出力)**、**第二級統計/地統計(分散・共分散)**、
+**非局所パッチ法**、および大域 routing を要する**水文学系**である。
+以下はこれらの族からの追加候補(Kimi (Moonshot AI) による検討)。
+
+### G1. Geomorphons(地形形態パターン分類)
+
+**提案: Kimi (Moonshot AI)(2026-07-18 検討)/ 判断: 検討中**
+
+#### 概要
+
+8方向の見通し(LOS)走査で、距離 L 以内の天頂角 ψ と天底角 ν の最大値を取り、
+閾値角 t に対し各方向を三値(+1: 周囲より高い / 0: 同程度 / −1: 低い)に分類する。
+8方向の三値パターンを回転・鏡映の同値類にまとめ、10地形要素
+(flat / peak / ridge / shoulder / spur / slope / hollow / footslope / valley / pit)
+にマッピングする。
+
+既存の curvature(微分型の連続スカラー)とも openness(角度の方向平均)とも違い、
+**パターンマッチングによる離散的な地形形態「分類」**であり、カテゴリという
+新しい出力次元を持つ。連続場アルゴリズムでは混ざり合う「尾根肩」「谷肩」「沢頭」
+などの地形単位が、塗り分け可能な離散ラベルとして得られる。クラス色塗り図のほか、
+峰/谷の二値マスクとして既存アルゴリズムの重み・マスクにも流用できる。
+
+#### 出典
+
+- Jasiewicz, J. & Stepinski, T.F. (2013) "Geomorphons — a pattern recognition approach to classification and mapping of landforms." *Geomorphology* 182. — 原法。GRASS GIS r.geomorphon として広く実装済み。
+- 代替の分類系: Weiss, A. (2001) "Topographic Position and Landforms Analysis." *ESRI User Conference 2001*. — 2スケール TPI + slope による10区分。
+- LOS 走査の背景: Yokoyama, R. et al. (2002) openness(既存実装)と同じ8方向走査機構。
+
+#### 実装の方向性
+
+- 8方向走査は openness の機構(方向ごとの逐次最大角更新、距離 L で打ち切り)を
+  流用できる。相違は openness が角度を平均するのに対し、こちらは天頂・天底の
+  **最大角のみ**保持して三値化する点。halo = L(既定 30–60px で十分なことが多く、
+  MAX_DEPTH=150 に収まる)。
+- 三値パターン 3^8 = 6561 → 回転/鏡映同値類 498 → 10 クラスへのルックアップは
+  事前計算して定数テーブル化し、CuPy の LUT 参照で完結させる。
+- パラメータ案: `--geomorphon-t`(閾値角、既定 1°)、`--lookup-distance`(既定 40px)。
+- 出力: クラス番号 0–9 の1バンド。**percentile 正規化をバイパスするカテゴリ出力の
+  特例が必要**(前例がないため要対応)。連続場版としてパターンの flatness 度などを
+  返すスカラーモードもオプションで用意すると既存経路に乗せやすい。
+- シーム: 走査長 L ≤ halo なら厳密にタイル整合。NoData 縁は openness と同じ流儀。
+
+---
+
+### F1. マルチスケール形態学トップハット / 差分形態プロファイル(DMP)
+
+**提案: Kimi (Moonshot AI)(2026-07-18 検討)/ 判断: 検討中**
+
+#### 概要
+
+半径 r の平坦構造要素による opening γ_r(z)(侵食→膨張)と closing φ_r(z) を計算し、
+white top-hat `WTH_r = z − γ_r(z)`(r より小さい凸要素の高さ)と
+black top-hat `BTH_r = φ_r(z) − z`(凹要素の深さ)を得る。r を段階的に変えた
+WTH/BTH 列が「形態プロファイル」で、その差分(DMP)が最大になる r が
+**その地点の地形要素の特性スケール**を示す。
+
+ガウシアン USM(topousm)や TV 分解は線形/norm ベースの平滑との残差であり、
+急崖では基準面そのものが動く。min/max 演算に基づく opening は
+**基準面が「谷を埋めた」包絡面**になるため、突出部(火口丘・砂丘・畝状構造・
+リッジ)の大きさと高さが分離して定量できる。次数統計(min/max)という
+現行実装に皆無の数学的族であり、ハローも出ない。
+
+#### 出典
+
+- Serra, J. (1982) *Image Analysis and Mathematical Morphology*. Academic Press. — 原典。
+- Pesaresi, M. & Benediktsson, J.A. (2001) "A new approach for the morphological segmentation of high-resolution satellite imagery." *IEEE Trans. Geosci. Remote Sensing* 39(2). — DMP(差分形態プロファイル)。
+- van Herk, M. (1992) "A fast algorithm for local minimum and maximum filters on rectangular and octagonal kernels." *Pattern Recognition Letters* 13(7); Gil, J. & Werman, M. (1993). — O(1)/画素の分離可能 min-max フィルタ。
+- Soille, P. (2003) *Morphological Image Analysis: Principles and Applications*. Springer. — DEM への形態学適用の総説。
+
+#### 実装の方向性
+
+- van Herk–Gil-Werman で行/列に分離(円盤近似は8方向走査の複合で近似可)。
+  各方向1パス・画素あたり数比較で GPU 負荷は極めて軽い。halo = r_max
+  (150px にクランプ)。
+- `--radii` を構造要素半径系列として解釈、`--weights` は DMP 合成に使用。
+- 出力モード案: `--mh-output wth|bth|both|scale`(既定 both: WTH−BTH の発散マップ)。
+  `scale` は DMP 最大スケールの1バンドで、既存のどれとも異なる
+  「地形の目の粗さの定量的地図」になる。
+- 正規化: WTH/BTH は非負で既存の percentile 正規化に素直に載る。scale 出力は
+  r_max で [0,1] に正規化。
+- 検証: 既知半径・既知高さの人工突起列で scale 出力がその半径を返すことを
+  ユニットテスト化。
+
+---
+
+### F2. 局所標高ランク(順位レリーフ / Percentile Relief)
+
+**提案: Kimi (Moonshot AI)(2026-07-18 検討)/ 判断: 検討中**
+
+#### 概要
+
+窓内の標高分布に対する自画素の順位 `P(x) = #{z < z(x)} / N` を [0,1] で与える。
+TPI(z − 局所平均)が「平均からの差」なのに対し、これは**分布中の順位**であり、
+外れ値・長尾分布に頑健かつ振幅不変。高山の稜線も低地の微小な堤防も
+「局所的に高い場所」として同じ 1.0 付近に描かれる。出力は標高への厳密な
+局所ヒストグラム平坦化(CLAHE の平滑化なし版)に相当する。
+
+openness が「見通し角度」、F1 が「包絡面からの距離」という幾何ベースの凸凹度
+なのに対し、これは純粋な**順序統計量**ベースの相対高度であり、
+標高値そのものの分布形状を一切仮定しない。
+
+#### 出典
+
+- Pizer, S.M. et al. (1987) "Adaptive histogram equalization and its variations." *Computer Vision, Graphics, and Image Processing* 39(3). — CLAHE(局所順位マッピング)。
+- Gallant, J.C. & Dowling, T.I. (2003) "A multiresolution index of valley bottom flatness for mapping depositional areas." *Water Resources Research* 39(12). — 局所標高順位を谷底平野指標(MrVBF)の成分として使用(本候補はその純粋な順位場版で、流路解析・解像度ピラミッドには依存しない)。
+
+#### 実装の方向性
+
+- 窓 w×w の全ペア比較は O(w²)/画素だが、「シフト画像との比較を box フィルタで
+  蓄積」する形で GPU に載る(w=31px・961比較でも実用的、メモリ帯域律速)。
+  halo = w/2(≤75px で MAX_DEPTH に収まる)。
+- 高速化の代替: 局所平均・分散からのガウス近似順位 Φ((z−μ)/σ)(安いが長尾に弱い)を
+  `--rank-mode exact|gauss` で選択可能に。
+- 出力: [0,1] 1バンドで正規化パイプラインは素通し可。`--radii` を窓半径系列として
+  複数窓の順位の加重平均(マルチスケール順位)にも乗る。
+- 検証: 単調スロープ+孤立突起の人工 DEM で、突起画素が ~1.0、周縁が ~0.5 に
+  なることをユニットテスト化。
+
+---
+
+### H1. 方向性バリオグラム粗さ異方性(ラグ固定の地統計ファブリック)
+
+**提案: Kimi (Moonshot AI)(2026-07-18 検討)/ 判断: 検討中**
+
+#### 概要
+
+ラグ d(例 4,8,16px)・方向 θ(8方向)のバリオグラム
+`γ_d(θ) = ½·E[(z(x) − z(x + d·u_θ))²]` を計算し、方向ごとの粗さのローズ図から
+**粗さの異方性比 A = γ_max/γ_min とその方向**を得る。
+
+structure_tensor(A1)が「勾配の向きの揃い方」= **地形フォームの走向**を返すのに
+対し、こちらは「どちらの方向に地形が粗いか」= **テクスチャの異方性**。
+fractal_anomaly がスケール方向の粗さ変化(等方的)を見るのに対し、こちらは
+ラグ固定で方向を見る。砂丘(走向方向に滑らか・横断方向に粗い)、侵食ガリー、
+氷食地形など、フォームではなく粗さの配向を持つプロセスの指紋を拾う。
+第二級統計(分散・共分散)の族は現行実装に皆無。
+
+拡張案: 方向ごとの γ(d) を d について走らせ、シルに達するレンジや
+hole effect の位置から**地形の特性波長**(砂丘間隔・ガリー間隔)の地図を作る。
+
+#### 出典
+
+- Matheron, G. (1963) "Principles of geostatistics." *Economic Geology* 58(8). — バリオグラム原論。
+- Herzfeld, U.C. & Higginson, C.A. (1996) "Automated geostatistical seafloor classification: Parameters for zonation, classification, and pattern recognition." *Geo-Marine Letters* 16. — 海底地形の方向性粗さによる分類。
+- Trevisani, S., Cavalli, M. & Marchi, L. (2012) "Surface texture analysis of a high-resolution DTM: Interpreting an alpine basin." *Geomorphology* 153–154. — バリオグラム系の地形テクスチャ解析。
+- Haralick, R.M. et al. (1973) "Textural features for image classification." *IEEE Trans. SMC* 3(6). — GLCM contrast はバリオグラムのラグ固定版と等価。
+
+#### 実装の方向性
+
+- 計算はシフト差分二乗+窓平均のみ(畳み込み系の既存部品で組める)。
+  halo = d_max + 窓半径(MAX_DEPTH に収まりやすい)。
+- `--radii` をラグ d 系列として解釈。方向数は 8 固定で十分。
+- 出力モード案:
+  - `--vg-output anisotropy`: A−1(等方で 0)の1バンド
+  - `--vg-output orientation`: 粗さ最大方向(A1 と同じ角度→[0,1) マッピング)
+  - HSV 合成はマルチバンド COG 対応後(A1 と同じ判断)
+- 正規化: γ を窓内分散で割れば無次元化でき、グローバル統計の percentile
+  正規化にも載る。
+- 検証: 一方向のみ正弦波を持つ人工縞模様 DEM で、異方性方向が縞に対し
+  正しい向きを返すことをユニットテスト化。
+
+---
+
+### E4. パッチ再帰性マップ(非局所自己類似度)
+
+**提案: Kimi (Moonshot AI)(2026-07-18 検討・オリジナル)/ 判断: 検討中**
+
+#### 概要
+
+各画素の p×p パッチを、周囲 R px の探索窓内の全パッチと SSD 比較し、
+「自分自身以外にどれだけ似たパッチが存在するか」(再帰スコア =
+`exp(−SSD_min/2σ²)` または上位 k 件の重み和)を可視化する。
+
+砂丘・モレーン・耕作痕・畝状地形のように**同じ地形素形が反復出現する
+プロセス領域**ではスコアが高く、噴出物堆積や崩壊地のようなカオス的地形では
+低い。既存の全手法が「画素とその近傍の局所関係」しか見ないのに対し、
+これは**非局所的なパッチ対応**を見る初の候補であり、「反復性」という新しい軸で
+プロセスドメインを分割する。地形への適用・命名とも本提案がオリジナル
+(実装時に要再調査)。
+
+#### 出典
+
+- (地形適用の直接の先行研究なし — オリジナル。以下は理論的基盤)
+- Shechtman, E. & Irani, M. (2007) "Matching local self-similarities across images and videos." *CVPR 2007*. — 局所自己類似度ディスクリプタ。
+- Buades, A., Coll, B. & Morel, J.-M. (2005) "A non-local algorithm for image denoising." *CVPR 2005*. — NL-means(パッチ重みの定式化)。
+- Efros, A.A. & Leung, T.K. (1999) "Texture synthesis by non-parametric sampling." *ICCV 1999*. — テクスチャ=パッチ反復性という思想。
+
+#### 実装の方向性
+
+- SSD を「p×p カーネルでの box_filter((z − shift(z))²)」として各探索オフセットに
+  ついて計算し、オフセット数 (2R+1)² 回の畳み込みで全探索位置をカバー
+  (NL-means の標準的 GPU 実装と同型)。p=5, R=12 程度で実用的。
+  halo = R + p/2(≪150px)。
+- 中心オフセット(自己一致)は除外し、最小距離 r_min > p のリング状探索にすると
+  パッチ重複による自明な一致を避けられる。
+- 出力: 再帰スコア [0,1] の1バンド。オプションで最良一致の方向(反復の配向、
+  砂丘列の配列方向検出に)。
+- `--radii` は探索半径 R として解釈するが、ラグではなく探索範囲なので
+  weights 合成は不自然。単一スケール運用を既定とする。
+- 検証: 周期的ストライプ領域+ランダム領域の合成 DEM で、前者が高スコア・
+  後者が低スコアになることをユニットテスト化。
+
+---
+
 ## 先送り候補(概要のみ)
 
 ### B2. 方向性ウェーブレット(Gabor / Shearlet)エネルギー地図
@@ -353,6 +567,24 @@ DEM を仮想侵食し、各画素の標高が閾値以上変化するまでの�
 尾根の鋭さ・地形の若さの指標。長時間反復 PDE のためタイル境界整合が困難
 (D1 と違い情報が流路沿いに長距離伝播する)。粗解像度実行が現実解だが優先度低。
 
+### I1. HAND(最近傍排水基準の相対標高)/ 水文正規化レリーフ
+
+**提案: Kimi (Moonshot AI)(2026-07-18)/ 判断: 先送り(C1 と同じ構造的理由)**
+
+フロールーティングで定めた局所排水基準面(最近傍水路セルの標高を流路に沿って
+参照)からの相対高度 HAND = z − z_drain。氾濫原・段丘面・扇状地を
+「排水基準からの高さ」という水文的に意味のある軸で描き、絶対標高の
+グラデーションを剥がした地形可視化ができる。谷底平野・テラス抽出の定番。
+出典: Rennó, C.D. et al. (2008) "HAND: A new terrain descriptor using SRTM-DEM:
+Mapping terra-firme rainforest environments in Amazonia." *Geomorphology* 98(3–4);
+窪地埋めは Barnes, R. et al. (2014) "Priority-flood: An optimal depression-filling
+and watershed-labeling algorithm for digital elevation models."
+*Computers & Geosciences* 62。
+流路網抽出・流量累積・窪地埋めが大域的な優先度フッド/逐次処理を要し、
+タイル/GPU と相性が悪い点は C1(persistence)と同じ。採るならオーバービュー上で
+グローバル routing → フル解像度へ転写するハイブリッド構成
+(排水基準面のフル解像度補間方法が別途課題)。
+
 ---
 
 ## 追記テンプレート(新しい提案はこの形式で追加)
@@ -376,3 +608,4 @@ DEM を仮想侵食し、各画素の標高が閾値以上変化するまでの�
 
 *初版: 2026-07-06 — Claude Fable 5 による検討に基づく。*
 *採用/先送りの判断: プロジェクトオーナー(2026-07-06)。*
+*追記: 2026-07-18 — Kimi (Moonshot AI) による検討に基づき、G1 / F1 / F2 / H1 / E4(検討中)と I1(先送り)を追加。*
