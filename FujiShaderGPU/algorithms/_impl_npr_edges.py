@@ -261,6 +261,7 @@ class NPREdgesAlgorithm(DaskAlgorithm):
             threshold_low=threshold_low,
             threshold_high=threshold_high,
             pixel_size=pixel_size,
+            grad_stats=npr_local_grad_stats(params),
         )
 
     def get_default_params(self) -> dict:
@@ -271,6 +272,20 @@ class NPREdgesAlgorithm(DaskAlgorithm):
             'pixel_size': 1.0,
             'mode': 'local', 'radii': None, 'weights': None,
         }
+
+
+# Key of the local-mode entry in ``_npr_grad_stats``.  A radius <= 1 is not
+# pre-smoothed (``_smooth_for_radius``), so the local-mode gradient is exactly
+# the spatial radius-1 gradient and shares its key.
+NPR_LOCAL_GRAD_KEY = 1
+
+
+def npr_local_grad_stats(params: dict):
+    """Global (base, range, mean) for the local-mode threshold, or None."""
+    gs_map = (params or {}).get("_npr_grad_stats")
+    if isinstance(gs_map, dict):
+        return gs_map.get(NPR_LOCAL_GRAD_KEY)
+    return None
 
 
 def _compute_npr_grad_stats(
@@ -286,7 +301,8 @@ def _compute_npr_grad_stats(
     stratified tiles.  npr's edge threshold is otherwise computed per block, which
     differs tile-to-tile and seams.  Only the small (full-res, multi-tile) radii
     need this; large radii run the whole coarsened grid as one block and are
-    already global.  Returns {round(radius): (base, range, mean)}.
+    already global.  In local mode (no pre-smoothing) a single entry keyed
+    ``NPR_LOCAL_GRAD_KEY`` is built.  Returns {round(radius): (base, range, mean)}.
 
     Backend-neutral (rasterio + cupy only) so both the Dask and tile pipelines
     share one implementation."""
@@ -297,19 +313,25 @@ def _compute_npr_grad_stats(
     except Exception as exc:
         logger.warning("npr grad-stats helpers unavailable: %s", exc)
         return None
-    radii = (params or {}).get("radii") or []
-    small = [float(r) for r in radii if float(r) <= small_radius_max]
+    if str((params or {}).get("mode", "local")).lower() == "spatial":
+        radii = (params or {}).get("radii") or []
+        small = [float(r) for r in radii if float(r) <= small_radius_max]
+    else:
+        # Local mode thresholds the un-smoothed full-res gradient (radius 1).
+        small = [float(NPR_LOCAL_GRAD_KEY)]
     if not small:
         return None
     pixel_size = float(params.get("pixel_size", 1.0))
     edge_sigma = float(params.get("edge_sigma", 1.0))
+    # Gaussian pre-smoothing footprint (edge_sigma) on top of the radius halo.
+    sig_halo = int(4 * edge_sigma + 2) if edge_sigma != 1.0 else 0
     tl = float(params.get("threshold_low", 0.2))
     th_ = float(params.get("threshold_high", 0.5))
     low_res = classify_resolution(pixel_size) in ("low", "very_low", "ultra_low")
     try:
         from ._norm_stats import stratified_windows
 
-        margin = int(min(2 * max(small) + 16, max_tile // 4))
+        margin = int(min(2 * max(small) + 16 + sig_halo, max_tile // 4))
         tile = int(min(max_tile, max(2048, 4 * margin)))
         # radius -> list of pooled host arrays.  One GPU tile is resident at a
         # time (the radius loop runs inside the tile loop); the previous layout
@@ -347,7 +369,7 @@ def _compute_npr_grad_stats(
                     grad = compute_npr_edges_spatial_block(
                         g, edge_sigma=edge_sigma, threshold_low=tl, threshold_high=th_,
                         pixel_size=pixel_size, radius=r, _return_grad=True)
-                    m = int(min(int(2 * r + 16), grad.shape[0] // 3, grad.shape[1] // 3))
+                    m = int(min(int(2 * r + 16) + sig_halo, grad.shape[0] // 3, grad.shape[1] // 3))
                     if m > 0:
                         grad = grad[m:-m, m:-m]
                     v = grad[~cp.isnan(grad)]
@@ -383,5 +405,6 @@ __all__ = [
     "compute_npr_edges_block",
     "compute_npr_edges_spatial_block",
     "NPREdgesAlgorithm",
+    "npr_local_grad_stats",
     "_compute_npr_grad_stats",
 ]

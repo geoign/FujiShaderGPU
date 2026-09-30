@@ -54,14 +54,14 @@ def compute_specular_block(block, *, roughness_scale=20.0, shininess=10.0,
     if nan_mask.any():
         filled = cp.where(nan_mask, 0, block)
         valid = (~nan_mask).astype(cp.float32)
-        mean_values = uniform_filter(filled * valid, size=kernel_size, mode='constant')
-        mean_weights = uniform_filter(valid, size=kernel_size, mode='constant')
+        mean_values = uniform_filter(filled * valid, size=kernel_size, mode='reflect')
+        mean_weights = uniform_filter(valid, size=kernel_size, mode='reflect')
         mean_f = cp.where(mean_weights > 0, mean_values / mean_weights, 0)
-        sq_values = uniform_filter((filled**2) * valid, size=kernel_size, mode='constant')
+        sq_values = uniform_filter((filled**2) * valid, size=kernel_size, mode='reflect')
         mean_sq_f = cp.where(mean_weights > 0, sq_values / mean_weights, 0)
     else:
-        mean_f = uniform_filter(block, size=kernel_size, mode='constant')
-        mean_sq_f = uniform_filter(block**2, size=kernel_size, mode='constant')
+        mean_f = uniform_filter(block, size=kernel_size, mode='reflect')
+        mean_sq_f = uniform_filter(block**2, size=kernel_size, mode='reflect')
     roughness = cp.sqrt(cp.maximum(mean_sq_f - mean_f**2, 0))
     roughness_valid = roughness[~nan_mask] if nan_mask.any() else roughness
     if len(roughness_valid) > 0:
@@ -216,12 +216,12 @@ def _roughness_p95_block(block: cp.ndarray, kernel: int) -> cp.ndarray:
     if bool(nan_mask.any()):
         filled = cp.where(nan_mask, 0, block)
         valid = (~nan_mask).astype(cp.float32)
-        mw = uniform_filter(valid, size=kernel, mode='constant')
-        mean_f = cp.where(mw > 0, uniform_filter(filled * valid, size=kernel, mode='constant') / mw, 0)
-        mean_sq = cp.where(mw > 0, uniform_filter((filled ** 2) * valid, size=kernel, mode='constant') / mw, 0)
+        mw = uniform_filter(valid, size=kernel, mode='reflect')
+        mean_f = cp.where(mw > 0, uniform_filter(filled * valid, size=kernel, mode='reflect') / mw, 0)
+        mean_sq = cp.where(mw > 0, uniform_filter((filled ** 2) * valid, size=kernel, mode='reflect') / mw, 0)
     else:
-        mean_f = uniform_filter(block, size=kernel, mode='constant')
-        mean_sq = uniform_filter(block ** 2, size=kernel, mode='constant')
+        mean_f = uniform_filter(block, size=kernel, mode='reflect')
+        mean_sq = uniform_filter(block ** 2, size=kernel, mode='reflect')
     return cp.sqrt(cp.maximum(mean_sq - mean_f ** 2, 0))
 
 

@@ -111,6 +111,13 @@ def compute_lic_block(block, *, length=20, lic_field='flow', composite='hillshad
         step_y = abs(float(pixel_scale_y if pixel_scale_y is not None else pixel_size)) or 1.0
         step_x = abs(float(pixel_scale_x if pixel_scale_x is not None else pixel_size)) or 1.0
         dy, dx = cp.gradient(filled, step_y, step_x)
+        # Same sign rule as compute_hillshade_block: the row/column gradients
+        # are w.r.t. increasing index; the signed geotransform scales turn them
+        # into dz/d(east) and dz/d(north) (north-up rasters: psy < 0).
+        sign_x = 1.0 if (pixel_scale_x is None or float(pixel_scale_x) >= 0.0) else -1.0
+        sign_y = 1.0 if (pixel_scale_y is None or float(pixel_scale_y) >= 0.0) else -1.0
+        dx = dx * sign_x
+        dy = dy * sign_y
         denom = cp.sqrt(dx * dx + dy * dy + 1.0)
         nxl = -dx / denom
         nyl = -dy / denom

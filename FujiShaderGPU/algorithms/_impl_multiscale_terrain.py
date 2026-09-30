@@ -146,7 +146,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         return norm_min, norm_scale
 
     def process(self, gpu_arr, **params):
-        scales, is_spatial = _resolve_scales(params)
+        scales, _ = _resolve_scales(params)
         weights = params.get('weights', None)
         if weights is None or len(weights) != len(scales):
             weights = [1.0 / float(s) for s in scales]
@@ -160,16 +160,16 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
         pixel_size = float(params.get('pixel_size', 1.0))
         psx = params.get('pixel_scale_x', None)
         psy = params.get('pixel_scale_y', None)
-        # Coarse path is only used in the explicit spatial (radii) mode; the
-        # default-scales path keeps its original uniform-depth behavior exactly.
+        # Coarse path for scales whose 4*sigma halo exceeds MAX_DEPTH, for the
+        # default scales too: the old uniform depth (capped at MAX_DEPTH) left
+        # the sigma=50/100 defaults seeing padded data at chunk edges -> seams.
         # Coarsen for large scales on geographic DEMs too (pixel-based, correct).
-        F = coarsen_factor_for_shape(gpu_arr.shape) if is_spatial else 1
+        F = coarsen_factor_for_shape(gpu_arr.shape)
         # Tile backend (single small tile -> F==1): use the injected global overview
         # for large scales so they are seam-free; Dask (no _tile_origin) keeps F>1.
         _coarse_ok_tile = (
             params.get("_overview_coarse_dem") is not None
             and params.get("_tile_origin") is not None)
-        common_depth = min(int(4 * max(scales)), Constants.MAX_DEPTH)
         cache = {}
 
         results = []
@@ -190,7 +190,7 @@ class MultiscaleDaskAlgorithm(DaskAlgorithm):
                 )
                 results.append(gpu_arr - smooth_up)
             else:
-                depth = min(int(4 * scale), Constants.MAX_DEPTH) if is_spatial else common_depth
+                depth = min(int(4 * scale), Constants.MAX_DEPTH)
                 results.append(gpu_arr.map_overlap(
                     _detail_block, depth=depth, boundary='reflect',
                     dtype=cp.float32, meta=cp.empty((0, 0), dtype=cp.float32),

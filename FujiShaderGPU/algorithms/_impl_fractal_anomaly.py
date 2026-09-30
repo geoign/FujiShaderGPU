@@ -29,6 +29,22 @@ def fractal_large_scale_predicate(radius) -> bool:
     return int(2 * float(radius) + 16) > Constants.MAX_DEPTH
 
 
+def _sort_radii_ascending(radii, weights=None):
+    """Return ``(radii, weights)`` sorted by ascending radius, carrying a
+    length-matching weight list along.  The fractal feature indexes scales by
+    position (fine = first, macro = last), so ``--radii`` order must not matter."""
+    radii = list(radii)
+    order = sorted(range(len(radii)), key=lambda i: float(radii[i]))
+    if weights is not None:
+        try:
+            wl = list(weights)
+        except TypeError:
+            wl = None
+        if wl is not None and len(wl) == len(radii):
+            weights = [wl[i] for i in order]
+    return [radii[i] for i in order], weights
+
+
 def compute_roughness_multiscale(block, radii, window_mult=3, detrend=True):
     """Compute per-scale roughness maps for fractal-style analysis."""
     nan_mask = cp.isnan(block)
@@ -96,6 +112,7 @@ def compute_fractal_dimension_block(block, *, radii=None,
     """
     if radii is None:
         radii = [4, 8, 16, 32, 64]
+    radii, weights = _sort_radii_ascending(radii, weights)
     sigmas = compute_roughness_multiscale(block, radii, window_mult=3, detrend=True)
     return _fractal_feature_from_roughness(
         block, sigmas, radii=radii, weights=weights, normalize=normalize,
@@ -262,6 +279,9 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
             radii = self._determine_optimal_radii(ps)
         if len(radii) < 5:
             radii = [4, 8, 16, 32, 64]
+        # Ascending radii (weights carried) for the stats pre-pass, the hybrid
+        # combine and the single-block path alike.
+        radii, weights = _sort_radii_ascending(radii, weights)
         max_r = max(radii)
         # Roughness uses a Gaussian with sigma = r/2 (window_mult=3, /6), whose
         # 4-sigma kernel needs ~2r of halo (+16 for the feature smoothing + median).
@@ -272,16 +292,16 @@ class FractalAnomalyAlgorithm(DaskAlgorithm):
         stats_ok = (isinstance(stats, (tuple, list)) and len(stats) >= 2
                      and float(stats[1]) > 1e-9)
         if not stats_ok:
-            nb = int(np.prod(gpu_arr.numblocks)) if hasattr(gpu_arr, "numblocks") else 1
-            if nb > 1:
-                stats = compute_global_stats(
-                    gpu_arr, fractal_stat_func, compute_fractal_dimension_block,
-                    {'radii': radii, 'normalize': False, 'smoothing_sigma': sm_sig,
-                     'despeckle_threshold': ds_thr, 'despeckle_alpha_max': ds_am,
-                     'detail_boost': db, 'weights': weights},
-                    depth=stats_depth, algorithm_name='fractal_anomaly')
-            else:
-                stats = (0.0, 0.5)
+            # Central-window estimate for any chunk count.  A single chunk used to
+            # get fixed (0, 0.5) stats, but compute_fractal_dimension_block does not
+            # self-normalize, so the output was left uncentred (median ~ -0.8).
+            stats = compute_global_stats(
+                gpu_arr, fractal_stat_func, compute_fractal_dimension_block,
+                {'radii': radii, 'normalize': False, 'smoothing_sigma': sm_sig,
+                 'despeckle_threshold': ds_thr, 'despeckle_alpha_max': ds_am,
+                 'detail_boost': db, 'weights': weights,
+                 'relief_p10': rp10, 'relief_p75': rp75},
+                depth=stats_depth, algorithm_name='fractal_anomaly')
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):
             stats = (0.0, 0.5)
         if rp10 is None and rp75 is None:

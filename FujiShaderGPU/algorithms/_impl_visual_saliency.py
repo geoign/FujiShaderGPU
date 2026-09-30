@@ -7,7 +7,6 @@ Module split out from dask_shared.py (Phase 3).
 from __future__ import annotations
 import logging
 import cupy as cp
-import numpy as np
 from cupyx.scipy.ndimage import gaussian_filter
 
 from ._base import DaskAlgorithm, Constants
@@ -267,18 +266,16 @@ class VisualSaliencyAlgorithm(DaskAlgorithm):
         stats = params.get('global_stats', None)
         stats_ok = isinstance(stats, (tuple, list)) and len(stats) >= 2
         if not stats_ok:
-            num_blocks = int(np.prod(gpu_arr.numblocks)) if hasattr(gpu_arr, "numblocks") else 1
-            if num_blocks > 1:
-                stats = compute_global_stats(
-                    gpu_arr, visual_saliency_stat_func,
-                    compute_visual_saliency_block,
-                    {'scales': scales, 'pixel_size': pixel_size,
-                     'pixel_scale_x': pixel_scale_x,
-                     'pixel_scale_y': pixel_scale_y, 'normalize': False,
-                     'weights': weights},
-                    depth=min(int(max(use_scales) * 5), Constants.MAX_DEPTH))
-            else:
-                stats = (0.0, 1.0)
+            # Central-window estimate for any chunk count (a single chunk used to
+            # get a fixed, DEM-unit-dependent (0, 1) scale instead).
+            stats = compute_global_stats(
+                gpu_arr, visual_saliency_stat_func,
+                compute_visual_saliency_block,
+                {'scales': scales, 'pixel_size': pixel_size,
+                 'pixel_scale_x': pixel_scale_x,
+                 'pixel_scale_y': pixel_scale_y, 'normalize': False,
+                 'weights': weights},
+                depth=min(int(max(use_scales) * 5), Constants.MAX_DEPTH))
         if not (isinstance(stats, (tuple, list)) and len(stats) >= 2):
             stats = (0.0, 1.0)
 

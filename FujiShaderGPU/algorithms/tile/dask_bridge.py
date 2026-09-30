@@ -276,14 +276,17 @@ def _direct_npr_edges(block, params):
     # Dask implementation so the tile backend matches it exactly.
     if str(params.get("mode", "local")).lower() == "spatial":
         raise _FallbackToDask()
-    from .._impl_npr_edges import compute_npr_edges_block
+    from .._impl_npr_edges import compute_npr_edges_block, npr_local_grad_stats
 
+    # Global (pre-pass) gradient threshold so tiles do not threshold against
+    # their own gradient percentiles (tile-dependent output / seams).
     return compute_npr_edges_block(
         block,
         edge_sigma=params.get("edge_sigma", 1.0),
         threshold_low=params.get("threshold_low", 0.1),
         threshold_high=params.get("threshold_high", 0.3),
         pixel_size=params.get("pixel_size", 1.0),
+        grad_stats=npr_local_grad_stats(params),
     )
 
 
@@ -314,8 +317,8 @@ def _direct_fractal_anomaly(block, params, algo):
     stats = params.get("global_stats", None)
     if not (isinstance(stats, (tuple, list)) and len(stats) >= 2 and float(stats[1]) > 1e-9):
         logger.warning(
-            "fractal_anomaly: global_stats missing on tile direct path; using "
-            "the shared Dask fallback instead of per-tile statistics."
+            "fractal_anomaly: global_stats missing on tile direct path; each tile "
+            "estimates its own statistics (levels may step at tile seams)."
         )
         raise _FallbackToDask()
     rp10 = params.get("relief_p10", None)

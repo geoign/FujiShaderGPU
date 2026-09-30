@@ -11,10 +11,10 @@ import logging
 import math
 import cupy as cp
 import dask.array as da
-from cupyx.scipy.ndimage import gaussian_filter
 from .common.kernels import (
     scale_space_surprise as kernel_scale_space_surprise,
     multi_light_uncertainty as kernel_multi_light_uncertainty,
+    nan_normalized_gaussian as kernel_nan_normalized_gaussian,
 )
 
 from ._base import DaskAlgorithm, Constants
@@ -64,19 +64,10 @@ def _sorted_scales_and_pair_weights(scales, weights):
 def _sss_smooth_block(block, *, scale, pixel_size=1.0, pixel_scale_x=None,
                       pixel_scale_y=None, **_ignored):
     """One scale's gaussian smooth, matching ``kernel_scale_space_surprise``
-    (NaN -> per-block nanmean fill, then gaussian, mode='reflect')."""
+    (NaN-aware normalized gaussian ``G(z*valid)/G(valid)``, mode='reflect')."""
     nan_mask = cp.isnan(block)
-    if bool(nan_mask.any()):
-        if bool((~nan_mask).any()):
-            valid = (~nan_mask).astype(cp.float32)
-            values = gaussian_filter(cp.where(nan_mask, 0.0, block), sigma=1.0, mode="nearest")
-            support = gaussian_filter(valid, sigma=1.0, mode="nearest")
-            work = cp.where(nan_mask, values / cp.maximum(support, 1e-6), block)
-        else:
-            work = cp.zeros_like(block)
-    else:
-        work = block
-    return gaussian_filter(work, sigma=max(float(scale), 0.5), mode='reflect').astype(cp.float32)
+    return kernel_nan_normalized_gaussian(
+        block, nan_mask, max(float(scale), 0.5), mode='reflect').astype(cp.float32)
 
 
 def _sss_combine_block(block, *smooths, pair_w=None, norm_min=0.0, norm_scale=1.0,

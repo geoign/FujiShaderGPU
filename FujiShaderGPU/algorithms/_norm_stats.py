@@ -60,6 +60,18 @@ _NORM_STAT_SPECS = {
                    "compute_scale_drift_block", "drift_stretch_stat_func"),
 }
 
+# ``--mode spatial`` overrides of the raw block function.  In spatial mode (the
+# CLI default) ambient_occlusion / openness stretch the weighted multi-radius
+# combination, whose distribution differs from the single-radius local block
+# (radius / max_distance); the pre-pass must pool the same field or the
+# [p1, p99] -> [0, 1] stretch lands on the wrong range (output fills roughly
+# [0.3, 0.9] instead of [0, 1]).  The other specs' block functions already take
+# the main pass's radii/scales directly, so they need no mode switch.
+_SPATIAL_RAW_FUNCS = {
+    "ambient_occlusion": "compute_ambient_occlusion_spatial_raw",
+    "openness": "compute_openness_spatial_raw",
+}
+
 
 def stratified_windows(
     width: int,
@@ -219,6 +231,9 @@ def _compute_norm_stats_tiled(
             merged["radii"] = list(merged["_topousm_fast_full_radii"])
             if merged.get("_topousm_fast_full_weights"):
                 merged["weights"] = list(merged["_topousm_fast_full_weights"])
+        if (algorithm in _SPATIAL_RAW_FUNCS
+                and str(merged.get("mode", "local")).lower() == "spatial"):
+            block_func = getattr(mod, _SPATIAL_RAW_FUNCS[algorithm])
         if _norm_stats_unused_for_mode(algorithm, merged):
             logger.info("Skipping %s norm stats: selected output mode does not consume global_stats", algorithm)
             return None
@@ -272,9 +287,11 @@ def _compute_norm_stats_tiled(
                     continue
                 g = cp.asarray(a)
                 raw = block_func(g, **kw)
-                m = int(min(margin, raw.shape[0] // 3, raw.shape[1] // 3))
+                # Trim the last two (spatial) axes: agg="stack" raw fields are
+                # band-first (C, H, W).
+                m = int(min(margin, raw.shape[-2] // 3, raw.shape[-1] // 3))
                 if m > 0:
-                    raw = raw[m:-m, m:-m]
+                    raw = raw[..., m:-m, m:-m]
                 vals = raw[~cp.isnan(raw)]
                 if vals.size:
                     pooled.append(cp.asnumpy(vals))
@@ -303,9 +320,9 @@ def inject_global_stats(src_cog: str, algorithm: str, params: dict, *, is_zarr: 
     ``params`` (in place), in the correct order and at full resolution.
 
     Single source of truth shared by the Dask and tile backends so their global
-    statistics cannot drift.  All steps are mode-independent (they run for both
-    ``local`` and ``spatial``) and seam-free (global, not per-tile).  No-op for
-    Zarr inputs.  Order matters:
+    statistics cannot drift.  All steps run for both ``local`` and ``spatial``
+    (each pools the raw field of the selected mode) and are seam-free (global,
+    not per-tile).  No-op for Zarr inputs.  Order matters:
 
     1. fractal_anomaly relief (p10/p75) BEFORE the norm-stats pre-pass, so the
        pre-pass feature distribution matches the main pass (correct median
@@ -314,7 +331,8 @@ def inject_global_stats(src_cog: str, algorithm: str, params: dict, *, is_zarr: 
        fractal_anomaly / scale_space_surprise / visual_saliency /
        multiscale_terrain / ambient_occlusion / openness) from stratified
        full-resolution tiles.
-    3. npr_edges global per-radius gradient threshold.
+    3. npr_edges global gradient threshold (per small radius in spatial mode,
+       a single local-mode entry otherwise).
     4. specular global roughness p95.
     """
     if is_zarr:

@@ -161,7 +161,45 @@ def compute_openness_spatial_block(
         pixel_size=float(pixel_size) * float(ds_factor),
         pixel_scale_x=ds_psx, pixel_scale_y=ds_psy,
     )
-    return _upsample_to_shape(result_small, block.shape)
+    return _upsample_to_shape(result_small, block.shape, factor=ds_factor)
+
+
+def _openness_spatial_radii(radii) -> list:
+    """Integer max_distance values used by the spatial-mode main pass (and its pre-pass)."""
+    return [float(int(max(2, round(float(r))))) for r in radii]
+
+
+def compute_openness_spatial_raw(
+    block: cp.ndarray,
+    *,
+    radii=None,
+    weights=None,
+    agg: str = "mean",
+    openness_type: str = 'positive',
+    num_directions: int = 16,
+    pixel_size: float = 1.0,
+    pixel_scale_x: float = None,
+    pixel_scale_y: float = None,
+) -> cp.ndarray:
+    """Spatial-mode raw (pre-stretch) openness field on one full-resolution block.
+
+    Mirrors ``process()``'s ``mode == "spatial"`` branch -- same max_distance
+    rounding, weight resolution and multi-radius combination -- so the
+    global-stats pre-pass (``_norm_stats``) takes its [p1, p99] display range
+    from the field the main pass actually stretches, not from the single
+    ``max_distance`` local block."""
+    rs, ws = _resolve_spatial_radii_weights(radii, weights, pixel_size)
+    responses = [
+        compute_openness_spatial_block(
+            block, openness_type=openness_type, num_directions=num_directions,
+            max_distance=md, pixel_size=pixel_size,
+            pixel_scale_x=pixel_scale_x, pixel_scale_y=pixel_scale_y,
+        )
+        for md in _openness_spatial_radii(rs)
+    ]
+    fields = [da.from_array(r, chunks=r.shape, asarray=False) for r in responses]
+    return _combine_multiscale_dask(fields, weights=ws, agg=agg).compute(
+        scheduler="synchronous")
 
 
 class OpennessAlgorithm(DaskAlgorithm):
@@ -190,7 +228,7 @@ class OpennessAlgorithm(DaskAlgorithm):
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
             # Large radius from a coarsened DEM (no large per-chunk halo).
             responses = multiscale_response_fields(
-                gpu_arr, [float(int(max(2, round(float(r))))) for r in radii],
+                gpu_arr, _openness_spatial_radii(radii),
                 block_fn=compute_openness_spatial_block, radius_kw="max_distance",
                 depth_for_scale=lambda md: int(md) + 1,
                 is_large=lambda md: int(md) > thr,
@@ -230,5 +268,6 @@ class OpennessAlgorithm(DaskAlgorithm):
 __all__ = [
     "compute_openness_vectorized",
     "compute_openness_spatial_block",
+    "compute_openness_spatial_raw",
     "OpennessAlgorithm",
 ]

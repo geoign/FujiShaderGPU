@@ -79,7 +79,7 @@ def compute_topousm_fast_efficient_block(block: cp.ndarray, *,
                 mean_small, _ = handle_nan_with_gaussian(small, sigma=1.0, mode='nearest')
             else:
                 mean_small, _ = handle_nan_with_uniform(small, size=2 * r_small + 1, mode='reflect')
-            mean_elev = _upsample_to_shape(mean_small, block.shape)
+            mean_elev = _upsample_to_shape(mean_small, block.shape, factor=ds_factor)
         elif radius <= 1:
             mean_elev, _ = handle_nan_with_gaussian(block, sigma=1.0, mode='nearest')
         else:

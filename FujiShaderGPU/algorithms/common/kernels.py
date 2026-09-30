@@ -18,6 +18,24 @@ def _locally_filled(block: cp.ndarray, nan_mask: cp.ndarray) -> cp.ndarray:
     return cp.where(nan_mask, local, block)
 
 
+def nan_normalized_gaussian(block: cp.ndarray, nan_mask: cp.ndarray, sigma: float,
+                            mode: str = "reflect") -> cp.ndarray:
+    """NaN-aware Gaussian smooth ``G(z*valid) / G(valid)`` at ``sigma``.
+
+    Valid pixels near NoData are smoothed over valid neighbours only, at every
+    scale.  (A 1-2 px ``_locally_filled`` followed by a large-sigma blur mixed
+    the deep-NoData zeros -- 0 m -- into coastal pixels.)  Pixels with no valid
+    support get 0; they are NoData and re-masked by the callers.
+    """
+    if not bool(nan_mask.any()):
+        return gaussian_filter(block, sigma=sigma, mode=mode)
+    valid = (~nan_mask).astype(cp.float32)
+    values = gaussian_filter(cp.where(nan_mask, cp.float32(0.0), block), sigma=sigma, mode=mode)
+    weights = gaussian_filter(valid, sigma=sigma, mode=mode)
+    return cp.where(weights > cp.float32(1e-6), values / cp.maximum(weights, cp.float32(1e-6)),
+                    cp.float32(0.0)).astype(block.dtype, copy=False)
+
+
 def scale_space_surprise(
     block: cp.ndarray,
     *,
@@ -35,7 +53,6 @@ def scale_space_surprise(
     """
     if nan_mask is None:
         nan_mask = cp.isnan(block)
-    work = _locally_filled(block, nan_mask)
 
     scale_list = [float(s) for s in scales]
     weight_list = None
@@ -52,10 +69,11 @@ def scale_space_surprise(
     sorted_scales = [s for s, _ in kept]
     sorted_w = [w for _, w in kept] if all(w is not None for _, w in kept) else None
 
+    # response_i = work - blur_i, so consecutive differences reduce to
+    # blur_i - blur_{i+1}; the NaN-aware blur keeps NoData out of every scale.
     responses = []
     for sigma in sorted_scales:
-        blur = gaussian_filter(work, sigma=sigma, mode='reflect')
-        responses.append(work - blur)
+        responses.append(-nan_normalized_gaussian(block, nan_mask, sigma, mode='reflect'))
 
     n_pair = max(1, len(responses) - 1)
     pair_w = None
@@ -65,7 +83,7 @@ def scale_space_surprise(
         if psum > 1e-12:
             pair_w = [p / psum for p in pw]
 
-    surprise = cp.zeros_like(work, dtype=cp.float32)
+    surprise = cp.zeros(block.shape, dtype=cp.float32)
     for i in range(len(responses) - 1):
         term = cp.abs(responses[i + 1] - responses[i])
         surprise += term * pair_w[i] if pair_w is not None else term

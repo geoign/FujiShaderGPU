@@ -20,11 +20,15 @@ def compute_curvature_block(block, *, curvature_type='mean', pixel_size=1.0,
                           pixel_scale_x=None, pixel_scale_y=None):
     """Curvature computation (mean, Gaussian, plan, and profile curvature)."""
     nan_mask = cp.isnan(block)
-    step_y = float(pixel_scale_y if pixel_scale_y is not None else pixel_size)
-    step_x = float(pixel_scale_x if pixel_scale_x is not None else pixel_size)
-    if abs(step_y) < 1e-9:
+    # Unsigned steps, the same row/column frame handle_nan_for_gradient uses for
+    # the first derivatives: a signed (north-up, negative) y step here would flip
+    # dyy/dxy but not dy.  The curvature formulas are invariant to flipping y
+    # as long as every derivative shares one frame.
+    step_y = abs(float(pixel_scale_y if pixel_scale_y is not None else pixel_size))
+    step_x = abs(float(pixel_scale_x if pixel_scale_x is not None else pixel_size))
+    if step_y < 1e-9:
         step_y = float(pixel_size if pixel_size else 1.0)
-    if abs(step_x) < 1e-9:
+    if step_x < 1e-9:
         step_x = float(pixel_size if pixel_size else 1.0)
     dy, dx, _ = handle_nan_for_gradient(
         block, pixel_scale_x=step_x, pixel_scale_y=step_y,

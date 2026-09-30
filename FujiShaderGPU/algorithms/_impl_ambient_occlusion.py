@@ -154,7 +154,44 @@ def compute_ambient_occlusion_spatial_block(
         pixel_size=float(pixel_size) * float(ds_factor),
         pixel_scale_x=ds_psx_ao, pixel_scale_y=ds_psy_ao,
     )
-    return _upsample_to_shape(result_small, block.shape)
+    return _upsample_to_shape(result_small, block.shape, factor=ds_factor)
+
+
+def _ao_spatial_radii(radii) -> list:
+    """Integer pixel radii used by the spatial-mode main pass (and its pre-pass)."""
+    return [float(max(1, int(round(float(r))))) for r in radii]
+
+
+def compute_ambient_occlusion_spatial_raw(
+    block: cp.ndarray,
+    *,
+    radii=None,
+    weights=None,
+    agg: str = "mean",
+    num_samples: int = 16,
+    intensity: float = 1.0,
+    pixel_size: float = 1.0,
+    pixel_scale_x: float = None,
+    pixel_scale_y: float = None,
+) -> cp.ndarray:
+    """Spatial-mode raw (pre-stretch) AO field on one full-resolution block.
+
+    Mirrors ``process()``'s ``mode == "spatial"`` branch -- same radius rounding,
+    weight resolution and multi-radius combination -- so the global-stats
+    pre-pass (``_norm_stats``) takes its [p1, p99] display range from the field
+    the main pass actually stretches, not from the single-radius local block."""
+    rs, ws = _resolve_spatial_radii_weights(radii, weights, pixel_size)
+    responses = [
+        compute_ambient_occlusion_spatial_block(
+            block, num_samples=num_samples, radius=r, intensity=intensity,
+            pixel_size=pixel_size, pixel_scale_x=pixel_scale_x,
+            pixel_scale_y=pixel_scale_y,
+        )
+        for r in _ao_spatial_radii(rs)
+    ]
+    fields = [da.from_array(r, chunks=r.shape, asarray=False) for r in responses]
+    return _combine_multiscale_dask(fields, weights=ws, agg=agg).compute(
+        scheduler="synchronous")
 
 
 class AmbientOcclusionAlgorithm(DaskAlgorithm):
@@ -177,7 +214,7 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
             is_geo = bool(params.get("is_geographic_dem", False))
             thr = large_radius_threshold(gpu_arr, fallback=max(radii) if radii else 64)
             responses = multiscale_response_fields(
-                gpu_arr, [float(max(1, int(round(float(r))))) for r in radii],
+                gpu_arr, _ao_spatial_radii(radii),
                 block_fn=compute_ambient_occlusion_spatial_block, radius_kw="radius",
                 depth_for_scale=lambda rr: int(rr) + 1,
                 is_large=lambda rr: int(rr) > thr,
@@ -217,5 +254,6 @@ class AmbientOcclusionAlgorithm(DaskAlgorithm):
 __all__ = [
     "compute_ambient_occlusion_block",
     "compute_ambient_occlusion_spatial_block",
+    "compute_ambient_occlusion_spatial_raw",
     "AmbientOcclusionAlgorithm",
 ]

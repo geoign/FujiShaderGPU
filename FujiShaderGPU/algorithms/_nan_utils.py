@@ -549,7 +549,7 @@ def _smooth_for_radius(
     reduced = _downsample_nan_aware(block, factor)
     sigma_small = max(0.5, (r / factor) / 2.0)
     smoothed_small, _ = handle_nan_with_gaussian(reduced, sigma=sigma_small, mode="nearest")
-    return _upsample_to_shape(smoothed_small, block.shape)
+    return _upsample_to_shape(smoothed_small, block.shape, factor=factor)
 
 
 def _radius_to_downsample_factor(
@@ -668,30 +668,46 @@ def _downsample_nan_aware(block: cp.ndarray, factor: int) -> cp.ndarray:
     return coarse.astype(cp.float32)
 
 
-def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int]) -> cp.ndarray:
+def _upsample_to_shape(block: cp.ndarray, target_shape: Tuple[int, int],
+                       factor: Optional[int] = None) -> cp.ndarray:
+    """Bilinear upsample of a ``_downsample_nan_aware`` grid back to ``target_shape``.
+
+    Coarse cell ``j`` is the mean of fine pixels ``[j*f, (j+1)*f)``, so fine pixel
+    ``i`` samples coarse coordinate ``(i + 0.5) / f - 0.5`` (cell centres).  A
+    corner-aligned zoom stretched the grid by up to half a coarse cell with an
+    error that reset at every block, which showed up as seams in
+    ``block - upsampled_mean`` outputs.  ``factor`` is the downsample factor;
+    when omitted it is inferred as ``ceil(target / coarse)``.
+    """
     th, tw = int(target_shape[0]), int(target_shape[1])
     h, w = block.shape[:2]
     if h == th and w == tw:
         return block.astype(cp.float32, copy=False)
-    sy = th / max(1, h)
-    sx = tw / max(1, w)
+    if factor is not None:
+        fy = fx = max(1, int(factor))
+    else:
+        fy = max(1, -(-th // max(1, h)))
+        fx = max(1, -(-tw // max(1, w)))
+
+    def _zoom(a):
+        # grid_mode=True maps pixel edges to edges, i.e. centre-aligned sampling
+        # on the padded (h*fy, w*fx) grid that the downsample averaged over.
+        return zoom(a, zoom=(fy, fx), order=1, mode="nearest", grid_mode=True)
+
     nan_mask = cp.isnan(block)
     if not bool(nan_mask.any()):
-        out = zoom(block, zoom=(sy, sx), order=1, mode="nearest").astype(cp.float32)
-        pad_h, pad_w = max(0, th - out.shape[0]), max(0, tw - out.shape[1])
-        if pad_h or pad_w:
-            out = cp.pad(out, ((0, pad_h), (0, pad_w)), mode="edge")
-        return out[:th, :tw]
-    # NaN-aware bilinear upsample: interpolate valid contributors only so the
-    # exterior NoData (now preserved as NaN by _downsample_nan_aware) does not
-    # bleed a NaN fringe into the interior valid pixels.  Cells whose upsampled
-    # valid weight is ~0 (the true exterior) are restored to NaN.
-    valid = (~nan_mask).astype(cp.float32)
-    filled = cp.where(nan_mask, cp.float32(0), block).astype(cp.float32)
-    num = zoom(filled, zoom=(sy, sx), order=1, mode="nearest")
-    den = zoom(valid, zoom=(sy, sx), order=1, mode="nearest")
-    out = cp.where(den > cp.float32(1e-3), num / cp.maximum(den, cp.float32(1e-6)),
-                   cp.float32(cp.nan)).astype(cp.float32)
+        out = _zoom(block).astype(cp.float32)
+    else:
+        # NaN-aware bilinear upsample: interpolate valid contributors only so the
+        # exterior NoData (now preserved as NaN by _downsample_nan_aware) does not
+        # bleed a NaN fringe into the interior valid pixels.  Cells whose upsampled
+        # valid weight is ~0 (the true exterior) are restored to NaN.
+        valid = (~nan_mask).astype(cp.float32)
+        filled = cp.where(nan_mask, cp.float32(0), block).astype(cp.float32)
+        num = _zoom(filled)
+        den = _zoom(valid)
+        out = cp.where(den > cp.float32(1e-3), num / cp.maximum(den, cp.float32(1e-6)),
+                       cp.float32(cp.nan)).astype(cp.float32)
     pad_h, pad_w = max(0, th - out.shape[0]), max(0, tw - out.shape[1])
     if pad_h or pad_w:
         out = cp.pad(out, ((0, pad_h), (0, pad_w)), mode="edge")

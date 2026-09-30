@@ -41,14 +41,46 @@ from ._normalization import NORMAL_PERCENTILE
 logger = logging.getLogger(__name__)
 
 
+# Normalized-convolution cascade for nan_filled: each stage extrapolates the
+# already-known field one gaussian further into the void (reach ~3*sigma per
+# stage, ~190 px in total -- beyond Constants.MAX_DEPTH, the largest halo).
+_NAN_FILL_SIGMAS = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+_NAN_FILL_MIN_SUPPORT = 1e-3
+
+
 def nan_filled(block: cp.ndarray):
-    """(filled, nan_mask): NaN -> per-block nanmean (0 when all-NaN)."""
+    """(filled, nan_mask): NaN -> local, tiling-independent fill (0 when all-NaN).
+
+    NoData near valid pixels is filled by a cascade of normalized gaussian
+    convolutions ``G(z*known)/G(known)`` (sigma 1, 2, 4, ...), so the fill
+    depends only on the valid data in a local neighbourhood (inside the block
+    halo) -- not on the block extent.  The previous per-block nanmean fill gave
+    every tile/chunk a different fill value and a cliff at the coastline, so
+    valid pixels near NoData changed with the tiling.  Voids farther than the
+    cascade reach (beyond any algorithm's support) get the block's valid mean;
+    outputs are re-masked to NaN at the NoData footprint anyway.
+    """
     nan_mask = cp.isnan(block)
     if not bool(nan_mask.any()):
         return block.astype(cp.float32, copy=False), nan_mask
-    fill = cp.nanmean(block)
-    fill = cp.where(cp.isfinite(fill), fill, cp.float32(0.0))
-    return cp.where(nan_mask, fill, block).astype(cp.float32), nan_mask
+    known = ~nan_mask
+    if not bool(known.any()):
+        return cp.zeros(block.shape, dtype=cp.float32), nan_mask
+    work = cp.where(nan_mask, cp.float32(0.0), block).astype(cp.float32)
+    for sigma in _NAN_FILL_SIGMAS:
+        # mode='constant' (zero value AND zero weight outside the block): a
+        # truncated window just averages the known pixels it does contain.
+        num = gaussian_filter(work, sigma=sigma, mode='constant')
+        den = gaussian_filter(known.astype(cp.float32), sigma=sigma, mode='constant')
+        new = (~known) & (den > cp.float32(_NAN_FILL_MIN_SUPPORT))
+        work = cp.where(new, num / cp.maximum(den, cp.float32(1e-12)), work)
+        known = known | new
+        if bool(known.all()):
+            break
+    if not bool(known.all()):
+        fill = cp.mean(block[~nan_mask]).astype(cp.float32)
+        work = cp.where(known, work, fill)
+    return work.astype(cp.float32, copy=False), nan_mask
 
 
 def gaussian_gradients(filled: cp.ndarray, sigma_d: float):
