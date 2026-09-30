@@ -478,9 +478,12 @@ already-found values are not re-reported):
    `io/dem_preprocess.py::_detect_sentinel_nodata`: the most common finite value,
    when it covers ≥ `--nodata-sentinel-fraction` (default `0.05`) of the grid **and**
    is a known fill (`0`, `-9999`, int8/16/32 min/max, float32 extremes, `_NODATA_SENTINELS`)
-   or the data-range extreme. Catches a float DEM padded with `0`/`-9999` whose tag
-   was lost in conversion, **including when the fill is spread through the interior**
-   (which rule 3 alone misses).
+   or the data-range extreme (the range-extreme case only when the source declares
+   no NoData, so a hydro-flattened lake at the data minimum survives). Catches a float
+   DEM padded with `0`/`-9999` whose tag was lost in conversion, **including when the
+   fill is spread through the interior** (which rule 3 alone misses). Without declared
+   NoData the grid is sampled from the full-resolution band, never from existing
+   overviews, which were averaged across the undeclared sentinel.
 3. **Undeclared value dominating the border** — `_detect_border_nodata`: a single
    value occupying ≥ `--nodata-border-fraction` (default `0.5`) of the outer ring and
    a non-trivial share of the grid — a lost sea / dataset-exterior frame.

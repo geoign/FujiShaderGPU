@@ -14,12 +14,16 @@ logger = logging.getLogger(__name__)
 # the project-specific override; the rest are the conventional GDAL / POSIX
 # temp-dir variables.  Kept in sync with the chunked-write path in
 # ``core.dask_processor._select_chunk_temp_parent``.
+#
+# ``TMP`` / ``TEMP`` are deliberately *not* listed: Windows always sets them, so
+# they are not an explicit redirect and would override every caller's
+# ``default`` (``prepare`` staged next to the output would always land on C:).
+# Callers that want the system temp dir pass ``tempfile.gettempdir()`` as the
+# default, which already honours TMP / TEMP.
 TMP_DIR_ENV_VARS: Tuple[str, ...] = (
     "FUJISHADER_TMP_DIR",
     "CPL_TMPDIR",
     "TMPDIR",
-    "TMP",
-    "TEMP",
 )
 
 

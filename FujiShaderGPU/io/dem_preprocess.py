@@ -42,7 +42,7 @@ from typing import Optional
 
 import numpy as np
 import rasterio
-from rasterio.enums import Resampling
+from rasterio.enums import MaskFlags, Resampling
 from rasterio.windows import Window
 from rasterio.windows import transform as rio_window_transform
 from osgeo import gdal
@@ -142,6 +142,7 @@ def _nan_aware_coarse_average(
     oversample: int = 4,
     max_intermediate: int = 4096,
     sample_ma=None,
+    return_partial: bool = False,
 ) -> tuple:
     """Build the coarse fill grid by averaging *valid cells only*.
 
@@ -156,7 +157,8 @@ def _nan_aware_coarse_average(
     mask every NoData (declared + undeclared sentinels) to NaN, and block-reduce
     with a NaN-aware mean: a coarse cell is the mean of its *valid* sub-cells, and
     only a fully-NoData cell becomes a void.  Returns ``(coarse, cmask)`` where
-    ``cmask`` is the NoData (void) mask.
+    ``cmask`` is the NoData (void) mask; with ``return_partial=True`` also a third
+    mask of cells with *any* NoData sub-sample (the ``enclosed`` exterior seed).
     """
     # At least 2x2 source samples per coarse cell are required for an actual
     # NaN-aware average; k=1 degenerates to one nearest-neighbour point.
@@ -185,6 +187,8 @@ def _nan_aware_coarse_average(
     s = np.nansum(a, axis=(1, 3))
     cmask = cnt == 0
     coarse = np.where(cmask, np.float32(0.0), s / np.maximum(cnt, 1)).astype(np.float32)
+    if return_partial:
+        return coarse, cmask, cnt < k * k
     return coarse, cmask
 
 
@@ -243,6 +247,7 @@ def _detect_sentinel_nodata(
     valid: np.ndarray,
     *,
     min_fraction: float = 0.05,
+    allow_range_extreme: bool = True,
 ) -> Optional[float]:
     """Guess an *undeclared* NoData value from a dominant sentinel/extreme value.
 
@@ -258,6 +263,11 @@ def _detect_sentinel_nodata(
     ``sample`` must be a NEAREST-resampled grid so the exact value survives;
     ``valid`` excludes cells already masked by the declared NoData.  Returns the
     value, or ``None``.
+
+    ``allow_range_extreme=False`` keeps only the known-sentinel / float-extreme
+    tests.  Callers pass it when the raster *declares* a NoData value: the fill is
+    then already tagged, and a dominant range extreme is far more likely a real
+    flat surface (a hydro-flattened lake or reservoir at the data minimum).
     """
     finite = sample[valid & np.isfinite(sample)]
     if finite.size < 64:
@@ -269,7 +279,9 @@ def _detect_sentinel_nodata(
         return None
     known = any(abs(cand - s) <= 1e-6 * max(1.0, abs(s)) for s in _NODATA_SENTINELS)
     very_extreme = abs(cand) >= 1e30
-    is_range_extreme = (cand == float(vals[0]) or cand == float(vals[-1]))
+    is_range_extreme = allow_range_extreme and (
+        cand == float(vals[0]) or cand == float(vals[-1])
+    )
     if known or very_extreme or is_range_extreme:
         return cand
     return None
@@ -280,6 +292,32 @@ def _coarse_shape(width: int, height: int, coarse_max: int) -> tuple[int, int]:
     cw = max(1, int(round(width / scale)))
     ch = max(1, int(round(height / scale)))
     return ch, cw
+
+
+def _band_nodata_mask(band_ma, extra_nodata: list) -> np.ndarray:
+    """NoData mask of one masked band read (declared + non-finite + sentinels)."""
+    arr = np.ma.getdata(band_ma)
+    wmask = np.ma.getmaskarray(band_ma) | ~np.isfinite(arr)
+    for v in extra_nodata:
+        wmask = wmask | (arr == np.float32(v))
+    return wmask
+
+
+def _scan_for_nodata(src, width: int, height: int, extra_nodata: list) -> bool:
+    """Full-resolution check for NoData the coarse sub-samples may have missed.
+
+    Stops at the first band containing NoData; a raster without any reads once.
+    """
+    logger.info("Coarse samples show no NoData; scanning full resolution for small voids.")
+    band_rows = _band_height(width)
+    for row in range(0, height, band_rows):
+        bh = min(band_rows, height - row)
+        band_ma = src.read(
+            1, window=Window(0, row, width, bh), out_dtype=np.float32, masked=True,
+        )
+        if _band_nodata_mask(band_ma, extra_nodata).any():
+            return True
+    return False
 
 
 def _band_height(width: int, target_pixels: int = 16_000_000) -> int:
@@ -537,13 +575,21 @@ def preprocess_dem_to_cog(
             ch * coarse_oversample, cw * coarse_oversample,
         ) > 4096:
             coarse_oversample -= 1
-        nn_ma = src.read(
-            1,
-            out_shape=(ch * coarse_oversample, cw * coarse_oversample),
-            resampling=Resampling.nearest,
-            out_dtype=np.float32,
-            masked=True,
-        )
+        # Without declared NoData, existing overviews were averaged across any
+        # undeclared sentinel (0 m sea next to 5000 m land -> 1875 m "terrain"),
+        # and a decimated read would pick them up.  Sample the full-resolution
+        # band instead (one extra pass, only in that case).
+        _nn_kwargs = {}
+        if src_nodata is None and src.overviews(1):
+            _nn_kwargs["OVERVIEW_LEVEL"] = "NONE"
+        with rasterio.open(in_path, **_nn_kwargs) as nn_src:
+            nn_ma = nn_src.read(
+                1,
+                out_shape=(ch * coarse_oversample, cw * coarse_oversample),
+                resampling=Resampling.nearest,
+                out_dtype=np.float32,
+                masked=True,
+            )
         if detect_nodata:
             nn = np.ma.getdata(nn_ma).astype(np.float32, copy=False)
             nn_valid = (~np.ma.getmaskarray(nn_ma)) & np.isfinite(nn)
@@ -552,7 +598,8 @@ def preprocess_dem_to_cog(
             # interior fill *and* a frame).
             for _detected, _why in (
                 (_detect_sentinel_nodata(
-                    nn, nn_valid, min_fraction=nodata_sentinel_fraction),
+                    nn, nn_valid, min_fraction=nodata_sentinel_fraction,
+                    allow_range_extreme=src_nodata is None),
                  "dominant sentinel/extreme value"),
                 (_detect_border_nodata(
                     nn, nn_valid, min_border_fraction=nodata_border_fraction),
@@ -575,12 +622,28 @@ def preprocess_dem_to_cog(
         # *before* averaging, so the data/NoData boundary is not contaminated by
         # the exterior sentinel (which otherwise seeds phantom low relief, e.g.
         # ~800 between 0 and 5000, and breaks downstream normalization).
-        coarse, cmask = _nan_aware_coarse_average(
+        coarse, cmask, cpartial = _nan_aware_coarse_average(
             src, ch, cw, src_nodata, extra_nodata,
-            oversample=coarse_oversample, sample_ma=nn_ma,
+            oversample=coarse_oversample, sample_ma=nn_ma, return_partial=True,
         )
         cvalid = (~cmask) & np.isfinite(coarse)
-        has_holes = bool((~cvalid).any())
+        cpartial = cpartial | ~cvalid
+        # A coarse cell is a void only when *all* its sub-samples are NoData, so
+        # voids smaller than a cell never show up in ``cvalid``.  Use the
+        # sub-samples instead, and when they are not exhaustive (raster larger
+        # than the sample grid) and NoData is representable, scan full resolution.
+        has_holes = bool(cpartial.any())
+        sample_exhaustive = (
+            ch * coarse_oversample >= height and cw * coarse_oversample >= width
+        )
+        nodata_possible = (
+            bool(extra_nodata)
+            or np.issubdtype(np.dtype(src.dtypes[0]), np.floating)  # NaN
+            or MaskFlags.all_valid not in src.mask_flag_enums[0]  # nodata/mask
+        )
+        if (fill_mode != "none" and not has_holes and not sample_exhaustive
+                and nodata_possible):
+            has_holes = _scan_for_nodata(src, width, height, extra_nodata)
 
         do_fill = fill_mode != "none" and has_holes
         surface = None
@@ -588,12 +651,19 @@ def preprocess_dem_to_cog(
         if do_fill:
             surface = _fill_coarse_surface(coarse, cvalid)
             if fill_mode == "enclosed":
-                # NoData connected to the (global) coarse border = exterior; keep it.
-                exterior_coarse = _edge_connected_mask(~cvalid)
+                # Exterior seed: border-connected cells with *any* NoData
+                # sub-sample.  Seeding from fully-void cells only let partly-void
+                # coastline cells count as land, so a band of exterior (sea)
+                # pixels along the coast was filled.  Each band then classifies
+                # its full-resolution void components against this mask
+                # (``_apply_band_fill``), so the coarse grid only has to *touch*
+                # the exterior, not resolve its outline.
+                exterior_coarse = _edge_connected_mask(cpartial)
                 n_ext = int(exterior_coarse.sum())
-                n_void = int((~cvalid).sum())
+                n_void = int(cpartial.sum())
                 logger.info(
-                    "Fill=enclosed: coarse voids=%d, exterior(kept)=%d, filled=%d",
+                    "Fill=enclosed: coarse cells with NoData=%d, exterior(kept)=%d, "
+                    "interior=%d",
                     n_void, n_ext, n_void - n_ext,
                 )
             else:  # all
@@ -736,7 +806,8 @@ def _sample_coarse(
     ch: int,
     cw: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Bilinearly sample the coarse surface (and exterior mask) for a row band.
+    """Bilinearly sample the coarse surface for a row band, plus the exterior mask
+    of the coarse cell *containing* each pixel (nearest, not bilinear).
 
     Coordinates are computed in the *global* coarse grid so that adjacent bands
     sample identical positions -> the upsampled fill is seamless.
@@ -761,10 +832,42 @@ def _sample_coarse(
     if exterior_coarse is None:
         ext = np.zeros((band_h, width), dtype=bool)
     else:
-        ext = map_coordinates(
-            exterior_coarse.astype(np.float32), coords, order=1, mode="nearest"
-        ) > 0.5
+        ri = np.clip(np.floor(rr + np.float32(0.5)).astype(np.int64), 0, ch - 1)
+        ci = np.clip(np.floor(cc + np.float32(0.5)).astype(np.int64), 0, cw - 1)
+        ext = exterior_coarse[ri[:, None], ci[None, :]]
     return fill_vals, ext
+
+
+def _exterior_components(
+    wmask: np.ndarray,
+    ext_cells: np.ndarray,
+    *,
+    row_off: int,
+    height: int,
+) -> np.ndarray:
+    """Full-resolution exterior (keep-as-NoData) mask for one band's voids.
+
+    Each 4-connected void component of the band is exterior when it touches the
+    raster border or overlaps a coarse exterior cell.  The coarse mask alone is
+    too blunt at a coastline (a partly-void cell is part land, part sea), while
+    this component test keeps every sea pixel connected -- within the band -- to
+    the exterior, and still fills interior holes cell-for-cell.
+    """
+    from scipy.ndimage import label
+
+    labels, n = label(wmask)
+    if n == 0:
+        return np.zeros_like(wmask, dtype=bool)
+    is_ext = np.zeros(n + 1, dtype=bool)
+    is_ext[np.unique(labels[ext_cells & wmask])] = True
+    is_ext[np.unique(labels[:, 0])] = True
+    is_ext[np.unique(labels[:, -1])] = True
+    if row_off == 0:
+        is_ext[np.unique(labels[0, :])] = True
+    if row_off + wmask.shape[0] >= height:
+        is_ext[np.unique(labels[-1, :])] = True
+    is_ext[0] = False  # label 0 = valid pixels
+    return is_ext[labels]
 
 
 def _apply_band_fill(
@@ -791,9 +894,7 @@ def _apply_band_fill(
     paths and across strip boundaries (seamless).
     """
     arr = np.array(np.ma.getdata(band_ma), dtype=np.float32, copy=True)
-    wmask = np.ma.getmaskarray(band_ma) | ~np.isfinite(arr)
-    for v in extra_nodata:
-        wmask = wmask | (arr == np.float32(v))
+    wmask = _band_nodata_mask(band_ma, extra_nodata)
     # Normalise every NoData cell to NaN up front, so finite sentinels (e.g.
     # -9999) are handled identically to declared NoData regardless of fill mode
     # (the fill step below then overwrites only the cells it is meant to fill).
@@ -807,7 +908,9 @@ def _apply_band_fill(
             surface, exterior_coarse, row_off, bh, width, height, ch, cw,
         )
         if fill_mode == "enclosed":
-            fill_here = wmask & ~ext
+            fill_here = wmask & ~_exterior_components(
+                wmask, ext, row_off=row_off, height=height,
+            )
         else:  # all
             fill_here = wmask
         arr[fill_here] = fill_vals[fill_here]
