@@ -41,7 +41,7 @@ except ImportError:
 
 from ..algorithms.common.spatial_mode import RADII_DRIVEN_ALGOS, MULTISCALE_REQUIRED_ALGOS
 from ..algorithms._norm_stats import inject_global_stats
-from ..io.raster_info import metric_pixel_scales_from_metadata
+from ..io.raster_info import metric_pixel_scales_from_metadata, nodata_override_source
 from ..io.output_encoding import (
     SUPPORTED_OUTPUT_DTYPES,
     output_nodata_for_dtype,
@@ -166,23 +166,28 @@ def _select_chunk_temp_parent(data_nbytes: int) -> Path:
 
 
 def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, float, float, bool, Optional[float]]:
-    """Detect signed x/y metric pixel scales from an xarray+rioxarray DataArray."""
+    """Detect signed x/y metric pixel scales from an xarray+rioxarray DataArray.
+
+    Raises ValueError (from metric_pixel_scales_from_metadata) when the raster
+    has no CRS but looks geographic: degree-sized pixels must never be treated
+    as metres silently.
+    """
     try:
         transform = dem.rio.transform()
         bounds = dem.rio.bounds()
         crs = dem.rio.crs
-        sx, sy, mean_m, is_geo, lat = metric_pixel_scales_from_metadata(
-            transform=transform, crs=crs, bounds=bounds
-        )
-        return float(sx), float(sy), float(mean_m), bool(is_geo), lat
     except Exception:
         try:
-            x_res = abs(float(dem.rio.resolution()[0]))
-            y_res = abs(float(dem.rio.resolution()[1]))
-            mean_m = 0.5 * (x_res + y_res)
-            return float(x_res), float(y_res), float(mean_m), False, None
+            x_res = float(dem.rio.resolution()[0])
+            y_res = float(dem.rio.resolution()[1])
+            mean_m = 0.5 * (abs(x_res) + abs(y_res))
+            return x_res, y_res, float(mean_m), False, None
         except Exception:
             return 1.0, 1.0, 1.0, False, None
+    sx, sy, mean_m, is_geo, lat = metric_pixel_scales_from_metadata(
+        transform=transform, crs=crs, bounds=bounds
+    )
+    return float(sx), float(sy), float(mean_m), bool(is_geo), lat
 
 
 ###############################################################################
@@ -935,6 +940,10 @@ def build_cog_with_overviews(src: Path, dst: Path, cog_options: dict):
 
 def validate_inputs(src_cog: str):
     """Validate input parameters."""
+    # Remote/VSI sources cannot be stat'ed locally; the CLI exempts them too
+    # and rasterio/xarray report a missing remote file on open.
+    if str(src_cog).lower().startswith(("http://", "https://", "s3://", "gs://", "az://", "/vsi")):
+        return
     if not Path(src_cog).exists():
         raise FileNotFoundError(f"Input file not found: {src_cog}")
 
@@ -1161,6 +1170,12 @@ def run_pipeline(
                 dem = dem.where(dem != np.float32(nodata_override))
                 logger.info("Applied --nodata override: %s -> NaN", float(nodata_override))
 
+        # Side reads (global stats, overview fields) reopen the source file and
+        # only see its declared NoData; give them a source declaring the override.
+        side_src = src_cog
+        if nodata_override is not None and not is_zarr_path(src_cog):
+            side_src = nodata_override_source(src_cog, nodata_override)
+
         logger.info(f"DEM shape: {dem.shape}, dtype: {dem.dtype}, "
                    f"chunks: {dem.chunks}")
 
@@ -1189,7 +1204,17 @@ def run_pipeline(
         # pixel_scale_x/y are REAL signed meters per pixel; the DEM array is
         # never rescaled -- the same convention as the tile backend, so the
         # shared (raw-elevation) normalization stats apply to both.
-        px_m_x, px_m_y, pixel_size_m, is_geo, lat_center = _detect_metric_scales_from_dataarray(dem)
+        try:
+            px_m_x, px_m_y, pixel_size_m, is_geo, lat_center = _detect_metric_scales_from_dataarray(dem)
+        except ValueError:
+            # No CRS but degree-like metadata: only an explicit --pixel-size can
+            # resolve it (handled below; only the axis signs are used from here).
+            if pixel_size is None:
+                raise
+            transform = dem.rio.transform()
+            px_m_x = 1.0 if float(transform.a) >= 0 else -1.0
+            px_m_y = 1.0 if float(transform.e) >= 0 else -1.0
+            pixel_size_m, is_geo, lat_center = 1.0, False, None
         if pixel_size is not None:
             # Explicit --pixel-size overrides the metadata-detected scale: treat each
             # pixel as this many metres isotropically (keeping the detected axis signs
@@ -1324,7 +1349,7 @@ def run_pipeline(
         # roughness, in that order) via the shared backend-neutral helper, so the
         # dask and tile pipelines cannot drift on these.  All steps are full-res,
         # global (seam-free) and mode-independent.
-        inject_global_stats(src_cog, algorithm, params, is_zarr=is_zarr_path(src_cog))
+        inject_global_stats(side_src, algorithm, params, is_zarr=is_zarr_path(src_cog))
 
         # Unified coarse source: read ONE decimated overview of the DEM and share it
         # across every algorithm's large-radius path (the coarse-overview combine is
@@ -1342,7 +1367,7 @@ def run_pipeline(
         ):
             try:
                 from ..algorithms._nan_utils import read_overview_coarse_dem
-                _overview_dem, _overview_decim = read_overview_coarse_dem(src_cog)
+                _overview_dem, _overview_decim = read_overview_coarse_dem(side_src)
                 if _overview_dem is not None:
                     params["_overview_coarse_dem"] = _overview_dem
                     params["_overview_decimation"] = _overview_decim
@@ -1399,7 +1424,7 @@ def run_pipeline(
                 _large = [r for r in _radii if _pred(r)]
                 if _large:
                     _fields, _decim = compute_overview_scale_fields(
-                        src_cog, large_radii=_large, block_fn=_bfn,
+                        side_src, large_radii=_large, block_fn=_bfn,
                         coarse_dem=_overview_dem, decimation=_overview_decim)
                     if _fields:
                         params[f"{_pfx}_large_fields"] = _scatter_to_workers(
@@ -1436,7 +1461,7 @@ def run_pipeline(
                     )
                     if _lr:
                         _field = _compute_topousm_fast_overview_coarse_field(
-                            src_cog, large_radii=_lr, large_weights=_lw,
+                            side_src, large_radii=_lr, large_weights=_lw,
                         )
                         if _field is not None:
                             params["_topousm_fast_coarse_field"] = _scatter_to_workers(
@@ -1602,11 +1627,19 @@ def run_pipeline(
                 f"Unsupported result shape {result_cpu.shape} for source dims {dem.dims}"
             )
         
+        # Value-encoding attrs describe the INPUT raster (an int16 DEM's
+        # scale/offset, its units); copied onto the output they would make
+        # readers decode the result wrongly.
+        src_attrs = {
+            k: v for k, v in dem.attrs.items()
+            if k not in ("scale_factor", "add_offset", "scales", "offsets", "_FillValue", "units")
+        }
+
         # Set the appropriate value range per algorithm
         if algorithm in ['hillshade']:
             # Hillshade is now also float32 (0..1), aligned with tile backend.
             attrs = {
-                **dem.attrs,
+                **src_attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
@@ -1617,7 +1650,7 @@ def run_pipeline(
             # Slope depends on the unit (degree, percent, radian)
             unit = params.get('unit', 'degree')
             attrs = {
-                **dem.attrs,
+                **src_attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
@@ -1628,7 +1661,7 @@ def run_pipeline(
             # Signed terrain anomaly outputs map the robust p99(|value|) to +/-1;
             # the tail beyond +/-1 passes through unclipped.
             attrs = {
-                **dem.attrs,
+                **src_attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
@@ -1640,11 +1673,12 @@ def run_pipeline(
         elif algorithm == 'blur':
             # Raw smoothed elevation -- same units as the input DEM.
             attrs = {
-                **dem.attrs,
+                **src_attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
                 "value_range": "elevation (input units)",
+                **({"units": dem.attrs["units"]} if "units" in dem.attrs else {}),
                 "data_type": "float32"
             }
         elif algorithm in [
@@ -1660,7 +1694,7 @@ def run_pipeline(
             # Unsigned analysis outputs map the robust p99 to +1; normalized
             # outputs keep an unclipped tail past 1.
             attrs = {
-                **dem.attrs,
+                **src_attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",
@@ -1672,7 +1706,7 @@ def run_pipeline(
         else:
             # Display/stylized outputs keep their native display range.
             attrs = {
-                **dem.attrs,
+                **src_attrs,
                 "algorithm": algorithm,
                 "parameters": str(params),
                 "processing": f"Dask-CUDA {algorithm.upper()}",

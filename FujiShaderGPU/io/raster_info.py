@@ -99,6 +99,48 @@ def metric_pixel_scales_from_metadata(
     return float(scale_x), float(scale_y), float(mean_m), False, None
 
 
+def reject_scaled_input(scale, offset, src_path) -> None:
+    """Raise if the input band carries a non-trivial scale/offset.
+
+    No reader in either backend applies it (tiles, global stats and overview
+    reads all see raw DNs), so an int16 DEM stored as ``DN * 0.1 + offset``
+    would silently yield gradients off by the scale factor.
+    """
+    scale = 1.0 if scale is None else float(scale)
+    offset = 0.0 if offset is None else float(offset)
+    if scale != 1.0 or offset != 0.0:
+        raise ValueError(
+            f"Input {src_path} has scale={scale:g}, offset={offset:g}; scaled "
+            "rasters are not supported. Convert to physical elevation first, e.g. "
+            "`gdal_translate -unscale -ot Float32 in.tif out.tif`."
+        )
+
+
+def nodata_override_source(src_path: str, nodata: Optional[float]) -> str:
+    """Return a rasterio-openable source that declares ``nodata`` as NoData.
+
+    Side reads (global statistics, decimated overview reads) open the input
+    directly, so without this they would ignore a ``--nodata`` override and
+    average the sentinel into valid data.  The result is an in-memory VRT XML
+    string (no temp file); it keeps the source overviews.  Returns ``src_path``
+    unchanged when there is no finite override.
+    """
+    if nodata is None:
+        return src_path
+    value = float(nodata)
+    if not math.isfinite(value):
+        return src_path
+    from osgeo import gdal
+
+    ds = gdal.Translate("", str(src_path), format="VRT", noData=value)
+    if ds is None:
+        raise RuntimeError(f"Could not build a NoData-override VRT for {src_path}")
+    try:
+        return ds.GetMetadata("xml:VRT")[0]
+    finally:
+        ds = None
+
+
 def detect_pixel_size_from_cog(input_cog_path: str) -> float:
     """Detect representative pixel size in meters from COG metadata."""
     try:
