@@ -46,10 +46,12 @@ def smooth_block(block: cp.ndarray, *, scale: float, **_ignored) -> cp.ndarray:
 def _resolve_radius(params: dict) -> float:
     """Single blur sigma (px).  The unified ``--radii`` first value wins (the CLI
     always sets ``radius`` from its default, so radii must take precedence to
-    override it); otherwise ``radius``; otherwise the default."""
+    override it); otherwise ``radius``; otherwise the default.  In ``--mode
+    local`` both pipelines inject radii=[1] (LOCAL_RADII), which is not a blur
+    size, so ``radius`` (--blur-radius) is used there."""
     r = None
     radii = params.get("radii") or None
-    if radii:
+    if radii and str(params.get("mode", "spatial")).lower() != "local":
         r = radii[0]
     if r is None:
         r = params.get("radius", None)

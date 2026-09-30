@@ -58,14 +58,32 @@ def write_tile_output(tile_filename: str, result_core: np.ndarray, tile_profile:
             return
 
         if result_core.ndim == 3:
-            # HxWxC -> CxHxW for rasterio
-            if result_core.shape[-1] == tile_profile.get("count", result_core.shape[-1]):
-                dst.write(np.moveaxis(result_core, -1, 0))
-                return
-            # Already band-first
-            if result_core.shape[0] == tile_profile.get("count", result_core.shape[0]):
-                dst.write(result_core)
-                return
+            # Decide the layout from the known raster (h, w) in the profile, not
+            # from the band count alone: a (C,H,W) stack whose edge tile is 3 or
+            # 4 px wide has shape[-1] == count and was transposed as HxWxC.
+            count = tile_profile.get("count")
+            hw = (tile_profile.get("height"), tile_profile.get("width"))
+            if None not in hw:
+                hw = (int(hw[0]), int(hw[1]))
+                if tuple(result_core.shape[-2:]) == hw and (
+                        count is None or result_core.shape[0] == count):
+                    # Already band-first.
+                    dst.write(result_core)
+                    return
+                if tuple(result_core.shape[:2]) == hw and (
+                        count is None or result_core.shape[-1] == count):
+                    # HxWxC -> CxHxW for rasterio
+                    dst.write(np.moveaxis(result_core, -1, 0))
+                    return
+            else:
+                # No size in the profile: fall back to the band-count check,
+                # band-first (the formal stack contract) first.
+                if result_core.shape[0] == tile_profile.get("count", result_core.shape[0]):
+                    dst.write(result_core)
+                    return
+                if result_core.shape[-1] == tile_profile.get("count", result_core.shape[-1]):
+                    dst.write(np.moveaxis(result_core, -1, 0))
+                    return
 
         raise ValueError(
             f"Unsupported tile array shape {result_core.shape} for profile count={tile_profile.get('count')}"

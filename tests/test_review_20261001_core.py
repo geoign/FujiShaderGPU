@@ -187,3 +187,23 @@ def test_nodata_override_source_masks_sentinel_in_decimated_reads(tmp_path):
         assert ds.overviews(1) == [2, 4, 8]
         sample = ds.read(1, out_shape=(64, 64), resampling=Resampling.average, masked=True)
     assert float(sample.min()) == 100.0 and float(sample.max()) == 100.0
+
+
+def test_tile_backend_rejects_scaled_dem(tmp_path):
+    from FujiShaderGPU.core.tile_processor import process_dem_tiles
+
+    path = tmp_path / "scaled.tif"
+    _write_tif(path, np.full((64, 64), 800, np.int16),
+               transform=from_origin(0, 640, 10, 10), crs="EPSG:32654", scale=0.1)
+    with pytest.raises(ValueError, match="scaled rasters are not supported"):
+        process_dem_tiles(str(path), str(tmp_path / "out.tif"),
+                          tmp_tile_dir=str(tmp_path / "tiles"), algorithm="slope",
+                          show_progress=False)
+
+
+def test_blur_local_mode_uses_blur_radius():
+    from FujiShaderGPU.algorithms._impl_blur import _resolve_radius
+
+    assert _resolve_radius({"mode": "local", "radii": [1], "radius": 40.0}) == 40.0
+    assert _resolve_radius({"mode": "spatial", "radii": [8, 32], "radius": 40.0}) == 8.0
+    assert _resolve_radius({"radius": 12.0}) == 12.0

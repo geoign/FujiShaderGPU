@@ -23,6 +23,8 @@ from ..io.raster_info import (
     detect_pixel_size_from_cog,
     meters_per_degree,
     metric_pixel_scales_from_metadata,
+    nodata_override_source,
+    reject_scaled_input,
 )
 from ..utils.types import TileResult
 from ..io.cog_builder import _build_vrt_and_cog_ultra_fast
@@ -43,6 +45,7 @@ from ..algorithms.common.spatial_mode import (
 )
 from ..utils.paths import safe_abspath
 import os
+import json
 import math
 import glob
 import shutil
@@ -244,7 +247,12 @@ def _required_padding_for_algorithm(
     _thr_switch = max(256, int(tile_size) // 16)
 
     def _unified_radii(default):
-        rs = algo_params.get("radii")
+        # Same precedence as the algorithms' own scale resolution (see
+        # _impl_visual_saliency / _impl_experimental / _impl_multiscale_terrain /
+        # _impl_scale_drift): explicit radii, else the algorithm's own ``scales``
+        # (--scales / --vs-scales / --surprise-scales), else the default.
+        # Ignoring ``scales`` sized the halo from the default and left seams.
+        rs = algo_params.get("radii") or algo_params.get("scales")
         if not rs:
             return [float(s) for s in default]
         try:
@@ -254,6 +262,11 @@ def _required_padding_for_algorithm(
 
     if algorithm == "visual_saliency":
         scales = _unified_radii([2, 4, 8, 16])
+        # compute_visual_saliency_block falls back to the default bank below 4
+        # scales (mirrors VisualSaliencyAlgorithm.process).
+        scales = [max(0.5, s) for s in scales]
+        if len(scales) < 4:
+            scales = [2.0, 4.0, 8.0, 16.0]
         # Saliency uses Gaussian center-surround at sigma up to max_scale (5*sigma
         # halo).  With the overview active only the small scales (5*scale<=MAX_DEPTH)
         # use the halo; larger scales come from the overview fields.
@@ -345,9 +358,46 @@ def _required_padding_for_algorithm(
         scales = _unified_radii([2.0, 4.0, 8.0, 16.0, 32.0])
         small = [s for s in scales
                  if int(max(1, round(s * 4))) + 1 <= _MAX_DEPTH] or [min(scales)]
+        # Without the overview (no radii) every scale is a full-res halo.
+        max_scale = max(small) if _overview_active else max(scales)
         required = max(
             required,
-            int(math.ceil(max(small) * 4.0)) + int(4 * DRIFT_WINDOW_CAP) + 8)
+            int(math.ceil(max_scale * 4.0)) + int(4 * DRIFT_WINDOW_CAP) + 8)
+    elif algorithm == "blur":
+        # Gaussian sigma = the resolved blur radius (radii[0] > radius > 16);
+        # 4*sigma truncation + 1 of halo (Dask map_overlap depth = 4*radius).
+        # With the overview active a radius past MAX_DEPTH is taken from the
+        # global overview field instead (no large per-tile halo).
+        try:
+            from ..algorithms._impl_blur import _resolve_radius as _blur_radius
+            blur_r = float(_blur_radius(algo_params))
+        except Exception:
+            blur_r = float(algo_params.get("radius", 16.0) or 16.0)
+        if not (_overview_active and int(4 * blur_r) > _MAX_DEPTH):
+            required = max(required, int(math.ceil(4.0 * blur_r)) + 1)
+
+    if _mode != "spatial":
+        # Local-mode single-scale size parameters (the spatial branch below
+        # sizes from radii instead).  Mirrors the Dask map_overlap depths.
+        try:
+            if algorithm == "ambient_occlusion":
+                # Directional search up to `radius` px (Dask depth = radius + 1).
+                required = max(required, int(math.ceil(float(
+                    algo_params.get("radius", 10.0) or 10.0))) + 16)
+            elif algorithm == "openness":
+                # Horizon search up to `max_distance` px (Dask depth = md + 1).
+                required = max(required, int(math.ceil(float(
+                    algo_params.get("max_distance", 50) or 50))) + 16)
+            elif algorithm == "specular":
+                # Roughness window (Dask depth = roughness_scale).
+                required = max(required, int(math.ceil(float(
+                    algo_params.get("roughness_scale", 20.0) or 20.0))) + 2)
+            elif algorithm == "npr_edges":
+                # Edge Gaussian (Dask depth = 4*edge_sigma + 2).
+                required = max(required, int(math.ceil(4.0 * float(
+                    algo_params.get("edge_sigma", 1.0) or 1.0))) + 2)
+        except (TypeError, ValueError):
+            pass
 
     if _mode == "spatial" and algorithm in SPATIAL_TILE_ALGORITHMS:
         radii = algo_params.get("radii")
@@ -377,7 +427,25 @@ def _required_padding_for_algorithm(
         else:
             # Gaussian radius smoothing uses sigma = r/2, whose 4-sigma kernel
             # needs ~2R of halo; keep 2R + a couple pixels for the local compute.
-            required = max(required, int(max_radius * 2 + 2))
+            # Algorithms with an extra kernel on top of the radius smoothing get
+            # their Dask depth_for_scale margin (frangi 2r+6, structure_tensor
+            # 2r+4*sigma_d+4, specular max(roughness_scale, 2r+1)).
+            extra = 2
+            try:
+                if algorithm == "frangi":
+                    extra = 6
+                elif algorithm == "structure_tensor":
+                    extra = int(math.ceil(4.0 * float(
+                        algo_params.get("derivative_sigma", 1.0) or 1.0))) + 4
+            except (TypeError, ValueError):
+                pass
+            required = max(required, int(max_radius * 2 + extra))
+            if algorithm == "specular":
+                try:
+                    required = max(required, int(math.ceil(float(
+                        algo_params.get("roughness_scale", 20.0) or 20.0))) + 2)
+                except (TypeError, ValueError):
+                    pass
 
     # Keep alignment with current tiling preferences.
     return max(32, ((required + 31) // 32) * 32)
@@ -606,6 +674,7 @@ def _compute_topousm_fast_overview_coarse_field_tile(
 def _format_algorithm_output(
     result_core: np.ndarray,
     algorithm: str,
+    core_shape: Optional[Tuple[int, int]] = None,
 ) -> Tuple[np.ndarray, float]:
     """Normalize dtype/band format per algorithm (all outputs float32).
 
@@ -613,13 +682,23 @@ def _format_algorithm_output(
     Dask backend (``output_nodata_for_dtype``) and the ``prepare`` command.
     Keeping a numeric input sentinel (e.g. -9999) here was fragile: hillshade's
     [0, 1] clip turned a -9999 fill into a *valid* black 0.0 pixel.
+
+    ``core_shape`` = the tile core (h, w).  The 3-D layout is decided from it
+    (band-first C,H,W stack vs legacy H,W,C), not guessed from the trailing
+    dim: an edge tile 3 or 4 px wide made a (C,H,3) stack look like HxWxC.
     """
     arr = result_core.astype(np.float32, copy=False)
     if algorithm == "hillshade":
         # Keep ordinary hillshade as single-band float output, but preserve
         # formal --agg stack output (C,H,W) as multiple bands.
-        if arr.ndim == 3 and arr.shape[-1] in (3, 4) and arr.shape[-2:] != arr.shape[:2]:
-            arr = arr[:, :, 0]
+        if arr.ndim == 3:
+            if core_shape is not None:
+                hw = (int(core_shape[0]), int(core_shape[1]))
+                is_hwc = tuple(arr.shape[-2:]) != hw and tuple(arr.shape[:2]) == hw
+            else:
+                is_hwc = arr.shape[-1] in (3, 4) and arr.shape[-2:] != arr.shape[:2]
+            if is_hwc:
+                arr = arr[:, :, 0]
         arr = np.clip(arr, 0.0, 1.0)
     return arr, np.nan
 
@@ -804,6 +883,38 @@ def _resolve_writable_tmp_dir(
         f"Failed to create writable temporary directory. Last error: {last_error}"
     )
 
+# Input-grid extent stored next to the tiles so a later --cog-only rebuild keeps
+# the full input extent (skipped all-NoData tiles write no file).
+_EXTENT_SIDECAR = "tiles_extent.json"
+
+
+def _write_extent_sidecar(tmp_tile_dir: str, bounds, resolution) -> None:
+    try:
+        with open(os.path.join(tmp_tile_dir, _EXTENT_SIDECAR), "w", encoding="utf-8") as f:
+            json.dump({"bounds": [float(v) for v in bounds],
+                       "resolution": [float(v) for v in resolution]}, f)
+    except Exception as exc:
+        logger.debug("Could not write tile extent sidecar: %s", exc)
+
+
+def _read_extent_sidecar(tmp_tile_dir: str):
+    """(bounds, resolution) from the sidecar, or (None, None) if absent/invalid."""
+    path = os.path.join(tmp_tile_dir, _EXTENT_SIDECAR)
+    if not os.path.isfile(path):
+        return None, None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        bounds = tuple(float(v) for v in meta["bounds"])
+        res = tuple(float(v) for v in meta["resolution"])
+        if len(bounds) != 4 or len(res) != 2:
+            raise ValueError("malformed extent")
+        return bounds, res
+    except Exception as exc:
+        logger.warning("Ignoring unreadable tile extent sidecar %s: %s", path, exc)
+        return None, None
+
+
 def _load_algorithm(name: str):
     """Load algorithm class from `algorithms/tile/<name>.py`."""
     if name in DEFAULT_ALGORITHMS:
@@ -907,7 +1018,12 @@ def process_single_tile(
                 "_sss_large_fields", "_fractal_large_fields",
             )):
                 tile_algo_params["_tile_origin"] = (int(win_y_off), int(win_x_off))
-            if src_crs is not None and getattr(src_crs, "is_geographic", False):
+            if (
+                src_crs is not None and getattr(src_crs, "is_geographic", False)
+                # An explicit --pixel-size cleared is_geographic_dem: keep its
+                # isotropic scales instead of the per-tile latitude conversion.
+                and tile_algo_params.get("is_geographic_dem", True)
+            ):
                 try:
                     # Use core tile center latitude for local meter conversion;
                     # pixel_scale_x/y carry REAL signed meters per pixel (the same
@@ -945,19 +1061,20 @@ def process_single_tile(
             core_x_in_win = core_x - win_x_off
             core_y_in_win = core_y - win_y_off
             if result_gpu.ndim == 3:
-                if tuple(result_gpu.shape[:2]) == tuple(dem_gpu.shape):
-                    # HxWxC legacy layout.
-                    result_core_gpu = result_gpu[
-                        core_y_in_win : core_y_in_win + core_h,
-                        core_x_in_win : core_x_in_win + core_w,
-                        :,
-                    ]
-                elif tuple(result_gpu.shape[-2:]) == tuple(dem_gpu.shape):
+                # Band-first (the formal --agg stack contract) is checked first.
+                if tuple(result_gpu.shape[-2:]) == tuple(dem_gpu.shape):
                     # Band-first stack layout (C,H,W).
                     result_core_gpu = result_gpu[
                         :,
                         core_y_in_win : core_y_in_win + core_h,
                         core_x_in_win : core_x_in_win + core_w,
+                    ]
+                elif tuple(result_gpu.shape[:2]) == tuple(dem_gpu.shape):
+                    # HxWxC legacy layout.
+                    result_core_gpu = result_gpu[
+                        core_y_in_win : core_y_in_win + core_h,
+                        core_x_in_win : core_x_in_win + core_w,
+                        :,
                     ]
                 else:
                     raise ValueError(
@@ -988,6 +1105,7 @@ def process_single_tile(
             result_core, output_nodata = _format_algorithm_output(
                 result_core=result_core,
                 algorithm=algorithm,
+                core_shape=(core_h, core_w),
             )
 
             # Output dtype quantization (int16/uint8): NaN (NoData) -> 0, valid values to [DN range].
@@ -1050,6 +1168,15 @@ def process_dem_tiles(
     # Preserve user intent before local/spatial defaults inject radii and weights.
     user_radii_specified = algo_params.get("radii") is not None
     user_weights_specified = algo_params.get("weights") is not None
+    # The pipeline below (radii injection, padding, overview path) treats a
+    # missing mode as spatial, but the algorithms themselves default to
+    # mode="local"; make the mode explicit so a Python-API call without `mode`
+    # gets one consistent behaviour (the CLI always passes --mode).
+    if algo_params.get("mode") is None:
+        algo_params["mode"] = "spatial"
+    # Remember whether --pixel-size was given (vs. auto-detected below): an
+    # explicit value overrides the metadata pixel scales (Dask parity).
+    pixel_size_explicit = pixel_size is not None
     # P3-8 (L-5/L-76): validate size/padding inputs before any expensive work so
     # a bad value fails fast with a clear message instead of a ZeroDivisionError
     # deep inside tiling or a silent oversized window.
@@ -1252,8 +1379,12 @@ def process_dem_tiles(
                 _thr = topousm_fast_default_large_radius_threshold(int(tile_size))
                 _sr, _sw, _lr, _lw = split_radii_by_threshold(_full_r, _full_w, _thr)
                 if _lr:
+                    # The override must be declared on the source itself: the
+                    # decimated average read would otherwise blend the sentinel
+                    # into valid cells before it could be masked.
                     _field = _compute_topousm_fast_overview_coarse_field_tile(
-                        input_cog_path, large_radii=_lr, large_weights=_lw,
+                        nodata_override_source(input_cog_path, nodata_override),
+                        large_radii=_lr, large_weights=_lw,
                         nodata=nodata_override,
                     )
                     if _field is not None:
@@ -1423,6 +1554,7 @@ def process_dem_tiles(
             width = src.width
             height = src.height
             profile = src.profile.copy()
+            reject_scaled_input(src.scales[0], src.offsets[0], input_cog_path)
             # FujiShaderGPU expects an overview-bearing COG; warn (do not fail) and
             # point to the preprocessing command when overviews are missing.
             try:
@@ -1466,8 +1598,31 @@ def process_dem_tiles(
                     )
                 else:
                     _warn_implicit_nodata_candidates(src, threshold_ratio=0.01)
+            # Side reads (global stats, overview fields) reopen the input and
+            # only see its declared NoData; hand them a source that declares the
+            # effective one (--nodata or the inferred border 0) instead.
+            side_src_path = input_cog_path
+            if (
+                nodata is not None
+                and not _nodata_is_nan(nodata)
+                and (src.nodata is None or float(src.nodata) != float(nodata))
+            ):
+                try:
+                    side_src_path = nodata_override_source(input_cog_path, nodata)
+                except Exception as exc:
+                    logger.warning(
+                        "Could not apply NoData %g to global-stat/overview reads: %s",
+                        float(nodata), exc,
+                    )
             src_transform = src.transform
             src_crs = src.crs
+            # Pin the mosaic to the input grid: skipped all-NoData tiles write
+            # no file, and a tiles-bbox VRT would shrink the output extent.
+            out_bounds = out_res = None
+            if src_transform.b == 0 and src_transform.d == 0:
+                out_bounds = tuple(float(v) for v in src.bounds)
+                out_res = (abs(float(src_transform.a)), abs(float(src_transform.e)))
+                _write_extent_sidecar(tmp_tile_dir, out_bounds, out_res)
             try:
                 px_m_x, px_m_y, _px_m_mean, is_geo, lat_center = metric_pixel_scales_from_metadata(
                     transform=src_transform,
@@ -1481,6 +1636,17 @@ def process_dem_tiles(
                 px_m_y = sign_y * float(pixel_size)
                 is_geo = False
                 lat_center = None
+            if pixel_size_explicit:
+                # Explicit --pixel-size overrides the metadata-detected scale
+                # (same rule as core/dask_processor.py): isotropic metres per
+                # pixel keeping the detected axis signs, no geographic
+                # anisotropy -- and process_single_tile then skips its per-tile
+                # latitude override (it keys off is_geographic_dem).
+                _p = float(pixel_size)
+                px_m_x = _p if px_m_x >= 0 else -_p
+                px_m_y = _p if px_m_y >= 0 else -_p
+                is_geo = False
+                logger.info("Pixel size overridden by --pixel-size: %.6gm (isotropic)", _p)
 
             # Inject anisotropic pixel scales for all algorithms.  REAL signed
             # meters per pixel on both projected and geographic DEMs -- the same
@@ -1514,7 +1680,7 @@ def process_dem_tiles(
             # fractal_anomaly) -> npr_edges gradient -> specular roughness p95.
             # Output normalization itself is owned by the algorithms (identical on
             # both backends); the tile pipeline applies no post-normalization.
-            inject_global_stats(input_cog_path, algorithm, algo_params, is_zarr=False)
+            inject_global_stats(side_src_path, algorithm, algo_params, is_zarr=False)
 
             # ----------------------------------------------------------------
             # Unified overview coarse source for the tile backend (mirrors the
@@ -1534,7 +1700,7 @@ def process_dem_tiles(
             ):
                 try:
                     from ..algorithms._nan_utils import read_overview_coarse_dem
-                    _ov_dem, _ov_decim = read_overview_coarse_dem(input_cog_path)
+                    _ov_dem, _ov_decim = read_overview_coarse_dem(side_src_path)
                     if _ov_dem is not None:
                         algo_params["_overview_coarse_dem"] = _ov_dem
                         algo_params["_overview_decimation"] = _ov_decim
@@ -1576,7 +1742,7 @@ def process_dem_tiles(
                             _large = [r for r in _radii if _pred(r)]
                             if _large:
                                 _fields, _ = compute_overview_scale_fields(
-                                    input_cog_path, large_radii=_large, block_fn=_bfn,
+                                    side_src_path, large_radii=_large, block_fn=_bfn,
                                     coarse_dem=_ov_dem, decimation=_ov_decim,
                                 )
                                 if _fields:
@@ -1701,6 +1867,8 @@ def process_dem_tiles(
             gpu_config,
             backend=cog_backend,
             gdal_bin_dir=gdal_bin_dir,
+            output_bounds=out_bounds,
+            output_resolution=out_res,
         )
         
         # COG quality validation.  No post-hoc metadata edits: updating a COG
@@ -1763,11 +1931,19 @@ def resume_cog_generation(
     if not os.path.exists(tmp_tile_dir):
         raise ValueError(f"Tile directory does not exist: {tmp_tile_dir}")
     
-    tile_files = sorted(glob.glob(os.path.join(tmp_tile_dir, "tile_*.tif")))
+    # glob.escape: '[' / ']' in the directory are glob character classes.
+    tile_files = sorted(glob.glob(os.path.join(glob.escape(tmp_tile_dir), "tile_*.tif")))
     if not tile_files:
         raise ValueError(f"No tile files found: {tmp_tile_dir}")
-    
+
     logger.info(f"Tiles found: {len(tile_files)}")
+    # Full input extent recorded by the tiling run (absent for tile dirs from
+    # older versions -> legacy tiles-bbox extent).
+    out_bounds, out_res = _read_extent_sidecar(tmp_tile_dir)
+    if out_bounds is None:
+        logger.info(
+            "No %s in the tile directory; the output extent is the tiles' bbox "
+            "(skipped all-NoData edge tiles would shrink it).", _EXTENT_SIDECAR)
     
     # Get basic info from the first tile
     sample_tile = tile_files[0]
@@ -1799,6 +1975,8 @@ def resume_cog_generation(
             gpu_config,
             backend=cog_backend,
             gdal_bin_dir=gdal_bin_dir,
+            output_bounds=out_bounds,
+            output_resolution=out_res,
         )
         if not _validate_cog_for_qgis(output_cog_path):
             raise RuntimeError(f"Generated output failed COG validation: {output_cog_path}")

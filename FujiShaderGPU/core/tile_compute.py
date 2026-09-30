@@ -136,12 +136,13 @@ def apply_nodata_mask(result_gpu: cp.ndarray, mask_nodata, nodata):
         if result_gpu.ndim == 2:
             result_gpu[mask_gpu] = fill_value
         elif result_gpu.ndim == 3:
-            if tuple(result_gpu.shape[:2]) == tuple(mask_gpu.shape):
-                # HxWxC output.
-                result_gpu[mask_gpu, :] = fill_value
-            elif tuple(result_gpu.shape[-2:]) == tuple(mask_gpu.shape):
+            # Band-first (the formal stack contract) wins when both match.
+            if tuple(result_gpu.shape[-2:]) == tuple(mask_gpu.shape):
                 # Band-first stack output: CxHxW.
                 result_gpu[:, mask_gpu] = fill_value
+            elif tuple(result_gpu.shape[:2]) == tuple(mask_gpu.shape):
+                # HxWxC output.
+                result_gpu[mask_gpu, :] = fill_value
             else:
                 raise ValueError(
                     f"Unsupported result/mask shapes for nodata masking: "

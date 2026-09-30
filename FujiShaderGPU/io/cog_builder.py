@@ -10,7 +10,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from osgeo import gdal
 
@@ -89,10 +89,30 @@ def _detect_nodata_from_tiles(tile_files: List[str]) -> Optional[float]:
     return expected
 
 
+def _extent_cli_args(
+    output_bounds: Optional[Tuple[float, float, float, float]],
+    output_resolution: Optional[Tuple[float, float]],
+) -> List[str]:
+    """gdalbuildvrt ``-te``/``-tr`` args pinning the mosaic to the input grid.
+
+    Skipped all-NoData tiles write no file, so without an explicit extent the
+    VRT (and hence the COG) shrinks to the bbox of the tiles that exist.
+    Returns ``[]`` when no extent is known (legacy behaviour).
+    """
+    if output_bounds is None:
+        return []
+    args = ["-te"] + [repr(float(v)) for v in output_bounds]
+    if output_resolution is not None:
+        args += ["-tr", repr(float(output_resolution[0])), repr(float(output_resolution[1]))]
+    return args
+
+
 def _create_vrt_command_line_ultra(
     tile_files: List[str],
     vrt_path: str,
     nodata: Optional[float] = None,
+    output_bounds: Optional[Tuple[float, float, float, float]] = None,
+    output_resolution: Optional[Tuple[float, float]] = None,
 ) -> None:
     """Create VRT by gdalbuildvrt command line (fast path for many tiles)."""
     # Derive the sidecar list from the VRT stem so a path that merely CONTAINS
@@ -107,13 +127,17 @@ def _create_vrt_command_line_ultra(
         cmd = [
             "gdalbuildvrt",
             "-allow_projection_difference",
-            "-resolution",
-            "highest",
             "-r",
             "nearest",
             "-input_file_list",
             file_list_path,
         ]
+        # -tr and -resolution highest are mutually exclusive in gdalbuildvrt.
+        if output_bounds is not None and output_resolution is not None:
+            cmd.extend(_extent_cli_args(output_bounds, output_resolution))
+        else:
+            cmd.extend(["-resolution", "highest"])
+            cmd.extend(_extent_cli_args(output_bounds, None))
         if nodata is not None:
             nval = str(float(nodata))
             cmd.extend(["-srcnodata", nval, "-vrtnodata", nval])
@@ -243,20 +267,34 @@ def _create_vrt_ultra_fast(
     tile_files: List[str],
     vrt_path: str,
     nodata: Optional[float] = None,
+    output_bounds: Optional[Tuple[float, float, float, float]] = None,
+    output_resolution: Optional[Tuple[float, float]] = None,
 ) -> None:
-    """Create VRT from tiles."""
+    """Create VRT from tiles.
+
+    ``output_bounds`` (minx, miny, maxx, maxy) / ``output_resolution`` (xres,
+    yres) pin the mosaic to the input raster grid so skipped (all-NoData, no
+    file) tiles become NoData instead of shrinking the output extent.
+    """
     start = time.time()
 
     if len(tile_files) > 20:
         try:
-            _create_vrt_command_line_ultra(tile_files, vrt_path, nodata=nodata)
+            _create_vrt_command_line_ultra(
+                tile_files, vrt_path, nodata=nodata,
+                output_bounds=output_bounds, output_resolution=output_resolution)
             logger.info("Command line VRT: %.1fs", time.time() - start)
             return
         except Exception as exc:
             logger.warning("Command line VRT failed; fallback to Python API: %s", exc)
 
+    _has_res = output_bounds is not None and output_resolution is not None
     vrt_options = gdal.BuildVRTOptions(
-        resolution="highest",
+        # -tr and -resolution highest are mutually exclusive in gdalbuildvrt.
+        resolution="user" if _has_res else "highest",
+        outputBounds=tuple(output_bounds) if output_bounds is not None else None,
+        xRes=float(output_resolution[0]) if _has_res else None,
+        yRes=float(output_resolution[1]) if _has_res else None,
         resampleAlg="nearest",
         allowProjectionDifference=True,
         addAlpha=False,
@@ -553,6 +591,8 @@ def _create_vrt_and_cog_external_cli(
     output_cog_path: str,
     nodata: Optional[float],
     gdal_bin_dir: Optional[str],
+    output_bounds: Optional[Tuple[float, float, float, float]] = None,
+    output_resolution: Optional[Tuple[float, float]] = None,
 ) -> None:
     """Run the external backend and remove an incomplete COG on failure."""
     try:
@@ -562,6 +602,8 @@ def _create_vrt_and_cog_external_cli(
             output_cog_path=output_cog_path,
             nodata=nodata,
             gdal_bin_dir=gdal_bin_dir,
+            output_bounds=output_bounds,
+            output_resolution=output_resolution,
         )
     except Exception:
         _remove_partial_cog_output(output_cog_path)
@@ -575,6 +617,8 @@ def _create_vrt_and_cog_external_cli_impl(
     output_cog_path: str,
     nodata: Optional[float],
     gdal_bin_dir: Optional[str],
+    output_bounds: Optional[Tuple[float, float, float, float]] = None,
+    output_resolution: Optional[Tuple[float, float]] = None,
 ) -> None:
     """Build VRT + COG using external GDAL executables (no Python GDAL processing path)."""
     start = time.time()
@@ -601,11 +645,15 @@ def _create_vrt_and_cog_external_cli_impl(
             "-allow_projection_difference",
             "-input_file_list",
             file_list_path,
-            "-resolution",
-            "highest",
             "-r",
             "nearest",
         ]
+        # -tr and -resolution highest are mutually exclusive in gdalbuildvrt.
+        if output_bounds is not None and output_resolution is not None:
+            cmd_vrt.extend(_extent_cli_args(output_bounds, output_resolution))
+        else:
+            cmd_vrt.extend(["-resolution", "highest"])
+            cmd_vrt.extend(_extent_cli_args(output_bounds, None))
         if nodata is not None:
             nval = str(float(nodata))
             cmd_vrt.extend(["-srcnodata", nval, "-vrtnodata", nval])
@@ -661,22 +709,34 @@ def _build_vrt_and_cog_ultra_fast(
     gpu_config: dict,
     backend: str = "internal",
     gdal_bin_dir: Optional[str] = None,
+    output_bounds: Optional[Tuple[float, float, float, float]] = None,
+    output_resolution: Optional[Tuple[float, float]] = None,
 ) -> None:
     """Build VRT from tile outputs and convert to COG.
 
     The GDAL Python calls below check ``None`` return values rather than catching
     exceptions, so this entry point opts into GDAL's non-exception mode locally
     (restored on exit) instead of mutating the policy globally at import time.
+
+    ``output_bounds`` / ``output_resolution`` (the input raster's extent and
+    pixel size) keep the output on the input grid even when all-NoData tiles
+    were skipped; ``None`` keeps the legacy tiles-bbox extent.
     """
     logger.info("=== Fast COG generation start ===")
     _configure_gdal_ultra_performance(gpu_config)
 
     vrt_path = os.path.join(tmp_tile_dir, "tiles.vrt")
-    tile_files = sorted(glob.glob(os.path.join(tmp_tile_dir, "tile_*.tif")))
+    # glob.escape: '[' / ']' in the directory are glob character classes.
+    tile_files = sorted(glob.glob(os.path.join(glob.escape(tmp_tile_dir), "tile_*.tif")))
     if not tile_files:
         raise ValueError(f"No tile files found: {tmp_tile_dir}")
 
     nodata = _detect_nodata_from_tiles(tile_files)
+    if output_bounds is not None and nodata is None:
+        logger.warning(
+            "Tiles carry no NoData value; areas of skipped tiles inside the "
+            "output extent will read as 0."
+        )
     logger.info("VRT create: merging %d tiles", len(tile_files))
     if nodata is not None:
         logger.info("Detected tile nodata=%g; preserving nodata through VRT/COG", nodata)
@@ -704,10 +764,14 @@ def _build_vrt_and_cog_ultra_fast(
             output_cog_path=output_cog_path,
             nodata=nodata,
             gdal_bin_dir=gdal_bin_dir,
+            output_bounds=output_bounds,
+            output_resolution=output_resolution,
         )
     else:
         logger.info("COG backend: internal GDAL Python")
-        _create_vrt_ultra_fast(tile_files, vrt_path, nodata=nodata)
+        _create_vrt_ultra_fast(
+            tile_files, vrt_path, nodata=nodata,
+            output_bounds=output_bounds, output_resolution=output_resolution)
         if gdal.GetDriverByName("COG"):
             _create_cog_ultra_fast(vrt_path, output_cog_path, gpu_config, nodata=nodata)
         else:
