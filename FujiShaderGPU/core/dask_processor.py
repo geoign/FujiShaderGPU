@@ -165,6 +165,13 @@ def _select_chunk_temp_parent(data_nbytes: int) -> Path:
     return parent
 
 
+def _balanced_chunks(length: int, chunk: int) -> Tuple[int, ...]:
+    """Split ``length`` into ceil(length/chunk) near-equal chunks (each <= chunk)."""
+    n = max(1, -(-int(length) // max(1, int(chunk))))
+    base, extra = divmod(int(length), n)
+    return tuple(base + 1 if i < extra else base for i in range(n))
+
+
 def _detect_metric_scales_from_dataarray(dem: xr.DataArray) -> Tuple[float, float, float, bool, Optional[float]]:
     """Detect signed x/y metric pixel scales from an xarray+rioxarray DataArray.
 
@@ -1343,6 +1350,18 @@ def run_pipeline(
                         gpu_arr = gpu_arr.rechunk((chunk, chunk))
                     except Exception as exc:
                         logger.warning("Could not rechunk after resolved radii shrink: %s", exc)
+
+        # Balance the chunk grid.  A thin trailing chunk (2600 rows at 512 ->
+        # ..., 512, 40) caps every multiscale map_overlap halo at its size - 1
+        # (multiscale_response_fields keeps fields aligned that way), silently
+        # truncating large radii and seaming the output at every chunk edge.
+        # Equal-size chunks no larger than requested keep the smallest >= chunk/2.
+        _balanced = tuple(
+            _balanced_chunks(int(n), int(c)) for n, c in zip(gpu_arr.shape, gpu_arr.chunksize)
+        )
+        if _balanced != tuple(gpu_arr.chunks):
+            gpu_arr = gpu_arr.rechunk(_balanced)
+            logger.info("Balanced chunk grid: %s", [sorted(set(c)) for c in _balanced])
 
         # Compute + inject every per-algorithm global normalization statistic
         # (fractal relief -> robust display range -> npr gradient -> specular

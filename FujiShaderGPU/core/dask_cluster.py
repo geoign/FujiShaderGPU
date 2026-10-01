@@ -1,6 +1,7 @@
 """Dask cluster setup helpers."""
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import sys
@@ -93,9 +94,13 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         'death_timeout': '60s' if is_colab else '30s',
         'interface': 'lo' if is_colab else None,
         'rmm_maximum_pool_size': f'{rmm_max_gb:.2f}GB',
-        'enable_cudf_spill': True,
         'local_directory': spill_dir,
     }
+    # cuDF native spilling only applies to cuDF objects (the pipeline holds CuPy
+    # arrays) and dask-cuda >= 25.x imports cudf eagerly when it is requested,
+    # so a plain CuPy install failed with "No module named 'cudf'".
+    if importlib.util.find_spec("cudf") is not None:
+        cluster_kwargs['enable_cudf_spill'] = True
 
     try:
         cluster = LocalCUDACluster(**cluster_kwargs)
@@ -107,7 +112,11 @@ def make_cluster(memory_fraction: float = None) -> Tuple[LocalCUDACluster, Clien
         logger.info("dask-cuda does not support enable_cudf_spill; using default spilling")
         cluster = LocalCUDACluster(**cluster_kwargs)
 
-    client = Client(cluster)
+    try:
+        client = Client(cluster)
+    except Exception:
+        cluster.close()
+        raise
     memory_budget = {
         "gpu_memory_gb": float(gpu_memory_gb),
         "device_limit_gb": float(device_limit_gb),

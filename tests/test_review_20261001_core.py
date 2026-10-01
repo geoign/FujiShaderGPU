@@ -207,3 +207,34 @@ def test_blur_local_mode_uses_blur_radius():
     assert _resolve_radius({"mode": "local", "radii": [1], "radius": 40.0}) == 40.0
     assert _resolve_radius({"mode": "spatial", "radii": [8, 32], "radius": 40.0}) == 8.0
     assert _resolve_radius({"radius": 12.0}) == 12.0
+
+
+@pytest.mark.parametrize("length,chunk", [(2600, 512), (3000, 1024), (5000, 4096), (300, 1024), (4096, 4096)])
+def test_balanced_chunks_have_no_thin_tail(monkeypatch, length, chunk):
+    dp = _import_dask_processor(monkeypatch)
+    sizes = dp._balanced_chunks(length, chunk)
+    assert sum(sizes) == length
+    assert max(sizes) <= chunk
+    assert len(sizes) == -(-length // chunk)
+    assert min(sizes) >= min(length, chunk) // 2
+
+
+def test_frangi_balanced_chunks_match_single_block():
+    """A thin trailing chunk used to cap every multiscale halo (seams)."""
+    da = pytest.importorskip("dask.array")
+    import dask
+    from scipy.ndimage import gaussian_filter
+    from FujiShaderGPU.algorithms._impl_frangi import FrangiAlgorithm
+    from FujiShaderGPU.core.dask_processor import _balanced_chunks
+
+    rng = np.random.default_rng(3)
+    z = (gaussian_filter(rng.standard_normal((1300, 1100)), 4) * 50
+         + gaussian_filter(rng.standard_normal((1300, 1100)), 40) * 3000).astype(np.float32)
+    g = cp.asarray(z)
+    params = dict(radii=[2, 8, 32], weights=[0.5, 0.3, 0.2], pixel_size=10.0,
+                  pixel_scale_x=10.0, pixel_scale_y=-10.0, global_stats=(0.0, 1.0))
+    chunks = tuple(_balanced_chunks(n, 256) for n in g.shape)
+    with dask.config.set(scheduler="synchronous"):
+        ref = FrangiAlgorithm().process(da.from_array(g, chunks=g.shape, asarray=False), **params).compute()
+        out = FrangiAlgorithm().process(da.from_array(g, chunks=chunks, asarray=False), **params).compute()
+    assert float(cp.abs(out - ref).max()) < 1e-3
