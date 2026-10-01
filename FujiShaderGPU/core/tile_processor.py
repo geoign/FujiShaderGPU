@@ -1680,7 +1680,14 @@ def process_dem_tiles(
             # fractal_anomaly) -> npr_edges gradient -> specular roughness p95.
             # Output normalization itself is owned by the algorithms (identical on
             # both backends); the tile pipeline applies no post-normalization.
-            inject_global_stats(side_src_path, algorithm, algo_params, is_zarr=False)
+            # The pre-pass reads params["pixel_size"] (the Dask backend sets it);
+            # here it is a separate argument, so without it the stats ran at 1 m
+            # (npr_edges thresholds off by the pixel size -> spurious edges all
+            # over the tile output).  algo_params itself must not carry it: it is
+            # also splatted into process_single_tile(pixel_size=...).
+            _stats_params = dict(algo_params, pixel_size=float(pixel_size))
+            inject_global_stats(side_src_path, algorithm, _stats_params, is_zarr=False)
+            algo_params.update({k: v for k, v in _stats_params.items() if k != "pixel_size"})
 
             # ----------------------------------------------------------------
             # Unified overview coarse source for the tile backend (mirrors the

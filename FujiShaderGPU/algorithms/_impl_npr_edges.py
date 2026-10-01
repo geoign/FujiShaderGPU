@@ -13,6 +13,7 @@ import dask.array as da
 from cupyx.scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter, convolve, binary_dilation
 
 from ._base import Constants, DaskAlgorithm, classify_resolution
+from ._impl_structure_tensor import nan_filled
 from ._nan_utils import (
     restore_nan,
     _resolve_spatial_radii_weights, _combine_multiscale_dask,
@@ -52,7 +53,8 @@ def compute_npr_edges_block(block: cp.ndarray, *, edge_sigma: float = 1.0,
 
     # Denoise (minimal)
     if nan_mask.any():
-        filled = cp.where(nan_mask, cp.nanmean(block), block)
+        # Local (tiling-independent) fill; a block-mean plateau moved coastal edges with the tiling.
+        filled = nan_filled(block)[0]
         if adaptive_sigma > 0.1:
             smoothed = gaussian_filter(filled, sigma=adaptive_sigma, mode='nearest')
         else:

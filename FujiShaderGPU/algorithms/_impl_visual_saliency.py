@@ -14,6 +14,7 @@ from ._nan_utils import (
     restore_nan, resolve_block_weights, hybrid_multiscale_response_combine,
 )
 from ._global_stats import compute_global_stats
+from ._impl_structure_tensor import nan_filled
 from ._normalization import NORMAL_PERCENTILE
 
 logger = logging.getLogger(__name__)
@@ -27,13 +28,11 @@ def vs_large_scale_predicate(scale) -> bool:
 
 
 def _vs_fill(block):
-    """NaN -> finite per-block fill (nanmean), matching compute_visual_saliency_block."""
-    nan_mask = cp.isnan(block)
-    if not bool(nan_mask.any()):
-        return block.astype(cp.float32, copy=False)
-    fill = cp.nanmean(block)
-    fill = cp.where(cp.isfinite(fill), fill, cp.float32(0.0))
-    return cp.where(nan_mask, fill, block).astype(cp.float32)
+    """NaN -> finite local fill (``nan_filled``), shared by every saliency path.
+
+    A per-block nanmean fill gave each chunk/tile a different plateau beyond
+    the coastline, so pixels within ~5 sigma of NoData changed with the tiling."""
+    return nan_filled(block)[0]
 
 
 def _vs_smooth_block(block, *, scale, pixel_size=1.0, pixel_scale_x=None,
@@ -113,12 +112,7 @@ def compute_visual_saliency_block(block, *, scales=None, radii=None,
     if scales is None:
         scales = [2, 4, 8, 16]
     nan_mask = cp.isnan(block)
-    if nan_mask.any():
-        fill = cp.nanmean(block)
-        fill = cp.where(cp.isfinite(fill), fill, 0.0)
-        work = cp.where(nan_mask, fill, block).astype(cp.float32)
-    else:
-        work = block.astype(cp.float32, copy=False)
+    work = _vs_fill(block)
     use_scales = [max(0.5, float(s)) for s in scales]
     if len(use_scales) < 4:
         use_scales = [2.0, 4.0, 8.0, 16.0]
@@ -187,9 +181,7 @@ def _vs_combine_block(block, *smooths, weights=None, pixel_size=1.0,
     treated identically; the true NoData footprint is restored at the end.
     """
     nan_mask = cp.isnan(block)
-    fillv = cp.nanmean(block)
-    fillv = cp.where(cp.isfinite(fillv), fillv, cp.float32(0.0))
-    sm = [cp.where(cp.isnan(s), fillv, s).astype(cp.float32) for s in smooths]
+    sm = [_vs_fill(s) for s in smooths]
     n = len(sm)
     wvec = resolve_block_weights(weights, n)
     w_host = cp.asnumpy(wvec).tolist() if wvec is not None else None

@@ -238,3 +238,47 @@ def test_frangi_balanced_chunks_match_single_block():
         ref = FrangiAlgorithm().process(da.from_array(g, chunks=g.shape, asarray=False), **params).compute()
         out = FrangiAlgorithm().process(da.from_array(g, chunks=chunks, asarray=False), **params).compute()
     assert float(cp.abs(out - ref).max()) < 1e-3
+
+
+def test_visual_saliency_near_nodata_is_tiling_independent():
+    """A per-block nanmean fill made coastal pixels depend on the chunking."""
+    da = pytest.importorskip("dask.array")
+    import dask
+    from scipy.ndimage import gaussian_filter
+    from FujiShaderGPU.algorithms._impl_visual_saliency import VisualSaliencyAlgorithm
+
+    rng = np.random.default_rng(5)
+    z = (gaussian_filter(rng.standard_normal((800, 900)), 3) * 40
+         + gaussian_filter(rng.standard_normal((800, 900)), 30) * 2000 + 500).astype(np.float32)
+    z[:, 700:] = np.nan  # sea
+    g = cp.asarray(z)
+    params = dict(scales=[2, 4, 8, 16], pixel_size=10.0, pixel_scale_x=10.0,
+                  pixel_scale_y=-10.0, global_stats=(0.0, 1.0))
+    with dask.config.set(scheduler="synchronous"):
+        ref = VisualSaliencyAlgorithm().process(
+            da.from_array(g, chunks=g.shape, asarray=False), **params).compute()
+        out = VisualSaliencyAlgorithm().process(
+            da.from_array(g, chunks=(400, 450), asarray=False), **params).compute()
+    d = cp.abs(out - ref)
+    assert float(cp.nanmax(d)) < 1e-3
+
+
+def test_tile_global_stats_see_pixel_size(tmp_path, monkeypatch):
+    """The tile pre-pass ran at 1 m (pixel_size missing from its params)."""
+    from FujiShaderGPU.core import tile_processor as tp
+
+    seen = {}
+
+    def _capture(src, algorithm, params, *, is_zarr=False):
+        seen.update(params)
+        return params
+
+    monkeypatch.setattr(tp, "inject_global_stats", _capture)
+    path = tmp_path / "dem.tif"
+    y, x = np.mgrid[0:96, 0:96]
+    _write_tif(path, (x * 2.0 + y).astype(np.float32),
+               transform=from_origin(0, 960, 10, 10), crs="EPSG:32654")
+    tp.process_dem_tiles(str(path), str(tmp_path / "out.tif"),
+                         tmp_tile_dir=str(tmp_path / "tiles"), algorithm="npr_edges",
+                         mode="local", show_progress=False)
+    assert seen.get("pixel_size") == pytest.approx(10.0)
